@@ -38,6 +38,9 @@ class GEMM(MLIROperator):
     dtype_out: str = field(default="bf16", repr=False)
     use_scalar: bool = field(default=False, repr=False)
     separate_c_tiles: bool = field(default=False, repr=False)
+    # O6: M-stationary dataflow (columns split M, B broadcast) → fills all 32 cores even at skinny
+    # N=B. Default False = the shipped N-stationary dataflow (byte-identical). Plain GEMM (no epilogue).
+    m_stationary: bool = field(default=False, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -51,15 +54,29 @@ class GEMM(MLIROperator):
 
     def __post_init__(self):
         num_aie_rows = 4
-        min_M = self.tile_m * num_aie_rows
-        min_K = self.tile_k
-        min_N = self.tile_n * self.num_aie_columns
-        if self.M % min_M != 0:
-            raise ValueError(f"M ({self.M}) must be a multiple of {min_M}")
-        if self.K % min_K != 0:
-            raise ValueError(f"K ({self.K}) must be a multiple of {min_K}")
-        if self.N % min_N != 0:
-            raise ValueError(f"N ({self.N}) must be a multiple of {min_N}")
+        if self.m_stationary:
+            # M-stationary: M splits across ALL cores (cols*rows m-tiles); N only needs N % tile_n
+            # (each core sweeps the full N), so skinny N=B is valid on the full 8-col array.
+            min_M = self.tile_m * num_aie_rows * self.num_aie_columns
+            if self.M % min_M != 0:
+                raise ValueError(
+                    f"m_stationary: M ({self.M}) must be a multiple of {min_M} "
+                    f"(tile_m*{num_aie_rows}*{self.num_aie_columns}); tile_m must == M/{num_aie_rows*self.num_aie_columns}"
+                )
+            if self.K % self.tile_k != 0:
+                raise ValueError(f"K ({self.K}) must be a multiple of {self.tile_k}")
+            if self.N % self.tile_n != 0:
+                raise ValueError(f"N ({self.N}) must be a multiple of {self.tile_n}")
+        else:
+            min_M = self.tile_m * num_aie_rows
+            min_K = self.tile_k
+            min_N = self.tile_n * self.num_aie_columns
+            if self.M % min_M != 0:
+                raise ValueError(f"M ({self.M}) must be a multiple of {min_M}")
+            if self.K % min_K != 0:
+                raise ValueError(f"K ({self.K}) must be a multiple of {min_K}")
+            if self.N % min_N != 0:
+                raise ValueError(f"N ({self.N}) must be a multiple of {min_N}")
 
         if self.emulate_bf16_mmul_with_bfp16:
             min_tile_m, min_tile_k, min_tile_n = 8, 8, 8
@@ -103,6 +120,7 @@ class GEMM(MLIROperator):
                     "emulate_bf16_mmul_with_bfp16": self.emulate_bf16_mmul_with_bfp16,
                     "prio_accuracy": self.prio_accuracy,
                     "separate_c_tiles": int(self.separate_c_tiles),
+                    "m_stationary": int(self.m_stationary),
                     "trace_size": 0,
                     "generate_taps": False,
                     "kernel_object": f"gemm_{self.tile_m}x{self.tile_k}x{self.tile_n}_{int(self.b_col_maj)}_{int(self.c_col_maj)}{self._kernel_flags_suffix}.o",
