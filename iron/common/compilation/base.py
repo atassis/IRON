@@ -490,7 +490,13 @@ class AieccCompilationRule(CompilationRule):
         self, build_dir, peano_dir, mlir_aie_dir, use_chess=False, *args, **kwargs
     ):
         self.build_dir = build_dir
-        self.aiecc_path = Path(mlir_aie_dir) / "bin" / "aiecc"
+        # AIECC_PATH lets a single session point at a locally-rebuilt aiecc (e.g. the
+        # getOrCreateDataMemref O(n^2)->O(n) fix in mlir-aie/build-on2) WITHOUT overwriting the
+        # shipped wheel aiecc, so other sessions are unaffected. Default = the wheel's aiecc.
+        _aiecc_override = os.environ.get("AIECC_PATH")
+        self.aiecc_path = (
+            Path(_aiecc_override) if _aiecc_override else Path(mlir_aie_dir) / "bin" / "aiecc"
+        )
         self.peano_dir = peano_dir
         self.use_chess = use_chess
         super().__init__(*args, **kwargs)
