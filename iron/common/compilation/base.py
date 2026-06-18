@@ -514,7 +514,7 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
             compile_cmd = [
                 str(self.aiecc_path),
                 "-v",
-                "-j1",
+                f"-j{os.environ.get('AIECC_JOBS', '1')}",
                 "--no-compile-host",
             ]
             if self.use_chess:
@@ -530,7 +530,9 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
                     str(self.peano_dir),
                 ]
             compile_cmd += [
-                "--expand-load-pdis",
+                *([] if os.environ.get("SKIP_EXPAND_PDIS") else ["--expand-load-pdis"]),
+                *(["--disable-repeater-scripts"] if os.environ.get("DISABLE_REPEATER") else []),
+                *(["-O", os.environ["AIECC_OPT"]] if os.environ.get("AIECC_OPT") else []),
                 "--generate-full-elf",
                 "--full-elf-name",
                 os.path.abspath(artifact.filename),
@@ -568,7 +570,7 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
             compile_cmd = [
                 str(self.aiecc_path),
                 "-v",
-                "-j1",
+                f"-j{os.environ.get('AIECC_JOBS', '1')}",
                 "--no-compile-host",
             ]
             if self.use_chess:
