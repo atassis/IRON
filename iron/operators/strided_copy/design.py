@@ -11,7 +11,7 @@ input[0, :, 0] -> output[:, 0, 0]
 import numpy as np
 
 from aie.dialects.aiex import TensorAccessPattern
-from aie.iron import ObjectFifo, Program, Runtime
+from aie.iron import ObjectFifo, Program, Runtime, ScratchpadParameter
 from aie.iron.placers import SequentialPlacer
 
 
@@ -30,7 +30,19 @@ def strided_copy(
     num_aie_channels=1,
     input_offset_patch_marker=0,
     output_offset_patch_marker=0,
+    output_offset_scratchpad=None,
 ):
+    # Deep-C: when output_offset_scratchpad is a (name) string, the per-dispatch output base
+    # offset becomes a runtime `offset_parameter` scratchpad (XRT-patched, additive to the BD
+    # address) instead of the compile-time `output_offset_patch_marker` ELF-patch. This keeps the
+    # ELF CONSTANT across tokens (registered once); the host writes the offset word per dispatch.
+    # Mutually exclusive with output_offset_patch_marker.
+    _out_off_param = None
+    if output_offset_scratchpad is not None:
+        assert (
+            output_offset_patch_marker == 0
+        ), "output_offset_scratchpad and output_offset_patch_marker are mutually exclusive"
+        _out_off_param = ScratchpadParameter(output_offset_scratchpad, np.int32)
     assert len(input_sizes) == len(input_strides)
     assert len(output_sizes) == len(output_strides)
 
@@ -130,7 +142,14 @@ def strided_copy(
         tg = rt.task_group()
         for c in range(num_aie_channels):
             rt.fill(fifos_in[c].prod(), inp, input_taps[c], task_group=tg)
-            rt.drain(fifos_out[c].cons(), out, output_taps[c], task_group=tg, wait=True)
+            rt.drain(
+                fifos_out[c].cons(),
+                out,
+                output_taps[c],
+                task_group=tg,
+                wait=True,
+                offset_parameter=_out_off_param,
+            )
         rt.finish_task_group(tg)
 
     return Program(dev, rt).resolve_program(SequentialPlacer())

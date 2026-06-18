@@ -28,6 +28,7 @@ class Softmax(MLIROperator):
     num_channels: int = 1
     rtp_vector_size: int | None = None
     mask_patch_value: int = 0
+    mask_scratchpad: str | None = None
     context: object = field(default=None, repr=False)
 
     @property
@@ -68,6 +69,7 @@ class Softmax(MLIROperator):
                     "tile_size": self.cols,
                     "rtp_vector_size": self.rtp_vector_size,
                     "mask_patch_value": self.mask_patch_value,
+                    "mask_scratchpad": self.mask_scratchpad,
                     "kernel_obj_file": self._kernel_link_file,
                 },
             ),
