@@ -147,6 +147,7 @@ def my_matmul(
     kernel_object=None,
     func_prefix="",
     generate_taps=False,
+    m_stationary=0,
 ):
     n_aie_rows = 4
 
@@ -210,6 +211,154 @@ def my_matmul(
         raise AssertionError(
             "Invalid configuration: NPU2 (Strix/Strix Halo/Krackan) has 8 columns"
         )
+
+    # ============================================================================================
+    # O6: M-STATIONARY mode (columns split M/rows, B broadcast → all n_aie_cols*4 cores busy even
+    # at skinny N=B). Channel-feasible (A + broadcast-B + C = 2 in / 1 out). Ported from
+    # route_b_kernels/m_stationary/m_stationary_iron.py; reuses IRON's func-prefixed zero/matmul
+    # kernels so it fuses under FusedMLIROperator. Self-contained early return — the N-stationary
+    # code below (and its N % mem_tile_n asserts, which reject skinny N) is skipped. Plain GEMM:
+    # bias/residual stay separate ops (the AIE2P 2-input-channel limit blocks residual preload).
+    # ============================================================================================
+    if m_stationary:
+        assert not use_scalar, "m_stationary: vectorized kernel only"
+        assert not use_larger_internal_buffer, "m_stationary: prio_accuracy not supported"
+        M_band = M // n_aie_cols
+        assert M % (m * n_aie_rows * n_aie_cols) == 0, (
+            f"m_stationary: M ({M}) must split into n_aie_cores ({m*n_aie_rows*n_aie_cols}) m-row-tiles"
+        )
+        assert M_band == m * n_aie_rows
+        assert K % k == 0 and N % n == 0 and m % r == 0 and k % s == 0 and n % t == 0
+        N_div_n = N // n
+        K_div_k = K // k
+        n_tiles_per_core = N_div_n
+        ms_depth = 2
+        dev_ty = NPU2()  # m_stationary is npu2-only (matches route_b m_stationary_iron.py)
+        gemm_object_ms = (
+            f"{func_prefix}{kernel_object}" if kernel_object
+            else f"{func_prefix}gemm_{m}x{k}x{n}.o"
+        )
+        A_ty = np.ndarray[(M * K,), np.dtype[dtype_in]]
+        B_ty = np.ndarray[(K * N,), np.dtype[dtype_in]]
+        C_ty = np.ndarray[(M * N,), np.dtype[dtype_out]]
+        A_l2_ty_ms = np.ndarray[(m * k * n_aie_rows,), np.dtype[dtype_in]]
+        B_l2_ty_ms = np.ndarray[(k * n,), np.dtype[dtype_in]]
+        C_l2_ty_ms = np.ndarray[(m * n * n_aie_rows,), np.dtype[dtype_out]]
+        A_l1_ty = np.ndarray[(m, k), np.dtype[dtype_in]]
+        B_l1_ty = np.ndarray[(k, n), np.dtype[dtype_in]]
+        C_l1_ty = np.ndarray[(m, n), np.dtype[dtype_out]]
+        zero_kernel = Kernel(f"{func_prefix}zero_{dtype_out_str}", gemm_object_ms, [C_l1_ty])
+        matmul_kernel = Kernel(
+            f"{func_prefix}matmul_{dtype_in_str}_{dtype_out_str}",
+            gemm_object_ms,
+            [A_l1_ty, B_l1_ty, C_l1_ty],
+        )
+        A_l3l2_fifos = [None] * n_aie_cols
+        A_l2l1_fifos = [[None] * n_aie_rows for _ in range(n_aie_cols)]
+        B_l3l2_fifos = [None] * n_aie_cols
+        B_l2l1_fifos = [None] * n_aie_cols
+        C_l1l2_fifos = [[None] * n_aie_rows for _ in range(n_aie_cols)]
+        C_l2l3_fifos = [None] * n_aie_cols
+        for col in range(n_aie_cols):
+            # A: this column's M-band, distributed across its 4 rows.
+            A_l3l2_fifos[col] = ObjectFifo(A_l2_ty_ms, name=f"A_L3L2_{col}", depth=ms_depth)
+            a_off = [m * k * row for row in range(n_aie_rows)]
+            a_dims = [[(m // r, r * k), (k // s, s), (r, k), (s, 1)]] * n_aie_rows
+            a_tmp = A_l3l2_fifos[col].cons().split(
+                a_off,
+                obj_types=[A_l1_ty] * n_aie_rows,
+                names=[f"A_L2L1_{col}_{row}" for row in range(n_aie_rows)],
+                dims_to_stream=a_dims,
+            )
+            for row in range(n_aie_rows):
+                A_l2l1_fifos[col][row] = a_tmp[row]
+            # B: FULL B, broadcast to the 4 rows of this column.
+            B_l3l2_fifos[col] = ObjectFifo(B_l2_ty_ms, name=f"B_L3L2_{col}", depth=ms_depth)
+            if b_col_maj:
+                b_dims = [(n // t, t * k), (k // s, s), (t, k), (s, 1)]
+            else:
+                b_dims = [(k // s, s * n), (n // t, t), (s, n), (t, 1)]
+            B_l2l1_fifos[col] = B_l3l2_fifos[col].cons().forward(
+                obj_type=B_l1_ty, name=f"B_L2L1_{col}", dims_to_stream=b_dims
+            )
+            # C: join the 4 row m-tiles of this column.
+            C_l2l3_fifos[col] = ObjectFifo(
+                C_l2_ty_ms,
+                name=f"C_L2L3_{col}",
+                depth=ms_depth,
+                dims_to_stream=[(m // r, r * n), (r, t), (n // t, r * t), (t, 1)],
+            )
+            c_off = [m * n * row for row in range(n_aie_rows)]
+            c_tmp = C_l2l3_fifos[col].prod().join(
+                c_off,
+                obj_types=[C_l1_ty] * n_aie_rows,
+                names=[f"C_L1L2_{col}_{row}" for row in range(n_aie_rows)],
+                depths=[ms_depth] * n_aie_rows,
+            )
+            for row in range(n_aie_rows):
+                C_l1l2_fifos[col][row] = c_tmp[row]
+
+        def ms_core_fn(in_a, in_b, out_c, zero, matmul):
+            loop = range(1) if n_tiles_per_core == 1 else range_(n_tiles_per_core)
+            for _ in loop:
+                elem_out = out_c.acquire(1)
+                zero(elem_out)
+                for _ in range_(K_div_k):
+                    ea = in_a.acquire(1)
+                    eb = in_b.acquire(1)
+                    matmul(ea, eb, elem_out)
+                    in_a.release(1)
+                    in_b.release(1)
+                out_c.release(1)
+
+        ms_workers = []
+        for col in range(n_aie_cols):
+            for row in range(n_aie_rows):
+                ms_workers.append(
+                    Worker(
+                        ms_core_fn,
+                        [
+                            A_l2l1_fifos[col][row].cons(),
+                            B_l2l1_fifos[col].cons(),
+                            C_l1l2_fifos[col][row].prod(),
+                            zero_kernel,
+                            matmul_kernel,
+                        ],
+                        stack_size=0xD00,
+                    )
+                )
+        # DMA descriptor wrap-count limit is 64; chunk N into CH n-blocks (<=64, dividing N_div_n).
+        CH = N_div_n
+        while CH > 64 or N_div_n % CH != 0:
+            CH -= 1
+        n_chunks = N_div_n // CH
+        A_tiles = TensorTiler2D.group_tiler(
+            (M, K), (m * n_aie_rows, k), (1, K_div_k), pattern_repeat=CH, prune_step=False
+        )
+        if b_col_maj:
+            B_tiles = TensorTiler2D.group_tiler((N, K), (n, k), (CH, K_div_k), prune_step=False)
+        else:
+            B_tiles = TensorTiler2D.group_tiler(
+                (K, N), (k, n), (K_div_k, CH), tile_group_col_major=True, prune_step=False
+            )
+        C_tiles = TensorTiler2D.group_tiler(
+            (M, N), (m * n_aie_rows, n), (1, CH), prune_step=False
+        )
+        rt = Runtime()
+        with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
+            rt.start(*ms_workers)
+            for c in range(n_chunks):
+                tg = rt.task_group()
+                for col in range(n_aie_cols):
+                    rt.fill(A_l3l2_fifos[col].prod(), A, tap=A_tiles[col], task_group=tg)
+                    rt.fill(B_l3l2_fifos[col].prod(), B, tap=B_tiles[c], task_group=tg)
+                for col in range(n_aie_cols):
+                    rt.drain(
+                        C_l2l3_fifos[col].cons(), C,
+                        tap=C_tiles[col * n_chunks + c], wait=True, task_group=tg,
+                    )
+                rt.finish_task_group(tg)
+        return Program(dev_ty, rt).resolve_program(SequentialPlacer())
 
     # Input matrix A:
     # Conceptually, we divide input A into (m * n_rows, k)-sized blocks. These
@@ -280,7 +429,11 @@ def my_matmul(
 
     # AIE Core Function declarations
     scalar_suffix = "_scalar" if use_scalar else ""
-    gemm_object = kernel_object or f"{func_prefix}gemm_{m}x{k}x{n}.o"
+    gemm_object = (
+        f"{func_prefix}{kernel_object}"
+        if kernel_object
+        else f"{func_prefix}gemm_{m}x{k}x{n}.o"
+    )
     if use_larger_internal_buffer:
         # Fix fifo depth for C objfifo to 1 since 1 buffer will be used for accumulation
         # and another for transfer to L2
@@ -289,17 +442,17 @@ def my_matmul(
         C_l1_ty_internal = np.ndarray[(m, n), np.dtype[dtype_out_internal]]
         # A kernel to convert from the internal f32 accumulation to bf16 for transfer to L2 is needed
         convert_copy_kernel = Kernel(
-            f"convert_copy_f32_to_bf16",
+            f"{func_prefix}convert_copy_f32_to_bf16",
             "convert_copy.o",
             [C_l1_ty_internal, C_l1_ty, np.int32],
         )
         # Fix the kernels to use f32 outputs
         zero_kernel = Kernel(
-            f"zero{scalar_suffix}_f32",
+            f"{func_prefix}zero{scalar_suffix}_f32",
             gemm_object,
             [C_l1_ty_internal],
         )
-        matmul_func_name = f"matmul{scalar_suffix}_{dtype_in_str}_f32"
+        matmul_func_name = f"{func_prefix}matmul{scalar_suffix}_{dtype_in_str}_f32"
         matmul_kernel = Kernel(
             matmul_func_name,
             gemm_object,
@@ -310,11 +463,13 @@ def my_matmul(
         # we only need the zero and matmul kernels
         fifo_depth_out = fifo_depth
         zero_kernel = Kernel(
-            f"zero{scalar_suffix}_{dtype_out_str}",
+            f"{func_prefix}zero{scalar_suffix}_{dtype_out_str}",
             gemm_object,
             [C_l1_ty],
         )
-        matmul_func_name = f"matmul{scalar_suffix}_{dtype_in_str}_{dtype_out_str}"
+        matmul_func_name = (
+            f"{func_prefix}matmul{scalar_suffix}_{dtype_in_str}_{dtype_out_str}"
+        )
         matmul_kernel = Kernel(
             matmul_func_name,
             gemm_object,
@@ -547,6 +702,34 @@ def my_matmul(
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
     with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
+        # --- per-op NPU trace hook (opt-in via IRON_TRACE_SIZE env; no-op when unset
+        # so production builds are unaffected). Route-(b) standalone per-op measurement. ---
+        import os as _os
+
+        if int(_os.environ.get("IRON_TRACE_SIZE", "0")) > 0:
+            import aie.utils.trace as _tu
+
+            _ev = _tu.events
+            rt.enable_trace(
+                int(_os.environ["IRON_TRACE_SIZE"]),
+                workers=list(workers)[: int(_os.environ.get("IRON_TRACE_NTILES", "1"))],
+                coretile_events=[
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_0, _ev.WireBundle.DMA, 0, True
+                    ),
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_1, _ev.WireBundle.DMA, 1, True
+                    ),
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_2, _ev.WireBundle.DMA, 0, False
+                    ),
+                    _ev.CoreEvent.INSTR_EVENT_0,
+                    _ev.CoreEvent.INSTR_EVENT_1,
+                    _ev.CoreEvent.MEMORY_STALL,
+                    _ev.CoreEvent.LOCK_STALL,
+                    _ev.CoreEvent.INSTR_VECTOR,
+                ],
+            )
         rt.start(*workers)
 
         # Set runtime parameters

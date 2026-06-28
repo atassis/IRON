@@ -484,7 +484,13 @@ class GenerateMLIRFromPythonCompilationRule(CompilationRule):
 class AieccCompilationRule(CompilationRule):
     def __init__(self, build_dir, peano_dir, mlir_aie_dir, *args, **kwargs):
         self.build_dir = build_dir
-        self.aiecc_path = Path(mlir_aie_dir) / "bin" / "aiecc"
+        # AIECC_PATH lets a single session point at a locally-rebuilt aiecc (e.g. the
+        # getOrCreateDataMemref O(n^2)->O(n) fix in mlir-aie/build-on2) WITHOUT overwriting the
+        # shipped wheel aiecc, so other sessions are unaffected. Default = the wheel's aiecc.
+        _aiecc_override = os.environ.get("AIECC_PATH")
+        self.aiecc_path = (
+            Path(_aiecc_override) if _aiecc_override else Path(mlir_aie_dir) / "bin" / "aiecc"
+        )
         self.peano_dir = peano_dir
         super().__init__(*args, **kwargs)
 
@@ -501,13 +507,15 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
             compile_cmd = [
                 str(self.aiecc_path),
                 "-v",
-                "-j1",
+                f"-j{os.environ.get('AIECC_JOBS', '1')}",
                 "--no-compile-host",
                 "--no-xchesscc",
                 "--no-xbridge",
                 "--peano",
                 str(self.peano_dir),
-                "--expand-load-pdis",
+                *([] if os.environ.get("SKIP_EXPAND_PDIS") else ["--expand-load-pdis"]),
+                *(["--disable-repeater-scripts"] if os.environ.get("DISABLE_REPEATER") else []),
+                *(["-O", os.environ["AIECC_OPT"]] if os.environ.get("AIECC_OPT") else []),
                 "--generate-full-elf",
                 "--full-elf-name",
                 os.path.abspath(artifact.filename),
@@ -545,7 +553,7 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
             compile_cmd = [
                 str(self.aiecc_path),
                 "-v",
-                "-j1",
+                f"-j{os.environ.get('AIECC_JOBS', '1')}",
                 "--no-compile-host",
                 "--no-xchesscc",
                 "--no-xbridge",

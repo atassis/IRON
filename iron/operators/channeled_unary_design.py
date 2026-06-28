@@ -103,6 +103,45 @@ def channeled_unary_design(
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
     with rt.sequence(transfer_type, transfer_type) as (a_in, b_out):
+        # Per-op on-NPU hardware trace (no-op when off -> production unaffected).
+        # Honors either the trace_size param (LayerNorm plumbs it) OR the IRON_TRACE_SIZE
+        # env (so GELU/SiLU/etc., which don't plumb trace_size through op.py, still trace).
+        # Mirrors the dequant op + the matrix_multiplication trace example: configure the
+        # compute tiles' trace units + route packets to DDR (ddr_id=4). Without this call the
+        # IRON program never emits aie.trace/configure ops, so trace.txt comes back all-zeros.
+        import os as _os
+
+        _ts = (
+            trace_size
+            if (trace_size and trace_size > 0)
+            else int(_os.environ.get("IRON_TRACE_SIZE", "0"))
+        )
+        if _ts > 0:
+            import aie.utils.trace as _trace_utils
+
+            _ev = _trace_utils.events
+            rt.enable_trace(
+                _ts,
+                workers=list(my_workers)[
+                    : int(_os.environ.get("IRON_TRACE_NTILES", "1"))
+                ],
+                coretile_events=[
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_0, _ev.WireBundle.DMA, 0, True
+                    ),
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_1, _ev.WireBundle.DMA, 1, True
+                    ),
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_2, _ev.WireBundle.DMA, 0, False
+                    ),
+                    _ev.CoreEvent.INSTR_EVENT_0,
+                    _ev.CoreEvent.INSTR_EVENT_1,
+                    _ev.CoreEvent.MEMORY_STALL,
+                    _ev.CoreEvent.LOCK_STALL,
+                    _ev.CoreEvent.INSTR_VECTOR,
+                ],
+            )
         rt.start(*my_workers)
 
         tg = rt.task_group()

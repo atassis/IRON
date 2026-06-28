@@ -68,9 +68,14 @@ void matmul_bf16_bf16_wrapper(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out, i
 
     ::aie::set_rounding(ROUNDING_MODE);
 
+#ifndef MHA_NONCAUSAL
+    // Causal compute-skip: future KV blocks (kv > q) contribute nothing. Disabled for non-causal
+    // (e.g. autoregressive DECODE: a single query attends the whole valid cache). The tail mask
+    // (S_kv_eff) still bounds the valid KV width on the non-causal path.
     if (idx_buffer[0] > idx_buffer[1]) {
         return;
     }
+#endif
 
     matmul_bf16_bf16(a_in, b_in, c_out);
 }
@@ -93,9 +98,11 @@ void matmul_PV(bfloat16 *Q,
 
     ::aie::set_rounding(ROUNDING_MODE);
 
+#ifndef MHA_NONCAUSAL
     if (idx_buffer[0] > idx_buffer[1]) {
         return;
     }
+#endif
 
     // 64 emul: O dims = [(8, 512), (8, 8), (8, 64), (8, 1)]
     // VJUNG: Scale O_{i-1} by 1/exp(m_{i-1} - m_{i}) store in scale_buffer[3*B_q:3*B_q + B_q]
@@ -177,11 +184,14 @@ void partial_softmax(bfloat16 *A,
     int32_t q_block_idx = idx_buffer[1];
     int32_t kv_block_idx = idx_buffer[0];
 
-    // Causal full mask: skip blocks strictly above diagonal
+    // Causal full mask: skip blocks strictly above diagonal. Disabled for non-causal (decode: the
+    // single query attends the whole valid cache; the tail mask below, driven by S_kv_eff, bounds it).
+#ifndef MHA_NONCAUSAL
     if (kv_block_idx > q_block_idx) {
         zero_bf16(P);
         return;
     }
+#endif
 
     // Compute valid extents within this block for padded tails
     int32_t valid_q_rows = S_q_eff - q_block_idx * B_q;

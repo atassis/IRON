@@ -99,6 +99,13 @@ def fuse_mlir(artifact: FusedMLIRSource) -> None:
     device_mlir_strings = {}
     device_ty = None
     sequence_arg_types = {}
+    # Deep-C: module-scope `aiex.scratchpad_parameter` decls are device-global and live OUTSIDE the
+    # aie.device op, so the device-only stitch below would drop them (the read_scratchpad_parameter /
+    # sync preamble / dma_bd offset_parameter that USE them live inside the device and survive the
+    # round-trip + RunOp inlining — only the decl is lost). Collect the unique decls here and re-emit
+    # them at the fused module scope. Dedup by symbol so operators sharing a parameter name (e.g. one
+    # KV-write offset shared by every layer's strided-copy) collapse to a single decl.
+    scratchpad_decls = {}  # sym_name -> decl asm string
     for op_name, mlir_artifact in artifact.operator_mlir_map.items():
         mlir_module = get_child_mlir_module(mlir_artifact)
         device_ops = [
@@ -114,13 +121,46 @@ def fuse_mlir(artifact: FusedMLIRSource) -> None:
             device_ty = device_op.device
         device_mlir_strings[op_name] = str(device_op)
         sequence_arg_types[op_name] = extract_runtime_sequence_arg_types(device_op)
+        for op in mlir_module.body.operations:
+            if op.operation.name == "aiex.scratchpad_parameter":
+                sym = ir.StringAttr(op.operation.attributes["sym_name"]).value
+                decl = str(op.operation)
+                if scratchpad_decls.setdefault(sym, decl) != decl:
+                    raise ValueError(
+                        f"Conflicting scratchpad_parameter decls for symbol '{sym}': "
+                        f"{scratchpad_decls[sym]!r} vs {decl!r}"
+                    )
 
     # Build fused MLIR module
     with mlir_mod_ctx() as ctx:
 
-        # Concatenate aie.device ops
+        # Deep-C: re-emit the hoisted module-scope scratchpad_parameter decls FIRST (before the
+        # devices), matching the module layout the single-op scratchpad designs use.
+        for sym, decl_str in scratchpad_decls.items():
+            ctx.module.body.append(ir.Operation.parse(decl_str))
+
+        # Concatenate aie.device ops. A device that reads/uses scratchpad parameters fails standalone
+        # verification (aie.DeviceOp.parse) because read_scratchpad_parameter's verifier requires the
+        # module-scope decl in scope; parse it inside a decls-wrapper module so the decl is visible,
+        # then move the (renamed) device into the fused module which carries the same decls.
         for op_name, device_str in device_mlir_strings.items():
-            dev_op = aie.DeviceOp.parse(device_str)
+            if scratchpad_decls:
+                wrapper = (
+                    "module {\n"
+                    + "\n".join(scratchpad_decls.values())
+                    + "\n"
+                    + device_str
+                    + "\n}"
+                )
+                wmod = ir.Module.parse(wrapper)
+                dev_op = next(
+                    o
+                    for o in wmod.body.operations
+                    if isinstance(o, aie.DeviceOp)
+                )
+                dev_op.operation.detach_from_parent()
+            else:
+                dev_op = aie.DeviceOp.parse(device_str)
             dev_op.sym_name = ir.StringAttr.get(op_name)
             ctx.module.body.append(dev_op)
 
