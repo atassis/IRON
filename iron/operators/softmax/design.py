@@ -90,7 +90,9 @@ def softmax(
     # Define a task that will run on a compute tile
     def core_body(of_in1, of_out, softmax_kernel, mask_kernel, ctrl, barrier):
         if use_sp:
-            vector_size = ctrl.read()  # aiex.read_scratchpad_parameter, fresh per dispatch
+            vector_size = (
+                ctrl.read()
+            )  # aiex.read_scratchpad_parameter, fresh per dispatch
         else:
             barrier.wait_for_value(1)
             vector_size = ctrl[0]
@@ -161,6 +163,36 @@ def softmax(
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
     with rt.sequence(tensor_ty, tensor_ty) as (A, C):
+        # --- per-op NPU trace hook (opt-in via IRON_TRACE_SIZE env; no-op when unset
+        # so production builds are unaffected). Route-(b) standalone per-op measurement. ---
+        import os as _os
+
+        if int(_os.environ.get("IRON_TRACE_SIZE", "0")) > 0:
+            import aie.utils.trace as _tu
+
+            _ev = _tu.events
+            rt.enable_trace(
+                int(_os.environ["IRON_TRACE_SIZE"]),
+                workers=list(my_workers)[
+                    : int(_os.environ.get("IRON_TRACE_NTILES", "1"))
+                ],
+                coretile_events=[
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_0, _ev.WireBundle.DMA, 0, True
+                    ),
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_1, _ev.WireBundle.DMA, 1, True
+                    ),
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_2, _ev.WireBundle.DMA, 0, False
+                    ),
+                    _ev.CoreEvent.INSTR_EVENT_0,
+                    _ev.CoreEvent.INSTR_EVENT_1,
+                    _ev.CoreEvent.MEMORY_STALL,
+                    _ev.CoreEvent.LOCK_STALL,
+                    _ev.CoreEvent.INSTR_VECTOR,
+                ],
+            )
         if use_sp:
             # Runtime path: sync the host-written scratchpad word into the cores before they run.
             rt.sync_parameters()

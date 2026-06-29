@@ -31,6 +31,12 @@ class GEMV(MLIROperator):
     # artifact cache and the decode opts ALL its GEMVs in consistently.
     coalesce_batch_dma: bool = field(default=False, repr=False)
     kernel_vector_size: int = field(default=64, repr=False)
+    # dtype_a="int8" -> matrix A is int8 (quantized resident K/V cache, halves its LPDDR re-read); vector B
+    # + output stay bf16. Default "bf16" = unchanged. repr=False (artifact names stable; opt-in via kwarg).
+    dtype_a: str = field(default="bf16", repr=False)
+    # epilogue="gelu" -> fused GELU(tanh) over the output C-tile (folds a separate GELU op into the GEMV).
+    # Default "none". repr=False keeps artifact names stable for callers.
+    epilogue: str = field(default="none", repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -78,6 +84,8 @@ class GEMV(MLIROperator):
                     "verbose": mlir_verbose,
                     "kernel_object": f"gemv_{self.K}k_{self.kernel_vector_size}vs.o",
                     "coalesce_batch_dma": self.coalesce_batch_dma,
+                    "dtype_a": self.dtype_a,
+                    "epilogue": self.epilogue,
                 },
             ),
         )

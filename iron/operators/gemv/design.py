@@ -37,6 +37,8 @@ def my_matvec(
     func_prefix="",
     verbose=False,
     coalesce_batch_dma=False,
+    dtype_a="bf16",
+    epilogue="none",
 ):
     if m_output is None:
         m_output = m_input
@@ -57,24 +59,38 @@ def my_matvec(
     assert (M // cols) % m_input == 0, "m_input must evenly divide M/cols"
 
     vectorized = True
-    dtype_in = np.dtype[bfloat16]
+    # B (vector) + C (output) are always bf16; A (matrix) may be int8 (a quantized resident K/V cache that
+    # halves its LPDDR re-read) via dtype_a="int8" -> binds matvec_vectorized_i8_bf16 (widens int8 A to bf16,
+    # MACs with bf16 B; per-tensor dequant scale folded host-side). bf16 path unchanged (default).
+    dtype_in = np.dtype[bfloat16]  # B vector dtype
     dtype_in_str = "bf16"
     dtype_out = np.dtype[bfloat16]
     dtype_out_str = "bf16"
+    # A (matrix) may be int8 (a quantized resident K/V cache that halves its LPDDR re-read). To avoid an
+    # i8-typed MLIR buffer (the fusion arena is bf16 + reinterpret_cast can't change element type), the int8
+    # bytes are STORED IN A bf16-TYPED buffer with HALF the inner dim (2 int8 per bf16 slot); the kernel
+    # (matvec_vectorized_i8_bf16) reinterprets bf16->int8 at the C level. So A stays bf16 in MLIR (no fusion
+    # change), DIM_K (the int8 contract length) stays K.
+    if dtype_a == "int8":
+        dtype_a_str = "i8"
+        a_k = K // 2  # K int8 bytes per row = K//2 bf16 slots
+    else:
+        dtype_a_str = "bf16"
+        a_k = K
 
     assert M % cols == 0
 
     L1_A_ty = np.ndarray[
         (
             m_input,
-            K,
+            a_k,
         ),
         dtype_in,
     ]
     L1_B_ty = np.ndarray[(K,), dtype_in]
     L1_C_ty = np.ndarray[(m_output,), dtype_out]
     L3_A_ty = np.ndarray[
-        (num_batches * M * K,),
+        (num_batches * M * a_k,),
         dtype_in,
     ]
     L3_B_ty = np.ndarray[(num_batches * K,), dtype_in]
@@ -82,10 +98,22 @@ def my_matvec(
 
     func_type = "vectorized" if vectorized else "scalar"
     matvec = Kernel(
-        f"{func_prefix}matvec_{func_type}_{dtype_in_str}_{dtype_out_str}",
+        f"{func_prefix}matvec_{func_type}_{dtype_a_str}_{dtype_out_str}",
         f"{func_prefix}{kernel_object}",
         [np.int32, np.int32, L1_A_ty, L1_B_ty, L1_C_ty],
     )
+    # epilogue="gelu": fold a GELU(tanh) into the GEMV. Applied ONCE per C-tile over the full m_output rows
+    # (in core_body, after the matvec inner-loop) — NOT per matvec call, whose m_input tile can be < the
+    # gelu 16-wide vector. bf16-only.
+    gelu_kernel = None
+    if epilogue == "gelu":
+        assert vectorized and dtype_a_str == "bf16", "gelu epilogue is bf16-vectorized only"
+        assert m_output % 16 == 0, f"gelu epilogue needs m_output % 16 == 0 (got {m_output})"
+        gelu_kernel = Kernel(
+            f"{func_prefix}gelu_tile_bf16",
+            f"{func_prefix}{kernel_object}",
+            [np.int32, L1_C_ty],
+        )
 
     A_L3L1_fifos = [
         ObjectFifo(L1_A_ty, name=f"A_L3L1_{i}", depth=2) for i in range(cols)
@@ -97,7 +125,7 @@ def my_matvec(
         ObjectFifo(L1_C_ty, name=f"C_L1L3_{i}", depth=2) for i in range(cols)
     ]
 
-    def core_body(A_L3L1_fifo, B_L3L1_fifo, C_L1L3_fifo, matvec):
+    def core_body(A_L3L1_fifo, B_L3L1_fifo, C_L1L3_fifo, matvec, gelu_kernel=None):
         one_idx = index.constant(1)
         for _ in range_(0xFFFFFFFF):  # batch dim handled as part of this loop
             b = B_L3L1_fifo.acquire(1)
@@ -111,6 +139,9 @@ def my_matvec(
                     a = A_L3L1_fifo.acquire(1)
                     matvec(m_input, output_row_offset, a, b, c)
                     A_L3L1_fifo.release(1)
+                # epilogue: gelu over the FULL m_output C-tile (the matvec inner-loop has filled all rows).
+                if gelu_kernel is not None:
+                    gelu_kernel(m_output, c)
                 C_L1L3_fifo.release(1)
             B_L3L1_fifo.release(1)
 
@@ -122,7 +153,8 @@ def my_matvec(
                 B_L3L1_fifos[i].cons(),
                 C_L1L3_fifos[i].prod(),
                 matvec,
-            ],
+            ]
+            + ([gelu_kernel] if epilogue == "gelu" else []),
         )
         for i in range(cols)
     ]
@@ -134,8 +166,9 @@ def my_matvec(
         [
             TensorAccessPattern(
                 tensor_dims=L3_A_ty.__args__[0],
-                offset=col * (M // cols) * K + batch * M * K,
-                sizes=[1, 1, 1, (M // cols) * K],
+                # A is laid out in a_k-wide rows (a_k = K for bf16, K//2 for the int8-bytes-in-bf16 buffer).
+                offset=col * (M // cols) * a_k + batch * M * a_k,
+                sizes=[1, 1, 1, (M // cols) * a_k],
                 strides=[0, 0, 0, 1],
             )
             for batch in range(num_batches)
@@ -210,18 +243,52 @@ def my_matvec(
     # Constructed only when opting in, so the default path (and other GEMV callers)
     # never run _split_run/_split_batch (which could raise for an unsplittable run).
     A_taps_coalesced = (
-        [_coalesced_tap(L3_A_ty, col * (M // cols) * K, (M // cols) * K, M * K)
-         for col in range(cols)]
-        if coalesce_batch_dma else None
+        [
+            _coalesced_tap(L3_A_ty, col * (M // cols) * K, (M // cols) * K, M * K)
+            for col in range(cols)
+        ]
+        if coalesce_batch_dma
+        else None
     )
     C_taps_coalesced = (
-        [_coalesced_tap(L3_C_ty, col * (M // cols), (M // cols), M)
-         for col in range(cols)]
-        if coalesce_batch_dma else None
+        [
+            _coalesced_tap(L3_C_ty, col * (M // cols), (M // cols), M)
+            for col in range(cols)
+        ]
+        if coalesce_batch_dma
+        else None
     )
 
     rt = Runtime()
     with rt.sequence(L3_A_ty, L3_B_ty, L3_C_ty) as (A, B, C):
+        # --- per-op NPU trace hook (opt-in via IRON_TRACE_SIZE env; no-op when unset
+        # so production builds are unaffected). Route-(b) standalone per-op measurement. ---
+        import os as _os
+
+        if int(_os.environ.get("IRON_TRACE_SIZE", "0")) > 0:
+            import aie.utils.trace as _tu
+
+            _ev = _tu.events
+            rt.enable_trace(
+                int(_os.environ["IRON_TRACE_SIZE"]),
+                workers=list(workers)[: int(_os.environ.get("IRON_TRACE_NTILES", "1"))],
+                coretile_events=[
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_0, _ev.WireBundle.DMA, 0, True
+                    ),
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_1, _ev.WireBundle.DMA, 1, True
+                    ),
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_2, _ev.WireBundle.DMA, 0, False
+                    ),
+                    _ev.CoreEvent.INSTR_EVENT_0,
+                    _ev.CoreEvent.INSTR_EVENT_1,
+                    _ev.CoreEvent.MEMORY_STALL,
+                    _ev.CoreEvent.LOCK_STALL,
+                    _ev.CoreEvent.INSTR_VECTOR,
+                ],
+            )
         rt.start(*workers)
         tg_b = rt.task_group()
         for col in range(cols):
@@ -231,13 +298,18 @@ def my_matvec(
             tg_ac = rt.task_group()
             for col in range(cols):
                 rt.fill(
-                    A_L3L1_fifos[col].prod(), A, A_taps_coalesced[col],
+                    A_L3L1_fifos[col].prod(),
+                    A,
+                    A_taps_coalesced[col],
                     task_group=tg_ac,
                 )
             for col in range(cols):
                 rt.drain(
-                    C_L1L3_fifos[col].cons(), C, C_taps_coalesced[col],
-                    task_group=tg_ac, wait=True,
+                    C_L1L3_fifos[col].cons(),
+                    C,
+                    C_taps_coalesced[col],
+                    task_group=tg_ac,
+                    wait=True,
                 )
             rt.finish_task_group(tg_ac)
         else:
@@ -245,7 +317,9 @@ def my_matvec(
                 tg_ac = rt.task_group()
                 for col in range(cols):
                     rt.fill(
-                        A_L3L1_fifos[col].prod(), A, A_taps[col][batch],
+                        A_L3L1_fifos[col].prod(),
+                        A,
+                        A_taps[col][batch],
                         task_group=tg_ac,
                     )
                 for col in range(cols):

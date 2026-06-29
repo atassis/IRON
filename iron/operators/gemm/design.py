@@ -701,6 +701,34 @@ def my_matmul(
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
     with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
+        # --- per-op NPU trace hook (opt-in via IRON_TRACE_SIZE env; no-op when unset
+        # so production builds are unaffected). Route-(b) standalone per-op measurement. ---
+        import os as _os
+
+        if int(_os.environ.get("IRON_TRACE_SIZE", "0")) > 0:
+            import aie.utils.trace as _tu
+
+            _ev = _tu.events
+            rt.enable_trace(
+                int(_os.environ["IRON_TRACE_SIZE"]),
+                workers=list(workers)[: int(_os.environ.get("IRON_TRACE_NTILES", "1"))],
+                coretile_events=[
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_0, _ev.WireBundle.DMA, 0, True
+                    ),
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_1, _ev.WireBundle.DMA, 1, True
+                    ),
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_2, _ev.WireBundle.DMA, 0, False
+                    ),
+                    _ev.CoreEvent.INSTR_EVENT_0,
+                    _ev.CoreEvent.INSTR_EVENT_1,
+                    _ev.CoreEvent.MEMORY_STALL,
+                    _ev.CoreEvent.LOCK_STALL,
+                    _ev.CoreEvent.INSTR_VECTOR,
+                ],
+            )
         rt.start(*workers)
 
         # Set runtime parameters
