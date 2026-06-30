@@ -12,7 +12,6 @@ import numpy as np
 
 from aie.dialects.aiex import TensorAccessPattern
 from aie.iron import ObjectFifo, Program, Runtime, ScratchpadParameter
-from aie.iron.placers import SequentialPlacer
 
 
 def strided_copy(
@@ -152,4 +151,4 @@ def strided_copy(
             )
         rt.finish_task_group(tg)
 
-    return Program(dev, rt).resolve_program(SequentialPlacer())
+    return Program(dev, rt).resolve_program()

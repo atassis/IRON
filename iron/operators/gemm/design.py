@@ -18,7 +18,6 @@ from aie.iron import (
     WorkerRuntimeBarrier,
     str_to_dtype,
 )
-from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1Col1, NPU1Col2, NPU1, NPU2, Tile
 from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D, TensorAccessPattern
 from aie.iron.controlflow import range_
@@ -358,7 +357,7 @@ def my_matmul(
                         tap=C_tiles[col * n_chunks + c], wait=True, task_group=tg,
                     )
                 rt.finish_task_group(tg)
-        return Program(dev_ty, rt).resolve_program(SequentialPlacer())
+        return Program(dev_ty, rt).resolve_program()
 
     # Input matrix A:
     # Conceptually, we divide input A into (m * n_rows, k)-sized blocks. These
@@ -928,7 +927,7 @@ def my_matmul(
     my_program = Program(dev_ty, rt)
 
     # Place components (assign them resources on the device) and generate an MLIR module
-    module = my_program.resolve_program(SequentialPlacer())
+    module = my_program.resolve_program()
     return module
 
 
