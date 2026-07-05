@@ -33,6 +33,9 @@ class Transpose(MLIROperator):
     n: int
     s: int
     num_batches: int = 1
+    # repr=False so it is excluded from the op `name` (the kernel cache key is unchanged) -- opt-in
+    # B-unroll->BD-iteration coalesce of the per-batch L3 DMA (single-tile configs only; see design.py).
+    coalesce_batch_dma: bool = field(default=False, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -81,6 +84,9 @@ class Transpose(MLIROperator):
                     self.s,
                     self.num_batches,
                 ),
+                {
+                    "coalesce_batch_dma": self.coalesce_batch_dma,
+                },
             ),
         )
 
