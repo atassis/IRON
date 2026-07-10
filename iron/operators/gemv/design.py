@@ -9,6 +9,7 @@ from aie.dialects.aie import T
 from aie.helpers.dialects.scf import _for as range_
 from aie.helpers.taplib import TensorAccessPattern
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
+from iron.operators._trace import maybe_enable_trace
 
 """
 Matrix-vector design
@@ -36,6 +37,7 @@ def my_matvec(
     kernel_object="mv.o",
     func_prefix="",
     verbose=False,
+    dtype_a="bf16",
     epilogue="none",
 ):
     if m_output is None:
@@ -57,24 +59,38 @@ def my_matvec(
     assert (M // cols) % m_input == 0, "m_input must evenly divide M/cols"
 
     vectorized = True
-    dtype_in = np.dtype[bfloat16]
+    # B (vector) + C (output) are always bf16; A (matrix) may be int8 (a quantized resident K/V cache that
+    # halves its LPDDR re-read) via dtype_a="int8" -> binds matvec_vectorized_i8_bf16 (widens int8 A to bf16,
+    # MACs with bf16 B; per-tensor dequant scale folded host-side). bf16 path unchanged (default).
+    dtype_in = np.dtype[bfloat16]  # B vector dtype
     dtype_in_str = "bf16"
     dtype_out = np.dtype[bfloat16]
     dtype_out_str = "bf16"
+    # A (matrix) may be int8 (a quantized resident K/V cache that halves its LPDDR re-read). To avoid an
+    # i8-typed MLIR buffer (the fusion arena is bf16 + reinterpret_cast can't change element type), the int8
+    # bytes are STORED IN A bf16-TYPED buffer with HALF the inner dim (2 int8 per bf16 slot); the kernel
+    # (matvec_vectorized_i8_bf16) reinterprets bf16->int8 at the C level. So A stays bf16 in MLIR (no fusion
+    # change), DIM_K (the int8 contract length) stays K.
+    if dtype_a == "int8":
+        dtype_a_str = "i8"
+        a_k = K // 2  # K int8 bytes per row = K//2 bf16 slots
+    else:
+        dtype_a_str = "bf16"
+        a_k = K
 
     assert M % cols == 0
 
     L1_A_ty = np.ndarray[
         (
             m_input,
-            K,
+            a_k,
         ),
         dtype_in,
     ]
     L1_B_ty = np.ndarray[(K,), dtype_in]
     L1_C_ty = np.ndarray[(m_output,), dtype_out]
     L3_A_ty = np.ndarray[
-        (num_batches * M * K,),
+        (num_batches * M * a_k,),
         dtype_in,
     ]
     L3_B_ty = np.ndarray[(num_batches * K,), dtype_in]
@@ -82,7 +98,7 @@ def my_matvec(
 
     func_type = "vectorized" if vectorized else "scalar"
     matvec = Kernel(
-        f"{func_prefix}matvec_{func_type}_{dtype_in_str}_{dtype_out_str}",
+        f"{func_prefix}matvec_{func_type}_{dtype_a_str}_{dtype_out_str}",
         f"{func_prefix}{kernel_object}",
         [np.int32, np.int32, L1_A_ty, L1_B_ty, L1_C_ty],
     )
@@ -92,6 +108,8 @@ def my_matvec(
     assert epilogue in ("none", "gelu")
     gelu_kernel = None
     if epilogue == "gelu":
+        # The activation kernel is bf16; the int8-A path binds a different matvec and is excluded.
+        assert dtype_a_str == "bf16", "gelu epilogue is bf16-only"
         assert (
             m_output % 16 == 0
         ), f"gelu epilogue needs m_output % 16 == 0 (got {m_output})"
@@ -151,8 +169,9 @@ def my_matvec(
         [
             TensorAccessPattern(
                 tensor_dims=L3_A_ty.__args__[0],
-                offset=col * (M // cols) * K + batch * M * K,
-                sizes=[1, 1, 1, (M // cols) * K],
+                # A is laid out in a_k-wide rows (a_k = K for bf16, K//2 for the int8-bytes-in-bf16 buffer).
+                offset=col * (M // cols) * a_k + batch * M * a_k,
+                sizes=[1, 1, 1, (M // cols) * a_k],
                 strides=[0, 0, 0, 1],
             )
             for batch in range(num_batches)
@@ -287,4 +306,7 @@ def my_matvec(
             [of.cons() for of in C_L1L3_fifos],
         ],
     )
-    return Program(dev, rt, workers=workers).resolve_program()
+    prog = Program(dev, rt, workers=workers)
+    # gemv takes no trace_size argument, so the IRON_TRACE_SIZE fallback is the whole knob.
+    maybe_enable_trace(prog, None, workers)
+    return prog.resolve_program()

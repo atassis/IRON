@@ -28,6 +28,10 @@ class MHA(MLIROperator):
     d: int
     num_KV_heads: int
     num_of_pipelines: int = field(default=1, repr=False)
+    # causal=True (default) = prefill/causal (upstream behaviour). causal=False compiles the kernel with
+    # -DMHA_NONCAUSAL (gates the 3 causal block-skips in mha.cc) for non-causal attention, e.g. ASR
+    # autoregressive decode where a single query attends the whole valid KV cache (width via S_kv_eff).
+    causal: bool = field(default=True)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -89,6 +93,8 @@ class MHA(MLIROperator):
         mm_defines_colmaj = mm_defines_rowmaj + [
             "-DB_COL_MAJ",
         ]
+        if not self.causal:
+            mm_defines_colmaj = mm_defines_colmaj + ["-DMHA_NONCAUSAL"]
         # mha.cc #includes softmax.cc and mm.cc (both col-major and row-major)
         # directly, so everything is compiled into a single mha.o translation unit.
         return [

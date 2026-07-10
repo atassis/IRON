@@ -28,6 +28,14 @@ class GEMV(MLIROperator):
     tile_size_output: int | None = None
     num_batches: int = 1
     kernel_vector_size: int = field(default=64, repr=False)
+    # coalesce_batch_dma: compat no-op. #127 made batched-DMA coalescing the DEFAULT and auto-derives it
+    # in design.py (coalesces only when stride/granularity/splittable constraints hold, else per-batch
+    # fallback), so this toggle is no longer plumbed into my_matvec. Kept as an accepted field so the
+    # (parked) batched decode callers that still pass coalesce_batch_dma= don't break. repr=False.
+    coalesce_batch_dma: bool = field(default=False, repr=False)
+    # dtype_a="int8" -> matrix A is int8 (quantized resident K/V cache, halves its LPDDR re-read); vector B
+    # + output stay bf16. Default "bf16" = unchanged. repr=False (artifact names stable; opt-in via kwarg).
+    dtype_a: str = field(default="bf16", repr=False)
     # Optional fused activation applied to each output tile in the producing core.
     # "none" (default) leaves the output unchanged; "gelu" applies GELU(tanh approx).
     # repr=False keeps operator/artifact names stable for the default path.
@@ -105,6 +113,7 @@ class GEMV(MLIROperator):
                 {
                     "verbose": mlir_verbose,
                     "kernel_object": self._kernel_link_file,
+                    "dtype_a": self.dtype_a,
                     "epilogue": self.epilogue,
                 },
             ),
