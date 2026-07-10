@@ -10,7 +10,17 @@ from aie.iron.controlflow import range_
 
 
 def shuffle_transpose(
-    dev, M, N, num_columns, num_channels, m, n, s, num_batches=1, func_prefix=""
+    dev,
+    M,
+    N,
+    num_columns,
+    num_channels,
+    m,
+    n,
+    s,
+    num_batches=1,
+    func_prefix="",
+    coalesce_batch_dma=False,
 ):
     num_elements = M * N
     per_tile_elements = m * n
@@ -97,6 +107,78 @@ def shuffle_transpose(
         for j in range(num_channels)
     ]
 
+    # B-unroll -> BD-iteration (opt-in): collapse the per-batch L3 fill/drain into batched BD(s).
+    # Two cases, both requiring num_columns==num_channels==1 and n==N (so the tile grid is only on M):
+    #
+    #  SINGLE-TILE (m==M): each per-batch L3 transfer is a CONTIGUOUS run of num_elements at offset
+    #    batch*num_elements (the transpose is done by the kernel's batch-independent L2L1 TAP, not the
+    #    L3 DMA). Both fill and drain coalesce to ONE batched 4D BD (batch in the size-uncapped dim,
+    #    run split across two wrap dims <=1023) — identical to the GEMV lever.
+    #
+    #  MULTI-TILE (m<M): the FILL is still contiguous (grid_row stride m*N == inner block m*n since
+    #    n==N -> telescopes), so one BD. The DRAIN is a transpose-SCATTER whose per-batch enumeration
+    #    order [grid_row, n, m] must be preserved with batch OUTERMOST. The AIE2p iteration (outermost)
+    #    BD dim is capped at <=64, so batch can't be a single >64 dim there -> the drain is BATCH-CHUNKED:
+    #    ceil(num_batches/64) BDs, each [chunk<=64, grid_row, n, m] strides [num_elements, m, M, 1].
+    #
+    # Offline-verified to enumerate the identical DRAM access for both cases:
+    #   scripts/tap_equivalence_transpose.py (single-tile), tap_equivalence_transpose_multitile.py (multi-tile).
+    # Default off; any other shape (multi-column/-channel, or n!=N) falls back to the per-batch path.
+    _grid_ok = num_columns == 1 and num_channels == 1 and n == N and M % m == 0
+    _single_tile = _grid_ok and m == M
+    _multi_tile = _grid_ok and m < M
+    _do_coalesce = coalesce_batch_dma and (_single_tile or _multi_tile)
+    _ITER_CAP = 64  # AIE2p iteration (outermost) BD dim cap (empirical, GEMV bring-up)
+
+    def _split_run(
+        n_, lim=1023
+    ):  # (hi, lo): lo = largest divisor <= lim (contiguous inner)
+        for lo in range(min(lim, n_), 0, -1):
+            if n_ % lo == 0 and (n_ // lo) <= lim:
+                return (n_ // lo, lo)
+        raise ValueError(f"transpose run={n_} not splittable into two dims <= {lim}")
+
+    def _coalesced_contiguous(
+        dims,
+    ):  # ONE BD: contiguous num_elements run, batch in the uncapped dim
+        assert num_elements <= (1 << 20), f"batch stride {num_elements} exceeds 2**20"
+        rhi, rlo = _split_run(num_elements)
+        return TensorAccessPattern(
+            dims, 0, [1, num_batches, rhi, rlo], [0, num_elements, rlo, 1]
+        )
+
+    def _chunked_drain(
+        dims,
+    ):  # batch-chunked transpose-scatter drain (multi-tile): one BD per <=64 batches
+        grid = M // m
+        # sizes [cb<=64, grid, n, m] must be <=1023 (cb<=_ITER_CAP by construction); strides
+        # [num_elements, m, M, 1] must be <=2**20 (M is a STRIDE here, not a size).
+        assert grid <= 1023 and n <= 1023 and m <= 1023
+        assert num_elements <= (1 << 20) and M <= (1 << 20)
+        taps = []
+        for c0 in range(0, num_batches, _ITER_CAP):
+            cb = min(_ITER_CAP, num_batches - c0)
+            taps.append(
+                TensorAccessPattern(
+                    dims, c0 * num_elements, [cb, grid, n, m], [num_elements, m, M, 1]
+                )
+            )
+        return taps
+
+    if _single_tile:
+        taps_in_L3L2_coalesced = [_coalesced_contiguous(in_dims)]
+        taps_out_L1L3_coalesced = [_coalesced_contiguous(out_dims)]
+    elif _multi_tile:
+        taps_in_L3L2_coalesced = [
+            _coalesced_contiguous(in_dims)
+        ]  # fill stays contiguous (1 BD)
+        taps_out_L1L3_coalesced = _chunked_drain(
+            out_dims
+        )  # drain = ceil(nb/64) chunk BDs
+    else:
+        taps_in_L3L2_coalesced = None
+        taps_out_L1L3_coalesced = None
+
     # AIE-array data movement with object fifos
     of_in1s_L3L2 = [
         ObjectFifo(tile_ty, name=f"of_in1s_L3L2_{i}_{j}", depth=fifodepth)
@@ -154,6 +236,36 @@ def shuffle_transpose(
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
     with rt.sequence(tensor_ty, tensor_ty) as (A, C):
+        # --- per-op NPU trace hook (opt-in via IRON_TRACE_SIZE env; no-op when unset
+        # so production builds are unaffected). Route-(b) standalone per-op measurement. ---
+        import os as _os
+
+        if int(_os.environ.get("IRON_TRACE_SIZE", "0")) > 0:
+            import aie.utils.trace as _tu
+
+            _ev = _tu.events
+            rt.enable_trace(
+                int(_os.environ["IRON_TRACE_SIZE"]),
+                workers=list(my_workers)[
+                    : int(_os.environ.get("IRON_TRACE_NTILES", "1"))
+                ],
+                coretile_events=[
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_0, _ev.WireBundle.DMA, 0, True
+                    ),
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_1, _ev.WireBundle.DMA, 1, True
+                    ),
+                    _ev.PortEvent(
+                        _ev.CoreEvent.PORT_RUNNING_2, _ev.WireBundle.DMA, 0, False
+                    ),
+                    _ev.CoreEvent.INSTR_EVENT_0,
+                    _ev.CoreEvent.INSTR_EVENT_1,
+                    _ev.CoreEvent.MEMORY_STALL,
+                    _ev.CoreEvent.LOCK_STALL,
+                    _ev.CoreEvent.INSTR_VECTOR,
+                ],
+            )
         rt.start(*my_workers)
 
         # One task group per batch (each a parallel fill+drain over all columns/channels), so the
