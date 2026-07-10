@@ -36,7 +36,16 @@ def strided_copy(
     num_aie_channels=1,
     input_offset_parameter=None,
     output_offset_parameter=None,
+    input_offset_patch_marker=0,
+    output_offset_patch_marker=0,
 ):
+    # Local moat (deep-C, no upstream equivalent): input/output_offset_patch_marker is a deferred-offset
+    # ELF-patch mechanism. When non-zero it is baked as a placeholder offset (sentinel, e.g. KV_MAGIC)
+    # into the BD TAP instead of the static offset; the host (npu-xrt FusedElfPatcher) rewrites that word
+    # in the ELF per token, so ONE compiled whole-decode ELF serves every token position. tensor_dims is
+    # expanded by the marker so the huge sentinel offset does not trip out-of-bounds during codegen.
+    # Distinct from *_offset_parameter (upstream scratchpad path, additive per-dispatch, ELF constant):
+    # the patch_marker path is the fused-ELF-patch path used by gen_layer / gen_self_attn / verify.
     assert len(input_sizes) == len(input_strides)
     assert len(output_sizes) == len(output_strides)
 
@@ -91,9 +100,13 @@ def strided_copy(
 
     input_taps = [
         TensorAccessPattern(
-            tensor_dims=(int(input_buffer_size),),
+            tensor_dims=(int(input_buffer_size + input_offset_patch_marker),),
             offset=(
-                input_offset
+                (
+                    input_offset_patch_marker
+                    if input_offset_patch_marker != 0
+                    else input_offset
+                )
                 + c
                 * (input_sizes[input_highest_sz_idx] // num_aie_channels)
                 * input_strides[input_highest_sz_idx]
@@ -110,9 +123,13 @@ def strided_copy(
 
     output_taps = [
         TensorAccessPattern(
-            tensor_dims=(int(output_buffer_size),),
+            tensor_dims=(int(output_buffer_size + output_offset_patch_marker),),
             offset=(
-                output_offset
+                (
+                    output_offset_patch_marker
+                    if output_offset_patch_marker != 0
+                    else output_offset
+                )
                 + c
                 * (output_sizes[output_highest_sz_idx] // num_aie_channels)
                 * output_strides[output_highest_sz_idx]
