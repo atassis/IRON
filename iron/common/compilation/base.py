@@ -531,7 +531,14 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
                     str(self.peano_dir),
                 ]
             compile_cmd += [
-                "--expand-load-pdis",
+                *([] if os.environ.get("SKIP_EXPAND_PDIS") else ["--expand-load-pdis"]),
+                *(["--disable-repeater-scripts"] if os.environ.get("DISABLE_REPEATER") else []),
+                *(["-O", os.environ["AIECC_OPT"]] if os.environ.get("AIECC_OPT") else []),
+                # Emit params.txt (scratchpad runtime-parameter descriptors) into the .prj so the host
+                # ParameterScratchpad runtime (sequence.py callable `.params`) can write per-dispatch
+                # params (e.g. decode kv_off/sm_mask). No-op + no file when the sequence has no runtime
+                # parameters; emits only a descriptor file, so the generated ELF is unchanged.
+                "--emit-scratchpad-parameters",
                 "--generate-full-elf",
                 "--full-elf-name",
                 os.path.abspath(artifact.filename),
