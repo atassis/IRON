@@ -11,7 +11,6 @@ import pyxrt
 import torch
 from . import compilation as comp
 from .base import AIEOperatorBase, MLIROperator
-from .utils import XRTSubBuffer
 import aie.utils as aie_utils
 from aie.iron.device import NPU2
 from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
@@ -569,21 +568,21 @@ class SequenceFullELFCallable(SequenceCallable):
             "output": self.output_buffer,
             "scratch": self.scratch_buffer,
         }[buf_type]
-        sub = XRTSubBuffer(
-            parent_bo=parent.buffer_object(),
-            offset_bytes=offset,
-            size_bytes=length,
-            shape=(length // BF16.itemsize,),
+        sub = parent.subview(
+            offset // BF16.itemsize,
+            (length // BF16.itemsize,),
             dtype=ml_dtypes.bfloat16,
-            parent=parent,
         )
         self._buffer_cache[buffer_name] = sub
         return sub
 
     def _sync_inputs(self):
-        # Sub-views handed out by get_buffer() mark this parent host-dirty on .data
-        # access (XRTSubBuffer.data), so `to("npu")` here actually fires the host->device
-        # sync for the freshly written inputs.
+        # Inputs were written host-side into sub-views of the input arena. The
+        # arena parent owns residency for all its windows, so force the one-shot
+        # whole-arena upload. (Upstream subviews share the parent's storage and
+        # do not mark the parent host-dirty on access, so assert cpu residency
+        # first to make to("npu") actually fire.)
+        self.input_buffer.device = "cpu"
         self.input_buffer.to("npu")
 
     def _sync_outputs(self):
@@ -661,13 +660,10 @@ class SequenceXclbinCallable(_PerBufferCallable):
         return XRTTensor((n_elements,), dtype=ml_dtypes.bfloat16)
 
     def _make_subbuffer(self, parent, offset_bytes, size_bytes):
-        return XRTSubBuffer(
-            parent_bo=parent.buffer_object(),
-            offset_bytes=offset_bytes,
-            size_bytes=size_bytes,
-            shape=(size_bytes // BF16.itemsize,),
+        return parent.subview(
+            offset_bytes // BF16.itemsize,
+            (size_bytes // BF16.itemsize,),
             dtype=ml_dtypes.bfloat16,
-            parent=parent,
         )
 
     def _allocate_buffers(self):
