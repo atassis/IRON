@@ -365,16 +365,44 @@ class FusedFullELFCallable(FullELFCallable):
             size_bytes=length,
             shape=(length // itemsize,),
             dtype=ml_dtypes.bfloat16,
+            # Without this link the sub-view cannot mark its PARENT host-dirty, which is
+            # exactly what XRTSubBuffer.data exists to do -- and the parent is what gets
+            # synced below. Omitting it left the parent "npu" from allocation forever, so
+            # the sync no-opped and kernels read init-zeros. See issue Xilinx/mlir-aie#3420.
+            parent=main_buffer,
         )
 
         self._buffer_cache[buffer_name] = sub_buffer
         return sub_buffer
 
-    def __call__(self):
+    def _sync_inputs(self):
+        # Sub-views handed out by get_buffer() mark this parent host-dirty on .data access
+        # (XRTSubBuffer.data), so `to("npu")` here actually fires the host->device sync for
+        # the freshly written inputs. Mirrors OperatorSequence._sync_inputs.
+        #
+        # The residency assert is deliberate belt-and-braces: .data is the only write hook,
+        # so a caller that grabs `buf = get_buffer(x).data` ONCE and then writes into that
+        # ndarray in a loop never re-marks the parent, and the guarded `.to()` would no-op
+        # on every later dispatch. Host is always the authority for inputs here, and this
+        # buffer is small (scratch -- weights/KV -- is synced separately and is untouched),
+        # so forcing the sync costs nothing and removes a silent-staleness class.
+        self.input_buffer.device = "cpu"
         self.input_buffer.to("npu")
+
+    def _sync_outputs(self):
+        # _run just rewrote the output arena on the device, so the device holds the
+        # authoritative copy. Force the device->host sync: assert device residency first
+        # so `to("cpu")` fires even if a prior read of get_buffer(...).data marked the
+        # buffer "cpu" (otherwise a looped dispatch would read stale output).
+        # Mirrors OperatorSequence._sync_outputs.
+        self.output_buffer.device = "npu"
+        self.output_buffer.to("cpu")
+
+    def __call__(self):
+        self._sync_inputs()
         super().__call__(
             self.input_buffer.buffer_object(),
             self.output_buffer.buffer_object(),
             self.scratch_buffer.buffer_object(),
         )
-        self.output_buffer.to("cpu")
+        self._sync_outputs()
