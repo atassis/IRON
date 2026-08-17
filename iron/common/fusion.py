@@ -398,6 +398,21 @@ class FusedFullELFCallable(FullELFCallable):
         # so forcing the sync costs nothing and removes a silent-staleness class.
         self.input_buffer.device = "cpu"
         self.input_buffer.to("npu")
+        # The output arena too, and NOT for its contents: a caller that pre-fills or clears
+        # it through `get_buffer(...).data` (an unreconciled write -- see NpuTensor.data)
+        # leaves DIRTY host cache lines over the region the DMA is about to write. The
+        # device-to-host sync afterwards does not discard them, so those lines shadow the
+        # device's output and the caller reads back its own pre-fill. MEASURED: with a
+        # sentinel pre-fill, 1024/1024 elements read the sentinel and none read the device's
+        # bytes; with this flush, 1024/1024 exact. Flushing writes the dirty lines out, so
+        # none outlive the dispatch. Costs one sync of a small arena.
+        #
+        # Scratch is deliberately not flushed here: it carries the weights and KV, is synced
+        # by whoever loads it, and is large enough that an unconditional flush per dispatch
+        # would cost real time. A caller that pre-writes scratch through `.data` has the same
+        # hazard and must flush it itself.
+        self.output_buffer.device = "cpu"
+        self.output_buffer.to("npu")
 
     def _sync_outputs(self):
         # _run just rewrote the output arena on the device, so the device holds the

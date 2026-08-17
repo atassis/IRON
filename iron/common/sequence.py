@@ -627,6 +627,13 @@ class SequenceFullELFCallable(SequenceCallable):
         # access (XRTSubBuffer.data), so `to("npu")` here actually fires the host->device
         # sync for the freshly written inputs.
         self.input_buffer.to("npu")
+        # And the output arena, for its cache state rather than its contents: a caller that
+        # pre-fills or clears it through `get_buffer(...).data` leaves dirty host lines over
+        # the region the DMA is about to write, the device-to-host sync does not discard
+        # them, and the caller reads back its own pre-fill. See the measurement in
+        # fusion.py's FusedFullELFCallable._sync_inputs.
+        self.output_buffer.device = "cpu"
+        self.output_buffer.to("npu")
 
     def _sync_outputs(self):
         # _run just rewrote the output arena on the device, so the device holds the
