@@ -5,6 +5,65 @@ import numpy as np
 from aie.dialects.aie import get_target_model, WireBundle
 from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor, xrt as _pyxrt
 
+try:
+    from aie.utils.hostruntime.tensor_class import COHERENCE_GRANULE
+except ImportError:  # runtimes predating the coherence map
+    COHERENCE_GRANULE = 64
+
+
+def align_up(value: int, alignment: int = COHERENCE_GRANULE) -> int:
+    """Round ``value`` up to the next multiple of ``alignment``."""
+    return -(-value // alignment) * alignment
+
+
+def granule_arena_offsets(lengths):
+    """Byte offsets placing ``lengths`` in one arena so every sub-view is syncable.
+
+    Host and device reconcile a cache line at a time, so two sub-views sharing a
+    line are not independently syncable: one view's flush can write its stale host
+    copy over bytes the device just produced in its neighbour. ``subview()``
+    refuses such a view outright, requiring a granule-aligned offset AND a
+    granule-sized length -- excusing the length only when the view ends where its
+    parent does, since then no sibling shares its last line.
+
+    So each buffer is placed at the next granule boundary, and the arena ends
+    exactly where its last buffer ends. Padding the tail instead would cost that
+    last buffer the ends-at-parent-end exemption, which is the only thing that
+    makes a length that is not a whole number of granules legal at all -- and every
+    design running today relies on it (``vpair_stage``'s 16- and 32-byte buffers).
+
+    ``COHERENCE_GRANULE`` is the *build host's* line size (floored at 64). A layout
+    built here and run where the line is wider trips the check again -- loudly, at
+    ``subview()``, not silently.
+
+    Raises:
+        ValueError: If more than one length is not a multiple of the granule. Only
+            the last buffer can carry a ragged length, so no ordering of the arena
+            satisfies two of them; the caller must pad the operator's own buffer
+            sizes up to the granule instead.
+    """
+    lengths = list(lengths)
+    ragged = [n for n in lengths if n % COHERENCE_GRANULE]
+    if len(ragged) > 1:
+        raise ValueError(
+            f"{len(ragged)} buffers in one arena have lengths that are not multiples "
+            f"of the {COHERENCE_GRANULE}-byte coherence granule ({ragged}). At most "
+            f"one can be placed last and take the ends-at-parent-end exemption, so no "
+            f"layout makes them all independently syncable. Pad the operator buffer "
+            f"sizes up to a multiple of {COHERENCE_GRANULE} bytes."
+        )
+    offsets, cursor = [], 0
+    last = len(lengths) - 1
+    for i, n in enumerate(lengths):
+        offsets.append(cursor)
+        cursor += n if i == last else align_up(n)
+    return offsets, cursor
+
+
+def granule_arena_order(names, length_of):
+    """``names`` reordered so the one buffer with a ragged length is placed last."""
+    return sorted(names, key=lambda n: bool(length_of(n) % COHERENCE_GRANULE))
+
 
 def get_shim_dma_limit(dev) -> int:
     """Return the total number of ShimDMA output channels available on the device.

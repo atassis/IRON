@@ -11,7 +11,7 @@ import pyxrt
 import torch
 from . import compilation as comp
 from .base import AIEOperatorBase, MLIROperator
-from .utils import XRTSubBuffer
+from .utils import XRTSubBuffer, granule_arena_offsets, granule_arena_order
 import aie.utils as aie_utils
 from aie.iron.device import NPU2
 from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
@@ -390,22 +390,24 @@ class OperatorSequence(AIEOperatorBase):
         slice_info = {}  # full_buffer_name -> (base_name, start, end)
 
         def add_buffers(buffer_type, args_list):
-            offset = 0
+            placed = {}
             for arg in args_list:
                 if arg in self.explicit_buffer_sizes:
                     # Explicit size specified - this is a parent buffer for slices
-                    length = self.explicit_buffer_sizes[arg]
-                    subbuffer_layout[arg] = (buffer_type, offset, length)
-                    offset += length
+                    placed[arg] = self.explicit_buffer_sizes[arg]
                 elif arg in args:
                     arg_spec = args[arg]
-                    length = int(
+                    placed[arg] = int(
                         np.prod(arg_spec.shape) * np.dtype(arg_spec.dtype).itemsize
                     )
-                    subbuffer_layout[arg] = (buffer_type, offset, length)
-                    offset += length
                 # Note: sliced buffers are handled separately, not in args_list
-            return offset  # == total length
+            # Granule-spaced for the same reason as FusedMLIROperator's copy of this;
+            # see utils.granule_arena_offsets.
+            order = granule_arena_order(placed, placed.get)
+            offsets, total = granule_arena_offsets(placed[arg] for arg in order)
+            for arg, offset in zip(order, offsets):
+                subbuffer_layout[arg] = (buffer_type, offset, placed[arg])
+            return total  # == total length
 
         # Add sliced buffer entries to layout (they reference parent buffers)
         for buf_name, (base_name, start, end, args_spec) in sliced_buffers.items():
