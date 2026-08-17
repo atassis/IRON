@@ -359,18 +359,25 @@ class FusedFullELFCallable(FullELFCallable):
             )
 
         itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
-        sub_buffer = XRTSubBuffer(
-            parent_bo=main_buffer.buffer_object(),
-            offset_bytes=offset,
-            size_bytes=length,
-            shape=(length // itemsize,),
-            dtype=ml_dtypes.bfloat16,
-            # Without this link the sub-view cannot mark its PARENT host-dirty, which is
-            # exactly what XRTSubBuffer.data exists to do -- and the parent is what gets
-            # synced below. Omitting it left the parent "npu" from allocation forever, so
-            # the sync no-opped and kernels read init-zeros. See issue Xilinx/mlir-aie#3420.
-            parent=main_buffer,
-        )
+        shape = (length // itemsize,)
+        try:
+            # Preferred: the runtime's own sub-region view. It tracks residency in the
+            # coherence map shared with the parent, which is what our `parent=` link was
+            # emulating (issue Xilinx/mlir-aie#3420), and it refuses views that share a
+            # 64-byte granule instead of letting them silently clobber each other's syncs.
+            sub_buffer = main_buffer.subview(offset, shape, ml_dtypes.bfloat16)
+        except (AttributeError, NotImplementedError):
+            # Backends predating hostruntime subview(); XRTSubBuffer needs the parent link
+            # explicitly or the parent stays "npu" from allocation, the sync no-ops, and
+            # kernels read init-zeros.
+            sub_buffer = XRTSubBuffer(
+                parent_bo=main_buffer.buffer_object(),
+                offset_bytes=offset,
+                size_bytes=length,
+                shape=shape,
+                dtype=ml_dtypes.bfloat16,
+                parent=main_buffer,
+            )
 
         self._buffer_cache[buffer_name] = sub_buffer
         return sub_buffer
