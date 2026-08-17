@@ -611,21 +611,38 @@ class SequenceFullELFCallable(SequenceCallable):
             "output": self.output_buffer,
             "scratch": self.scratch_buffer,
         }[buf_type]
-        sub = XRTSubBuffer(
-            parent_bo=parent.buffer_object(),
-            offset_bytes=offset,
-            size_bytes=length,
-            shape=(length // BF16.itemsize,),
-            dtype=ml_dtypes.bfloat16,
-            parent=parent,
-        )
+        shape = (length // BF16.itemsize,)
+        try:
+            # Preferred: the runtime's own sub-region view, for the reasons in
+            # FusedFullELFCallable.get_buffer -- shared coherence map with the parent, and it
+            # refuses views that share a 64-byte granule. This path was migrated in e48befe
+            # and this call site was missed, so `dispatch="fused"` kept dying in
+            # XRTSubBuffer.__init__ with AttributeError: no attribute '_shape'.
+            sub = parent.subview(offset, shape, ml_dtypes.bfloat16)
+        except (AttributeError, NotImplementedError):
+            # Backends predating hostruntime subview(); the parent link is required or the
+            # parent stays "npu" from allocation, the sync no-ops, and kernels read init-zeros.
+            sub = XRTSubBuffer(
+                parent_bo=parent.buffer_object(),
+                offset_bytes=offset,
+                size_bytes=length,
+                shape=shape,
+                dtype=ml_dtypes.bfloat16,
+                parent=parent,
+            )
         self._buffer_cache[buffer_name] = sub
         return sub
 
     def _sync_inputs(self):
-        # Sub-views handed out by get_buffer() mark this parent host-dirty on .data
-        # access (XRTSubBuffer.data), so `to("npu")` here actually fires the host->device
-        # sync for the freshly written inputs.
+        # Force the host->device sync rather than relying on the sub-view to have marked this
+        # parent host-dirty. That marking was XRTSubBuffer.data's doing, and get_buffer() now
+        # hands out the runtime's subview(), whose `.data` is an unreconciled write (see
+        # NpuTensor.data) -- so the parent stayed "npu" from allocation, `to("npu")` no-opped,
+        # and the device read init-zeros. MEASURED on probe_fusion_roundtrip PROBE_PATH=sequence:
+        # 0/4096 then 640/4096 exact across trials (eviction luck, 64-byte quantised), and
+        # 4096/4096 with this flush. Same reason fusion.py forces it; host is always the
+        # authority for inputs here and the arena is small.
+        self.input_buffer.device = "cpu"
         self.input_buffer.to("npu")
         # And the output arena, for its cache state rather than its contents: a caller that
         # pre-fills or clears it through `get_buffer(...).data` leaves dirty host lines over
