@@ -218,3 +218,111 @@ def test_gemm(
     print(f"Throughput: {gflops:.6e} GFLOP/s\n")
 
     assert not errors, "Test failed"
+
+
+def get_m_stationary_params():
+    """Shapes where BOTH dataflows are legal, so n-stationary can act as the reference."""
+    dev = aie_utils.get_current_device()
+    if dev.resolve().name != "npu2" or dev.cols < 8:
+        return []
+    # fmt: off
+    #   M,     K,    N, cols, b_col_maj,  m,   k,   n
+    return [
+        (2048, 2048, 2048,  8,     False, 64,  64,  64),
+        (2048, 2048, 2048,  8,      True, 64,  64,  64),
+        (2048,  512, 1024,  8,     False, 64,  64,  64),
+    ]
+    # fmt: on
+
+
+def get_m_stationary_skinny_params():
+    """Shapes only the m-stationary dataflow can run: N < tile_n * cols."""
+    dev = aie_utils.get_current_device()
+    if dev.resolve().name != "npu2" or dev.cols < 8:
+        return []
+    # fmt: off
+    #   M,     K,   N, cols, b_col_maj,  m,   k,   n
+    return [
+        (2048, 2048,  64,  8,     False, 64,  64,  64),
+        (2048,  512, 128,  8,      True, 64,  64,  64),
+    ]
+    # fmt: on
+
+
+def _run_gemm(M, K, N, num_aie_columns, b_col_maj, m, k, n, m_stationary, ctx):
+    golden_ref = generate_golden_reference(
+        M=M, K=K, N=N, b_col_maj=b_col_maj, c_col_maj=False
+    )
+    operator = GEMM(
+        M=M,
+        K=K,
+        N=N,
+        tile_m=m,
+        tile_k=k,
+        tile_n=n,
+        num_aie_columns=num_aie_columns,
+        # m_stationary asserts against prio_accuracy (design.py), so the reference arm
+        # has to give up f32 accumulation too or the comparison is not like-for-like.
+        prio_accuracy=False,
+        emulate_bf16_mmul_with_bfp16=False,
+        b_col_maj=b_col_maj,
+        c_col_maj=False,
+        m_stationary=m_stationary,
+        context=ctx,
+    ).compile()
+
+    arg_spec = operator.get_arg_spec()
+    a_buf = XRTTensor.from_torch(golden_ref["input"].flatten())
+    b_buf = XRTTensor.from_torch(golden_ref["input_b"][0].flatten())
+    c_buf = XRTTensor(arg_spec[2].shape, dtype=arg_spec[2].dtype)
+    op_func = operator.get_callable()
+    op_func(a_buf, b_buf, c_buf)
+    # to_torch() is a view on the XRT buffer, which does not survive loading the next
+    # design; clone before the caller runs a second arm.
+    return c_buf.to_torch().flatten().clone(), golden_ref["output"][0].flatten()
+
+
+@pytest.mark.parametrize(
+    "M,K,N,num_aie_columns,b_col_maj,m,k,n", get_m_stationary_params()
+)
+def test_gemm_m_stationary(M, K, N, num_aie_columns, b_col_maj, m, k, n, aie_context):
+    """M-stationary must be bit-identical to the shipped N-stationary dataflow.
+
+    Both accumulate a given output element over K in the same order -- the dataflow
+    only moves WHERE that happens -- so this is an equality check, not a tolerance.
+    Comparing against the f32 golden reference instead would drown the signal: without
+    prio_accuracy, bf16 accumulation over K=2048 puts ~29% of elements past rel 0.005
+    on BOTH dataflows.
+    """
+    args = (M, K, N, num_aie_columns, b_col_maj, m, k, n)
+    got, _ = _run_gemm(*args, m_stationary=True, ctx=aie_context)
+    aie_utils.DefaultNPURuntime.cleanup()
+    ref, _ = _run_gemm(*args, m_stationary=False, ctx=aie_context)
+    mismatches = int((got.view(torch.uint16) != ref.view(torch.uint16)).sum())
+    assert (
+        mismatches == 0
+    ), f"{mismatches}/{got.numel()} elements differ from n-stationary"
+
+
+@pytest.mark.parametrize(
+    "M,K,N,num_aie_columns,b_col_maj,m,k,n", get_m_stationary_skinny_params()
+)
+def test_gemm_m_stationary_skinny_n(
+    M, K, N, num_aie_columns, b_col_maj, m, k, n, aie_context
+):
+    """N below tile_n*cols, which the N-stationary path rejects -- the reason O6 exists.
+
+    No equivalence arm is available here, so this only checks that the N-chunking is
+    sane: a wrong tiling gives O(1) relative error, while correct tiling lands on the
+    bf16 accumulation floor (measured 7.0e-3 at K=2048, 3.9e-3 at K=512, i.e. ~sqrt(K)).
+    """
+    got, expected = _run_gemm(
+        M, K, N, num_aie_columns, b_col_maj, m, k, n, m_stationary=True, ctx=aie_context
+    )
+    got_f = got.float()
+    exp_f = expected.float()
+    rel_l2 = float(torch.linalg.norm(got_f - exp_f) / torch.linalg.norm(exp_f))
+    print(f"\nrel_L2: {rel_l2:.3e}")
+    assert (
+        rel_l2 < 0.02
+    ), f"rel_L2 {rel_l2:.3e} is far above the bf16 accumulation floor"
