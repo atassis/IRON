@@ -41,6 +41,7 @@ import os.path
 import shutil
 import zlib
 import logging
+import functools
 import subprocess
 import importlib.util
 from dataclasses import dataclass, field
@@ -52,6 +53,25 @@ from iron.common.device_utils import get_kernel_dir
 
 # Global Functions
 # ##########################################################################
+
+
+@functools.lru_cache(maxsize=None)
+def _aiecc_accepts(aiecc_path: str, flag: str) -> bool:
+    """Whether this aiecc still has ``flag``, asked rather than assumed.
+
+    aiecc's core-backend flags inverted in mlir-aie #3501: Peano became the default and the
+    explicit ``--no-xchesscc`` / ``--no-xbridge`` opt-outs were dropped with it. IRON pins
+    mlir_aie 1.4.0, which predates that, so the opt-outs are REQUIRED there and are a hard
+    error ("Unknown command line argument") on any later toolchain. Neither spelling is
+    correct for both, so read the flag surface off --help once per binary.
+    """
+    try:
+        proc = subprocess.run(
+            [aiecc_path, "--help"], capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return False
+    return flag in (proc.stdout + proc.stderr)
 
 
 @dataclass
@@ -526,8 +546,11 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
                 ]
             else:
                 compile_cmd += [
-                    "--no-xchesscc",
-                    "--no-xbridge",
+                    flag
+                    for flag in ("--no-xchesscc", "--no-xbridge")
+                    if _aiecc_accepts(str(self.aiecc_path), flag)
+                ]
+                compile_cmd += [
                     "--peano",
                     str(self.peano_dir),
                 ]
@@ -602,8 +625,11 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
                 ]
             else:
                 compile_cmd += [
-                    "--no-xchesscc",
-                    "--no-xbridge",
+                    flag
+                    for flag in ("--no-xchesscc", "--no-xbridge")
+                    if _aiecc_accepts(str(self.aiecc_path), flag)
+                ]
+                compile_cmd += [
                     "--peano",
                     str(self.peano_dir),
                 ]
