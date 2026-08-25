@@ -145,3 +145,56 @@ def test_coalesce_batch_dma_reaches_the_design(m, n, coalesces, tmp_path):
         assert coalesced < per_batch
     else:
         assert coalesced == per_batch
+
+
+# Device arms for the coalesced path, chosen to cover each branch design.py can take:
+# the contiguous single-tile BD, the multi-tile chunked drain at one BD and at two
+# (num_batches > _ITER_CAP), the fifodepth==2 case where the fill runs ahead of the core
+# and the depth==1 case where it cannot (m*n > 4096), and an n != N shape the guard
+# refuses so the fallback stays covered.
+_COALESCE_DEVICE_ARMS = [
+    # M,    N,   m,   n,  nb,  admitted
+    (64, 64, 64, 64, 4, True),  # single-tile, depth 2
+    (2048, 64, 64, 64, 4, True),  # multi-tile, one drain BD, depth 2
+    (512, 64, 64, 64, 65, True),  # multi-tile, two drain BDs (nb > 64)
+    (2048, 64, 128, 64, 4, True),  # multi-tile, depth 1 (m*n > 4096): fully serial
+    (2048, 128, 64, 64, 4, False),  # n != N: guard refuses, per-batch fallback
+]
+
+
+@pytest.mark.parametrize("M,N,m,n,num_batches,admitted", _COALESCE_DEVICE_ARMS)
+@pytest.mark.parametrize("coalesce", [False, True])
+def test_coalesce_batch_dma_on_device(
+    M, N, m, n, num_batches, admitted, coalesce, aie_context
+):
+    """Offline tap equivalence proves the index sequence, not the runtime.
+
+    The coalesced fill is a single iterated BD that runs ahead of the core at
+    fifodepth 2, and correctness there rests on ObjectFifo lock backpressure rather
+    than on the taps. Transpose does no arithmetic, so the gate is exact equality
+    with the golden rather than a tolerance -- both arms must reproduce it bitwise.
+    """
+    golden_ref = generate_golden_reference(rows=M, cols=N, num_batches=num_batches)
+
+    operator = Transpose(
+        M=M,
+        N=N,
+        num_aie_columns=1,
+        num_channels=1,
+        m=m,
+        n=n,
+        s=8,
+        num_batches=num_batches,
+        coalesce_batch_dma=coalesce,
+        context=aie_context,
+    )
+
+    errors, _, _ = run_test(
+        operator,
+        {"input": golden_ref["input"]},
+        {"output": golden_ref["output"]},
+        rel_tol=0.0,
+        abs_tol=0.0,
+    )
+
+    assert not errors, f"Test failed with errors: {errors}"
