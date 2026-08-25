@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -134,12 +135,26 @@ class MLIROperator(AIEOperatorBase):
         """
         if dataclasses.is_dataclass(self):
             aliases = type(self)._name_aliases
-            parts = (
-                f"{aliases.get(f.name, f.name)}{_serialize_param(getattr(self, f.name))}"
-                for f in dataclasses.fields(self)
-                if f.repr and getattr(self, f.name) is not None
-            )
+            parts = []
+            off_name = []
+            for f in dataclasses.fields(self):
+                value = getattr(self, f.name)
+                if value is None or isinstance(value, AIEContext):
+                    continue
+                if f.repr:
+                    parts.append(
+                        f"{aliases.get(f.name, f.name)}{_serialize_param(value)}"
+                    )
+                elif f.default is dataclasses.MISSING or value != f.default:
+                    off_name.append(f"{f.name}={_serialize_param(value)}")
             base = type(self).__name__ + "_" + "_".join(parts)
+            if off_name:
+                # repr=False fields still reach the design generator, so they are part of
+                # the cache key even though they are hidden from the readable name. Only
+                # non-default ones are digested, so default-configured operators keep the
+                # names (and the cached artifacts) they had before.
+                digest = hashlib.sha256("|".join(off_name).encode()).hexdigest()[:8]
+                base += f"_{digest}"
         else:
             raise NotImplementedError(
                 f"{type(self).__name__} must be a @dataclass or override the name property"
