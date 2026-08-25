@@ -33,8 +33,10 @@ class Transpose(MLIROperator):
     n: int
     s: int
     num_batches: int = 1
-    # repr=False so it is excluded from the op `name` (the kernel cache key is unchanged) -- opt-in
-    # B-unroll->BD-iteration coalesce of the per-batch L3 DMA (single-tile configs only; see design.py).
+    # Opt-in B-unroll->BD-iteration coalesce of the per-batch L3 DMA. design.py takes it only
+    # for single-column/-channel shapes with n == N; anything else falls back to the per-batch
+    # path. repr=False, so it reaches the artifact name through the non-default digest rather
+    # than the readable part.
     coalesce_batch_dma: bool = field(default=False, repr=False)
     context: object = field(default=None, repr=False)
 

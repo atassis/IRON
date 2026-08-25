@@ -237,6 +237,21 @@ def shuffle_transpose(
     # Runtime operations to move data to/from the AIE-array
     def sequence(A, C, of_in1s_L3L2_prods, of_outs_conss):
 
+        if _do_coalesce:
+            # _do_coalesce implies one column and one channel, so there is a single FIFO
+            # pair. The fill is one iterated BD over every batch; the drain needs
+            # ceil(num_batches/64) of them because the iteration dim caps at _ITER_CAP.
+            # At fifodepth==1 this is correct but fully serial -- depth>=2 is what lets
+            # the fill run ahead of the core, and ObjectFifo lock backpressure is what
+            # makes running ahead safe (a producer that gets ahead blocks on the buffer
+            # lock; worst case a stall, never an overrun).
+            tg = TaskGroup()
+            of_in1s_L3L2_prods[0].fill(A, taps_in_L3L2_coalesced[0], group=tg)
+            for tap in taps_out_L1L3_coalesced:
+                of_outs_conss[0].drain(C, tap, wait=True, group=tg)
+            tg.finish()
+            return
+
         # One task group per batch (each a parallel fill+drain over all columns/channels), so the
         # num_batches contiguous matrices stream through the same FIFOs in sequence.
         for batch in range(num_batches):
