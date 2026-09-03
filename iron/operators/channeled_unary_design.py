@@ -71,6 +71,12 @@ def channeled_unary_design(
             of_out.release(1)
 
     # Create a worker to perform the task
+    # STACK. The IRON default worker stack is 1024 B and the generated ld.script places it directly
+    # below the objectFIFO buffers with ZERO clearance, so a kernel whose frame exceeds it corrupts
+    # a neighbouring buffer silently -- no crash, deterministic, and the surviving tiles stay
+    # bit-exact. Activation kernels that evaluate a software polynomial (silu's f32 exp2 path) spill
+    # well past 1024 B. Size it past the frame rather than discovering the overflow as a wrong
+    # result. Same class as the upstream stack_size bumps, which were guessed three times.
     my_workers = [
         Worker(
             core_fn,
@@ -79,6 +85,7 @@ def channeled_unary_design(
                 of_outs[i * num_channels + j].prod(),
                 kernel_fcn,
             ],
+            stack_size=0x2000,
         )
         for i in range(num_columns)
         for j in range(num_channels)
