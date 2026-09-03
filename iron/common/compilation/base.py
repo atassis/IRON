@@ -528,6 +528,28 @@ class AieccCompilationRule(CompilationRule):
         super().__init__(*args, **kwargs)
 
 
+
+_AIECC_SCRATCHPAD_FLAG = None
+
+
+def _aiecc_has_scratchpad_flag() -> bool:
+    """True iff the resolved aiecc accepts --get-scratchpad-parameters (cached)."""
+    global _AIECC_SCRATCHPAD_FLAG
+    if _AIECC_SCRATCHPAD_FLAG is None:
+        import shutil
+        import subprocess
+        exe = os.environ.get("AIECC_PATH") or shutil.which("aiecc") or "aiecc"
+        try:
+            out = subprocess.run([exe, "--help"], capture_output=True, text=True, timeout=120)
+            _AIECC_SCRATCHPAD_FLAG = "scratchpad-parameters" in (out.stdout + out.stderr)
+        except Exception:
+            _AIECC_SCRATCHPAD_FLAG = False
+        if not _AIECC_SCRATCHPAD_FLAG:
+            print("[iron] NOTE: aiecc lacks --get-scratchpad-parameters; no params.txt will be "
+                  "emitted, so the built ELF cannot be driven per-token yet.")
+    return _AIECC_SCRATCHPAD_FLAG
+
+
 class AieccFullElfCompilationRule(AieccCompilationRule):
     def matches(self, graph):
         return any(graph.get_worklist(FullElfArtifact))
@@ -542,7 +564,13 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
             options = [
                 f"-j{os.environ.get('AIECC_JOBS', '1')}",
                 "--expand-load-pdis",
-                "--get-scratchpad-parameters",
+                # --get-scratchpad-parameters emits params.txt (the runtime-parameter descriptors the
+                # host ParameterScratchpad needs for per-dispatch kv_off/sm_mask). It is a fork-carried
+                # aiecc option and is ABSENT from older instances, where passing it aborts the whole
+                # compile on an unknown-argument error. Probe once instead of assuming: a build against
+                # an instance without it still produces a correct ELF, it just cannot be driven
+                # per-token until the instance is bumped.
+                *(["--get-scratchpad-parameters"] if _aiecc_has_scratchpad_flag() else []),
             ] + artifact.extra_flags
 
             def _compile(
@@ -735,6 +763,16 @@ class KernelCompilationRule(CompilationRule):
         runtime_lib_include_path = (
             Path(self.mlir_aie_dir) / "aie_runtime_lib" / kernel_dir.upper()
         )
+        # aie_api lives beside aie_runtime_lib under the mlir-aie build root, and
+        # compile_cxx_core_function adds NO include path of its own -- it uses exactly what it is
+        # handed. Without this, any kernel with `#include <aie_api/aie.hpp>` (rms_norm.cc, every
+        # vectorised kernel we use) fails to compile against an instance layout, which reads as a
+        # missing kernel rather than a missing -I. Only added when it exists, so a layout that
+        # already resolves aie_api some other way is unaffected.
+        include_paths = [str(runtime_lib_include_path)]
+        aie_api_include = Path(self.mlir_aie_dir) / "include"
+        if (aie_api_include / "aie_api").is_dir():
+            include_paths.append(str(aie_api_include))
 
         for artifact in worklist:
             if len(artifact.dependencies) < 1:
@@ -763,7 +801,7 @@ class KernelCompilationRule(CompilationRule):
                         source_path=source_file.filename,
                         target_arch=kernel_dir,
                         output_path=artifact.filename,
-                        include_dirs=[str(runtime_lib_include_path)],
+                        include_dirs=include_paths,
                         compile_args=compile_args,
                         use_chess=self.use_chess,
                     )
