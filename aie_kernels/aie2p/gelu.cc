@@ -36,6 +36,10 @@ static inline aie::vector<bfloat16, 32> gelu_tanh_approx(aie::vector<bfloat16, 3
 // Out-of-place GELU: output_vector = gelu(input_vector). input and output must not alias.
 void gelu_tanh_approx_bf16(bfloat16 *restrict input_vector, bfloat16 *restrict output_vector, const int32_t vector_size)
 {
+    // Do not inherit the caller's rounding mode: aie_api never sets it, the documented
+    // default is floor (biased toward -inf), and in a fused ELF the previous kernel on this
+    // core decides it. Mirrors rms_norm.cc, which carries this fix already.
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
     event0();
     auto it_in = aie::begin_restrict_vector<32>((bfloat16 *)input_vector);
     auto it_out = aie::begin_restrict_vector<32>((bfloat16 *)output_vector);
@@ -68,6 +72,10 @@ extern "C" {
 
 void gelu_bf16(bfloat16 *restrict input, bfloat16 *restrict output, int input_size)
 {
+    // Do not inherit the caller's rounding mode: aie_api never sets it, the documented
+    // default is floor (biased toward -inf), and in a fused ELF the previous kernel on this
+    // core decides it. Mirrors rms_norm.cc, which carries this fix already.
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
     gelu_tanh_approx_bf16(input, output, input_size);
 }
 
@@ -75,6 +83,10 @@ void gelu_bf16(bfloat16 *restrict input, bfloat16 *restrict output, int input_si
 // tile (e.g. a GEMV output tile), applied once per tile in the producing core.
 void gelu_tile_bf16(uint32_t n, bfloat16 *restrict c)
 {
+    // Do not inherit the caller's rounding mode: aie_api never sets it, the documented
+    // default is floor (biased toward -inf), and in a fused ELF the previous kernel on this
+    // core decides it. Mirrors rms_norm.cc, which carries this fix already.
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
     gelu_tanh_approx_inplace_bf16(c, (int32_t)n);
 }
 

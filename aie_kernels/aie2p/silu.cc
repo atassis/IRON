@@ -10,6 +10,10 @@ using namespace aie;
 
 void silu_tanh_approx_bf16(bfloat16 *restrict input_vector, bfloat16 *restrict output_vector, const int32_t vector_size)
 {
+    // Do not inherit the caller's rounding mode: aie_api never sets it, the documented
+    // default is floor (biased toward -inf), and in a fused ELF the previous kernel on this
+    // core decides it. Mirrors rms_norm.cc, which carries this fix already.
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
     event0();
 
     int num_elems = vector_size;
@@ -47,6 +51,10 @@ extern "C" {
 
 void silu_bf16(bfloat16 *restrict input, bfloat16 *restrict output, int input_size)
 {
+    // Do not inherit the caller's rounding mode: aie_api never sets it, the documented
+    // default is floor (biased toward -inf), and in a fused ELF the previous kernel on this
+    // core decides it. Mirrors rms_norm.cc, which carries this fix already.
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
     silu_tanh_approx_bf16(input, output, input_size);
 }
 

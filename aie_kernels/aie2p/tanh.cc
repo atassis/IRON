@@ -41,6 +41,10 @@ extern "C" {
 
 void tanh_bf16(bfloat16 *restrict input, bfloat16 *restrict output, int input_size)
 {
+    // Do not inherit the caller's rounding mode: aie_api never sets it, the documented
+    // default is floor (biased toward -inf), and in a fused ELF the previous kernel on this
+    // core decides it. Mirrors rms_norm.cc, which carries this fix already.
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
     tanh_bf16_vectorized(input, output, input_size);
 }
 
