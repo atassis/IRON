@@ -539,9 +539,14 @@ def _aiecc_has_scratchpad_flag() -> bool:
         import shutil
         import subprocess
         exe = os.environ.get("AIECC_PATH") or shutil.which("aiecc") or "aiecc"
+        # Probe by ACCEPTANCE, not by grepping --help. aiecc documents only the generic
+        # `--get=<name>` form and says "named artifacts also have --get-<name> shorthands", so the
+        # shorthand never appears in the help text even though it works. Grepping help reported the
+        # flag missing on an aiecc that accepts it, silently dropping params.txt from every build.
         try:
-            out = subprocess.run([exe, "--help"], capture_output=True, text=True, timeout=120)
-            _AIECC_SCRATCHPAD_FLAG = "scratchpad-parameters" in (out.stdout + out.stderr)
+            out = subprocess.run([exe, "--get-scratchpad-parameters", "--version"],
+                                 capture_output=True, text=True, timeout=120)
+            _AIECC_SCRATCHPAD_FLAG = out.returncode == 0
         except Exception:
             _AIECC_SCRATCHPAD_FLAG = False
         if not _AIECC_SCRATCHPAD_FLAG:
