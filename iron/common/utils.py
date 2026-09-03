@@ -63,7 +63,10 @@ class XRTSubBuffer(XRTTensor):
                 later whole-parent sync stays consistent with the sub-views.
         """
         # Skip XRTTensor.__init__ (which would allocate a new bo); set base attrs directly.
-        self.device = "npu"
+        # ORDER IS LOAD-BEARING: `device` is a property on the newer XRTTensor whose setter calls
+        # self._extent -> self.shape -> self._shape. Assigning it first (as this class did when the
+        # base still had a plain attribute) raises AttributeError('_shape') from three frames down.
+        # Establish the shape/dtype/buffer state first, then declare residency.
         self.dtype = np.dtype(dtype)
         self._parent = parent
         # TODO: replace with XRTTensor.__getitem__ slice support when available upstream
@@ -71,6 +74,7 @@ class XRTSubBuffer(XRTTensor):
         self._shape = tuple(shape)
         ptr = self._bo.map()
         self._data = np.frombuffer(ptr, dtype=self.dtype).reshape(self._shape)
+        self.device = "npu"
 
     @property
     def shape(self) -> tuple[int, ...]:

@@ -6,10 +6,15 @@ import ml_dtypes
 import pyxrt
 import ctypes
 from . import compilation as comp
+from aie.utils.hostruntime.coherence import COHERENCE_GRANULE as _COHERENCE_GRANULE
 from .base import AIEOperatorBase, MLIROperator
-from .utils import XRTSubBuffer
 import aie.utils as aie_utils
 from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
+
+
+def _coherence_granule():
+    return _COHERENCE_GRANULE
+
 
 # Fused Operator
 # ##########################################################################
@@ -160,21 +165,28 @@ class FusedMLIROperator(AIEOperatorBase):
         slice_info = {}  # full_buffer_name -> (base_name, start, end)
 
         def add_buffers(buffer_type, args_list):
+            # Advance the arena by whole COHERENCE GRANULES, not by exact lengths. Host and device
+            # are reconciled a cache line at a time, so two buffers sharing a line are not
+            # independent: syncing one acts on the other's bytes and can write a stale host copy
+            # over what the device just produced next door. The runtime's subview() refuses an
+            # unaligned offset for exactly this reason, so packing back-to-back makes most buffers
+            # un-viewable. The reported LENGTH stays exact; only the stride is rounded.
+            granule = _coherence_granule()
             offset = 0
             for arg in args_list:
                 if arg in self.explicit_buffer_sizes:
                     # Explicit size specified - this is a parent buffer for slices
                     length = self.explicit_buffer_sizes[arg]
-                    subbuffer_layout[arg] = (buffer_type, offset, length)
-                    offset += length
                 elif arg in args:
                     # Regular buffer with inferred size
                     arg_spec = args[arg]
                     length = int(
                         np.prod(arg_spec.shape) * np.dtype(arg_spec.dtype).itemsize
                     )
-                    subbuffer_layout[arg] = (buffer_type, offset, length)
-                    offset += length
+                else:
+                    continue
+                subbuffer_layout[arg] = (buffer_type, offset, length)
+                offset += (length + granule - 1) // granule * granule
                 # Note: sliced buffers are handled separately, not in args_list
             return offset  # == total length
 
@@ -338,6 +350,8 @@ class FusedFullELFCallable(FullELFCallable):
         )
 
         self._buffer_cache = {}
+        self._run_handle = None
+        self._params = None
 
     def get_buffer(self, buffer_name):
         # Return cached buffer if already allocated
@@ -359,17 +373,12 @@ class FusedFullELFCallable(FullELFCallable):
             )
 
         itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
-        sub_buffer = XRTSubBuffer(
-            parent_bo=main_buffer.buffer_object(),
-            offset_bytes=offset,
-            size_bytes=length,
-            shape=(length // itemsize,),
-            dtype=ml_dtypes.bfloat16,
-            # Without this link the sub-view cannot mark its PARENT host-dirty, which is
-            # exactly what XRTSubBuffer.data exists to do -- and the parent is what gets
-            # synced below. Omitting it left the parent "npu" from allocation forever, so
-            # the sync no-opped and kernels read init-zeros. See issue Xilinx/mlir-aie#3420.
-            parent=main_buffer,
+        # The runtime grew subview() (shares storage, keeps the parent alive, syncs its own slice
+        # and enforces granule alignment), which is what the carried XRTSubBuffer existed to
+        # provide. Use it: that class bypassed XRTTensor.__init__ and so had to mirror the base's
+        # private attribute set, which has since moved twice (_shape, then _initial_device).
+        sub_buffer = main_buffer.subview(
+            offset, (length // itemsize,), ml_dtypes.bfloat16
         )
 
         self._buffer_cache[buffer_name] = sub_buffer
@@ -398,11 +407,57 @@ class FusedFullELFCallable(FullELFCallable):
         self.output_buffer.device = "npu"
         self.output_buffer.to("cpu")
 
+    def _ensure_run_handle(self):
+        """Create (once per loaded ELF) a persistent run with the three buffers bound.
+
+        The base class makes a fresh ``pyxrt.run`` per dispatch, which is fine for a plain call but
+        leaves nothing for ParameterScratchpad to bind to: a runtime parameter is written INTO the
+        run's control scratchpad, so the handle must outlive the write. Keeping one handle also
+        matches what OperatorSequence's full-ELF callable already does.
+        """
+        if getattr(self, "_run_handle", None) is None:
+            rh = pyxrt.run(self.xrt_kernel)
+            rh.set_arg(0, self.input_buffer.buffer_object())
+            rh.set_arg(1, self.output_buffer.buffer_object())
+            rh.set_arg(2, self.scratch_buffer.buffer_object())
+            self._run_handle = rh
+        return self._run_handle
+
+    @property
+    def params(self):
+        """Lazy ParameterScratchpad for this ELF's runtime parameters (deep-C kv_off/sm_mask).
+
+        Mirrors SequenceFullELFCallable.params. params.txt is a graph output of aiecc
+        (--get-scratchpad-parameters) and lands in the aiecc work dir for the fused MLIR source.
+        Returns None when the graph declared no runtime parameters.
+        """
+        if getattr(self, "_params", None) is not None:
+            return self._params
+        mlir_filename = self.op.artifacts[0].mlir_input.filename
+        params_path = comp._aiecc_work_dir(mlir_filename) / "params.txt"
+        if not params_path.exists():
+            return None
+        if params_path.read_text().split("\n", 1)[0].strip() == "0":
+            return None
+        from aie.utils.hostruntime.xrtruntime.parameter_scratchpad import (
+            ParameterScratchpad,
+        )
+
+        self._params = ParameterScratchpad(self._ensure_run_handle(), str(params_path))
+        return self._params
+
+    def reload_elf(self, elf_data):
+        # A new ELF means a new kernel, so the cached run handle (and the scratchpad bound to it)
+        # no longer refer to anything live. Drop both; they are rebuilt on next use.
+        super().reload_elf(elf_data)
+        self._run_handle = None
+        self._params = None
+
     def __call__(self):
         self._sync_inputs()
-        super().__call__(
-            self.input_buffer.buffer_object(),
-            self.output_buffer.buffer_object(),
-            self.scratch_buffer.buffer_object(),
-        )
+        rh = self._ensure_run_handle()
+        rh.start()
+        ret_code = rh.wait()
+        if ret_code != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
+            raise RuntimeError(f"Kernel execution failed with return code {ret_code}")
         self._sync_outputs()
