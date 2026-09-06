@@ -60,25 +60,41 @@ static inline void taccum_rows(uint32_t rows,
 
 extern "C" {
 
-void taccum_zero_f32(float *__restrict acc)
+/* All three take `groups`: one core owns a GQA group -- batch_group query heads that share this
+ * core's kv head. A is read once and applied to each group member's w, which is the whole point of
+ * the mapping, so the group loop belongs inside the kernel rather than in the runtime sequence.
+ *
+ * Layouts: a is [rows][DIM_N], w is [groups][w_stride] read at w_off, acc and c are [groups][DIM_N].
+ */
+
+void taccum_zero_f32(uint32_t groups, float *__restrict acc)
 {
-    aie::store_v(acc, aie::zeros<float, DIM_N>());
+    for (uint32_t g = 0; g < groups; g++)
+        aie::store_v(acc + g * DIM_N, aie::zeros<float, DIM_N>());
 }
 
 void taccum_rows_bf16_f32(uint32_t rows,
+                          uint32_t groups,
+                          uint32_t w_stride,
+                          uint32_t w_off,
                           const bfloat16 *__restrict a_in,
                           const bfloat16 *__restrict w_in,
                           float *__restrict acc)
 {
-    taccum_rows<DIM_N>(rows, a_in, w_in, acc);
+    for (uint32_t g = 0; g < groups; g++)
+        taccum_rows<DIM_N>(rows, a_in, w_in + g * w_stride + w_off, acc + g * DIM_N);
 }
 
-void taccum_finish_bf16(const float *__restrict acc, bfloat16 *__restrict c_out)
+void taccum_finish_bf16(uint32_t groups,
+                        const float *__restrict acc,
+                        bfloat16 *__restrict c_out)
 {
     ::aie::set_rounding(aie::rounding_mode::conv_even);
-    aie::accum<accfloat, DIM_N> ac;
-    ac.from_vector(aie::load_v<DIM_N>(acc));
-    aie::store_v(c_out, ac.template to_vector<bfloat16>());
+    for (uint32_t g = 0; g < groups; g++) {
+        aie::accum<accfloat, DIM_N> ac;
+        ac.from_vector(aie::load_v<DIM_N>(acc + g * DIM_N));
+        aie::store_v(c_out + g * DIM_N, ac.template to_vector<bfloat16>());
+    }
 }
 
 } // extern "C"

@@ -74,14 +74,18 @@ def transposed_matvec(
     L3_W_ty = np.ndarray[(num_batches * K,), np.dtype[bfloat16]]
     L3_C_ty = np.ndarray[(num_batches * M,), np.dtype[bfloat16]]
 
-    k_zero = Kernel(f"{func_prefix}taccum_zero_f32", kernel_object, [np.int32, ACC_ty])
+    # The fused dispatch prefixes BOTH the symbol and the object FILENAME with op{idx}_, so the
+    # object reference has to carry func_prefix too -- prefixing only the symbol builds an object
+    # nothing links against ("cannot open tmv_128n.o").
+    obj = f"{func_prefix}{kernel_object}"
+    k_zero = Kernel(f"{func_prefix}taccum_zero_f32", obj, [np.int32, ACC_ty])
     k_rows = Kernel(
         f"{func_prefix}taccum_rows_bf16_f32",
-        kernel_object,
+        obj,
         [np.int32, np.int32, np.int32, np.int32, L1_A_ty, L1_W_ty, ACC_ty],
     )
     k_finish = Kernel(
-        f"{func_prefix}taccum_finish_bf16", kernel_object, [np.int32, ACC_ty, L1_C_ty]
+        f"{func_prefix}taccum_finish_bf16", obj, [np.int32, ACC_ty, L1_C_ty]
     )
 
     A_fifos = [ObjectFifo(L1_A_ty, name=f"A_L3L1_{c}", depth=2) for c in range(cols)]
