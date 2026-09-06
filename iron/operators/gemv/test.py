@@ -10,6 +10,7 @@ from iron.operators.gemv.quant import quantize_weight, dequantize_weight
 from iron.operators.gemv.reference import (
     generate_golden_reference,
     generate_golden_reference_batched,
+    generate_golden_reference_windowed,
     gelu_tanh_approx,
 )
 from iron.common.device_utils import get_kernel_dir
@@ -280,3 +281,77 @@ def test_batch_group_one_is_the_old_operand_shape():
     a = GEMV(M=256, K=128, num_batches=4).get_arg_spec()[0].shape
     b = GEMV(M=256, K=128, num_batches=4, batch_group=1).get_arg_spec()[0].shape
     assert a == b == (4, 256, 128), a
+
+
+# A NARROW WINDOW of a WIDE-STRIDED matrix. `M` is what gets computed, `alloc_M` is what is
+# allocated per matrix -- decode attention computes n_past scores against a KV cache sized at
+# max_seq. Only the buffer size and the per-matrix stride follow alloc_M; the run, the C tile and
+# the core loop all follow M.
+@pytest.mark.parametrize(
+    "M,K,alloc_M,num_batches,batch_group", [(256, 128, 2048, 16, 2), (64, 128, 512, 8, 1)]
+)
+def test_alloc_M_sizes_the_operand_not_the_window(M, K, alloc_M, num_batches, batch_group):
+    g = GEMV(M=M, K=K, alloc_M=alloc_M, num_batches=num_batches, batch_group=batch_group)
+    spec = g.get_arg_spec()
+    assert spec[0].shape == (num_batches // batch_group, alloc_M, K), (
+        f"matrix operand must be sized by the ALLOCATION {alloc_M}, got {spec[0].shape}"
+    )
+    assert spec[2].shape[0] == num_batches, "output stays per-batch"
+    assert spec[2].shape[1:] == (M,), f"output follows the WINDOW M={M}, got {spec[2].shape}"
+
+
+def test_alloc_M_none_is_the_old_operand_shape():
+    """The default must not move: alloc_M=None leaves the operand sized by M."""
+    a = GEMV(M=256, K=128, num_batches=4).get_arg_spec()[0].shape
+    b = GEMV(M=256, K=128, num_batches=4, alloc_M=None).get_arg_spec()[0].shape
+    c = GEMV(M=256, K=128, num_batches=4, alloc_M=256).get_arg_spec()[0].shape
+    assert a == b == c == (4, 256, 128), a
+
+
+def test_alloc_M_windowed_does_not_share_a_name_with_the_plain_gemv():
+    """A cached plain build must not be able to satisfy a windowed op (see GEMV.name)."""
+    plain = GEMV(M=128, K=128, num_batches=4).name
+    windowed = GEMV(M=128, K=128, num_batches=4, alloc_M=1024).name
+    assert windowed != plain, f"windowed GEMV shares an artifact name with the plain one: {plain}"
+    assert "am1024" in windowed, windowed
+    # alloc_M == M is the same design as None, so it must NOT perturb the stable name.
+    assert GEMV(M=128, K=128, num_batches=4, alloc_M=128).name == plain
+
+
+def test_alloc_M_below_M_is_refused():
+    with pytest.raises(ValueError, match="alloc_M"):
+        GEMV(M=256, K=128, alloc_M=128)
+
+
+@pytest.mark.parametrize(
+    "M,K,alloc_M,num_batches,batch_group", [(256, 128, 2048, 16, 2), (128, 128, 1024, 4, 1)]
+)
+def test_gemv_narrow_window_reads_only_its_window(
+    M, K, alloc_M, num_batches, batch_group, aie_context
+):
+    """Poisoned rows past the window catch a wrong PER-MATRIX STRIDE.
+
+    Not a wrong window: a GEMV row is a dot product, so rows past M cannot reach the first M
+    outputs at all. What alloc_M has to get right is that matrix m starts at m*alloc_M*K; at the
+    old m*M*K it lands inside the previous matrix's poison. Both params keep n_matrices > 1 so
+    that stride exists to be checked.
+    """
+    golden = generate_golden_reference_windowed(
+        M=M, K=K, alloc_M=alloc_M, num_batches=num_batches, batch_group=batch_group
+    )
+    operator = GEMV(
+        M=M,
+        K=K,
+        alloc_M=alloc_M,
+        num_aie_columns=aie_utils.get_current_device().cols,
+        tile_size_input=4,
+        num_batches=num_batches,
+        batch_group=batch_group,
+        context=aie_context,
+    )
+    input_buffers = {"matrix": golden["A"].flatten(), "vector": golden["B"].flatten()}
+    output_buffers = {"output": golden["C"].flatten()}
+    errors, latency_us, bandwidth_gbps = run_test(
+        operator, input_buffers, output_buffers, rel_tol=0.04, abs_tol=1e-3
+    )
+    assert not errors, f"windowed GEMV failed: {errors}"

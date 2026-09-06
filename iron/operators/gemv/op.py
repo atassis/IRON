@@ -32,6 +32,13 @@ class GEMV(MLIROperator):
     # matrix operand holds num_batches//batch_group heads and the access pattern repeats each one
     # instead of a Repeat op materialising a duplicate in DDR.
     batch_group: int = 1
+    # Rows ALLOCATED per matrix in A, when that differs from the rows COMPUTED (`M`). None means
+    # they are equal -- the old behaviour, byte for byte. Set it to read a NARROW WINDOW out of a
+    # buffer sized for a wider one: decode attention computes n_past scores against a KV cache
+    # allocated at max_seq, so M=n_past while the per-matrix stride must stay max_seq*K. Only the
+    # buffer size and the batch stride move; the run, the C tile and the core loop all follow M.
+    # repr=False + the `name` override below, matching the epilogue/weight_dtype convention.
+    alloc_M: int | None = field(default=None, repr=False)
     kernel_vector_size: int = field(default=64, repr=False)
     # Optional fused activation applied to each output tile in the producing core.
     # "none" (default) leaves the output unchanged; "gelu" applies GELU(tanh approx).
@@ -57,6 +64,11 @@ class GEMV(MLIROperator):
     }
 
     def __post_init__(self):
+        if self.alloc_M is not None and self.alloc_M < self.M:
+            raise ValueError(
+                f"alloc_M ({self.alloc_M}) must be >= M ({self.M}): it is the ALLOCATED row "
+                f"count per matrix, not a second window"
+            )
         if self.tile_size_output is None:
             self.tile_size_output = self.tile_size_input
 
@@ -124,6 +136,12 @@ class GEMV(MLIROperator):
             base = f"{base}_epi{self.epilogue}"
         if self.weight_dtype != "bf16":
             base = f"{base}_wdt{self.weight_dtype}g{self.group_size}"
+        # A windowed read is a DIFFERENT design from the plain GEMV of the same M: same compute
+        # extent, different buffer size and per-matrix stride. Without this they collide in the
+        # build dir and a cached plain build silently satisfies the windowed op. alloc_M == M is
+        # the same design as alloc_M=None, so it keeps the stable name.
+        if self.alloc_M is not None and self.alloc_M != self.M:
+            base = f"{base}_am{self.alloc_M}"
         return base
 
     @property
@@ -160,6 +178,7 @@ class GEMV(MLIROperator):
                     "epilogue": self.epilogue,
                     "weight_dtype": self.weight_dtype,
                     "group_size": self.group_size,
+                    "alloc_M": self.alloc_M,
                 },
             ),
         )
@@ -223,8 +242,12 @@ class GEMV(MLIROperator):
         # one, which is the whole point -- the operand shrinks by exactly that factor.
         n_matrices = self.num_batches // self.batch_group
         a_batch_dim = (n_matrices,) if n_matrices > 1 else ()
+        # Sized by the ALLOCATION: a windowed read (alloc_M > M) still addresses a buffer whose
+        # per-matrix stride is alloc_M*K, so the host operand must be that big or every matrix
+        # after the first reads past its end.
+        a_rows = self.M if self.alloc_M is None else self.alloc_M
         if self.weight_dtype == "bf16":
-            matrix_spec = AIERuntimeArgSpec("in", a_batch_dim + (self.M, self.K))
+            matrix_spec = AIERuntimeArgSpec("in", a_batch_dim + (a_rows, self.K))
         else:
             from iron.operators.gemv.quant import row_stride_bytes
 
