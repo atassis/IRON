@@ -10,7 +10,8 @@ from aie.iron.controlflow import range_
 
 
 def shuffle_transpose(
-    dev, M, N, num_columns, num_channels, m, n, s, num_batches=1, func_prefix=""
+    dev, M, N, num_columns, num_channels, m, n, s, num_batches=1, batch_group=1,
+    func_prefix=""
 ):
     num_elements = M * N
     per_tile_elements = m * n
@@ -54,13 +55,20 @@ def shuffle_transpose(
     # these are simply (M,N)/(N,M). Each (i,j) column/channel emits one TAP per batch, offset
     # by batch*num_elements; the per-batch internal sizes/strides are the same for every batch
     # because each matrix is contiguous and row-major.
-    in_dims = (num_batches * M, N)
+    assert num_batches % batch_group == 0, (
+        f"num_batches ({num_batches}) must be a multiple of batch_group ({batch_group})"
+    )
+    n_matrices = num_batches // batch_group
+    in_dims = (n_matrices * M, N)   # only the DISTINCT matrices; see the offset below
     out_dims = (num_batches * N, M)
     taps_in_L3L2 = [
         [
             TensorAccessPattern(
                 in_dims,
-                batch * num_elements
+                # By MATRIX, not by batch: batch_group consecutive batches transpose the SAME
+                # input, which is how a GQA kv head feeds gqa_group query heads without a Repeat
+                # materialising a duplicate first. batch_group=1 is the old behaviour exactly.
+                (batch // batch_group) * num_elements
                 + (M // num_channels) * j * N
                 + (N // num_columns) * i,
                 [M // num_channels // m, N // num_columns // n, m, n],

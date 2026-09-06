@@ -110,3 +110,20 @@ def test_transpose(M, N, aie_columns, channels, m, n, s, num_batches, aie_contex
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
 
     assert not errors, f"Test failed with errors: {errors}"
+
+
+# GQA without a Repeat, v-side: batch_group consecutive batches transpose ONE source, so the input
+# operand holds num_batches//batch_group matrices while the output stays per-batch.
+@pytest.mark.parametrize("num_batches,batch_group", [(16, 2), (8, 4)])
+def test_batch_group_shrinks_only_the_input(num_batches, batch_group):
+    t = Transpose(M=2048, N=128, num_aie_columns=1, num_channels=1, m=256, n=32, s=8,
+                  num_batches=num_batches, batch_group=batch_group)
+    spec = t.get_arg_spec()
+    assert spec[0].shape[0] == num_batches // batch_group, f"input: {spec[0].shape}"
+    assert spec[1].shape[0] == num_batches, f"output stays per-batch: {spec[1].shape}"
+
+
+def test_transpose_batch_group_must_divide():
+    with pytest.raises(ValueError, match="batch_group"):
+        Transpose(M=2048, N=128, num_aie_columns=1, num_channels=1, m=256, n=32, s=8,
+                  num_batches=15, batch_group=2)
