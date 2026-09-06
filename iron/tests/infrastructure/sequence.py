@@ -152,8 +152,10 @@ def test_fused_mlir_contains_reconfiguration(sequence, aie_context, tmp_path):
     # Reconfiguration + dispatch ops between temporal steps.
     assert "aiex.configure" in text, "missing aiex.configure in fused MLIR"
     assert "aiex.run @sequence" in text, "missing aiex.run in fused MLIR"
-    # Buffer sub-views handed to each operator's runtime sequence.
-    assert "memref.reinterpret_cast" in text, "missing buffer reinterpret in fused MLIR"
+    # Typed views of the byte arena handed to each operator's runtime sequence. memref.view,
+    # not reinterpret_cast: the arena is i8 and the element type changes here, which
+    # reinterpret_cast cannot express.
+    assert "memref.view" in text, "missing buffer view in fused MLIR"
     # One inlined device per unique operator plus the top-level driver device.
     assert (
         "op0_ElementwiseAdd" in text and "op1_ReLU" in text
