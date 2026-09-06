@@ -33,6 +33,7 @@ def my_matvec(
     m_input,
     m_output=None,
     num_batches=1,
+    batch_group=1,
     kernel_object="mv.o",
     func_prefix="",
     verbose=False,
@@ -98,8 +99,16 @@ def my_matvec(
     ]
     L1_B_ty = np.ndarray[(K,), dtype_b]
     L1_C_ty = np.ndarray[(m_output,), dtype_out]
+    # `batch_group` consecutive batches SHARE one matrix, so A holds num_batches//batch_group of
+    # them, not num_batches. This is the GQA case: gqa_group query heads attend to one kv head, and
+    # today that sharing is expressed by materialising a duplicate (Repeat) instead of by an access
+    # pattern. batch_group=1 is the old behaviour exactly.
+    assert num_batches % batch_group == 0, (
+        f"num_batches ({num_batches}) must be a multiple of batch_group ({batch_group})"
+    )
+    n_matrices = num_batches // batch_group
     L3_A_ty = np.ndarray[
-        (num_batches * M * a_row_width,),
+        (n_matrices * M * a_row_width,),
         dtype_in,
     ]
     L3_B_ty = np.ndarray[(num_batches * K,), dtype_b]
@@ -176,7 +185,7 @@ def my_matvec(
         [
             TensorAccessPattern(
                 tensor_dims=L3_A_ty.__args__[0],
-                offset=col * (M // cols) * a_row_width + batch * M * a_row_width,
+                offset=col * (M // cols) * a_row_width + (batch // batch_group) * M * a_row_width,
                 sizes=[1, 1, 1, (M // cols) * a_row_width],
                 strides=[0, 0, 0, 1],
             )
@@ -243,6 +252,7 @@ def my_matvec(
     A_split, C_split = split_run(A_run), split_run(C_run)
     coalesce = (
         num_batches > 1
+        and num_batches % batch_group == 0
         and A_bstride <= MAX_STRIDE
         and C_bstride <= MAX_STRIDE
         and A_bstride % GRAN_ELEMS == 0
@@ -251,13 +261,18 @@ def my_matvec(
         and C_split is not None
     )
 
-    def coalesced_tap(L3_ty, col_off, split, bstride):
+    # The outer dim used to be a dead placeholder (size 1, stride 0). It carries the group now:
+    # [matrix, group_member, run_hi, run_lo]. A advances per MATRIX and holds still within a group
+    # (inner stride 0); C advances per BATCH, so its outer skips a whole group. At batch_group=1
+    # both collapse to the old single-iterated-batch BD, and a shim BD has exactly four dims -- this
+    # uses all of them, so a shape needing a third run dim cannot coalesce.
+    def coalesced_tap(L3_ty, col_off, split, outer_stride, inner_stride):
         run_hi, run_lo = split
         return TensorAccessPattern(
             tensor_dims=L3_ty.__args__[0],
             offset=col_off,
-            sizes=[1, num_batches, run_hi, run_lo],
-            strides=[0, bstride, run_lo, 1],
+            sizes=[n_matrices, batch_group, run_hi, run_lo],
+            strides=[outer_stride, inner_stride, run_lo, 1],
         )
 
     if coalesce:
@@ -271,11 +286,11 @@ def my_matvec(
             f.depth >= 2 for f in C_L1L3_fifos
         ), "coalesced GEMV wants A/C ObjectFifo depth>=2 for fill/compute overlap"
         A_taps_coalesced = [
-            coalesced_tap(L3_A_ty, col * (M // cols) * K, A_split, A_bstride)
+            coalesced_tap(L3_A_ty, col * (M // cols) * K, A_split, A_bstride, 0)
             for col in range(cols)
         ]
         C_taps_coalesced = [
-            coalesced_tap(L3_C_ty, col * (M // cols), C_split, C_bstride)
+            coalesced_tap(L3_C_ty, col * (M // cols), C_split, batch_group * C_bstride, C_bstride)
             for col in range(cols)
         ]
 

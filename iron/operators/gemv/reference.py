@@ -74,3 +74,24 @@ def gelu_tanh_approx(x):
     xf = np.asarray(x, dtype=np.float32)
     inner = 0.79788456 * (xf + 0.044715 * xf**3)
     return 0.5 * xf * (1.0 + np.tanh(inner))
+
+
+def generate_golden_reference_grouped(M=128, K=128, num_batches=4, batch_group=2, seed=42):
+    """Golden for a GQA-shaped batched GEMV: `batch_group` consecutive batches share one matrix.
+
+    A holds num_batches//batch_group matrices, B and C stay per-batch, and batch b multiplies
+    A[b // batch_group] by B[b]. That is exactly what a Repeat op produces today by materialising
+    A[b // batch_group] into every b -- the point of the grouped form is to skip the copy.
+    """
+    import torch
+
+    assert num_batches % batch_group == 0
+    torch.manual_seed(seed)
+    n_matrices = num_batches // batch_group
+    val_range = 1.0
+    A = torch.randn(n_matrices, M, K, dtype=torch.bfloat16) * val_range
+    B = torch.randn(num_batches, K, dtype=torch.bfloat16) * val_range
+    C = torch.empty(num_batches, M, dtype=torch.bfloat16)
+    for b in range(num_batches):
+        C[b] = (A[b // batch_group].float() @ B[b].float()).to(torch.bfloat16)
+    return A, B, C

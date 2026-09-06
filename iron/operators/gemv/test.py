@@ -254,3 +254,29 @@ def test_gemv_gelu(
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
 
     assert not errors, f"Test failed with errors: {errors}"
+
+
+# GQA without a Repeat: batch_group consecutive batches read ONE matrix, so the operand holds
+# num_batches//batch_group of them. The shape below is the decode's own (Hq=16 query heads over
+# Hkv=8 kv heads), scaled down so it stays a fast test.
+@pytest.mark.parametrize("M,K,num_batches,batch_group", [(256, 128, 16, 2), (128, 64, 8, 4)])
+def test_batch_group_shrinks_the_matrix_operand(M, K, num_batches, batch_group):
+    g = GEMV(M=M, K=K, num_batches=num_batches, batch_group=batch_group)
+    spec = g.get_arg_spec()
+    assert spec[0].shape[0] == num_batches // batch_group, (
+        f"matrix operand must hold {num_batches // batch_group} matrices, got {spec[0].shape}"
+    )
+    assert spec[1].shape[0] == num_batches, "vector stays per-batch"
+    assert spec[2].shape[0] == num_batches, "output stays per-batch"
+
+
+def test_batch_group_must_divide_num_batches():
+    with pytest.raises(ValueError, match="batch_group"):
+        GEMV(M=256, K=128, num_batches=15, batch_group=2)
+
+
+def test_batch_group_one_is_the_old_operand_shape():
+    """The default must not move: batch_group=1 leaves every batch its own matrix."""
+    a = GEMV(M=256, K=128, num_batches=4).get_arg_spec()[0].shape
+    b = GEMV(M=256, K=128, num_batches=4, batch_group=1).get_arg_spec()[0].shape
+    assert a == b == (4, 256, 128), a
