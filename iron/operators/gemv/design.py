@@ -40,6 +40,7 @@ def my_matvec(
     epilogue="none",
     weight_dtype="bf16",
     group_size=0,
+    alloc_M=None,
 ):
     if m_output is None:
         m_output = m_input
@@ -107,8 +108,17 @@ def my_matvec(
         f"num_batches ({num_batches}) must be a multiple of batch_group ({batch_group})"
     )
     n_matrices = num_batches // batch_group
+    # A's rows ALLOCATED per matrix, which is not always the rows COMPUTED. The two differ whenever
+    # a narrow window is read out of a buffer sized for a wider one -- decode attention reads
+    # n_past rows of a KV cache allocated at max_seq. `M` stays the compute extent (it sizes the
+    # run, the C tile and the core loop); `alloc_M` sizes the buffer and the per-matrix stride, so
+    # a narrow read addresses the wide buffer correctly instead of walking off its own smaller one.
+    assert alloc_M is None or alloc_M >= M, (
+        f"alloc_M ({alloc_M}) must be >= M ({M}): it is the ALLOCATED row count, not a second window"
+    )
+    _AM = M if alloc_M is None else alloc_M
     L3_A_ty = np.ndarray[
-        (n_matrices * M * a_row_width,),
+        (n_matrices * _AM * a_row_width,),
         dtype_in,
     ]
     L3_B_ty = np.ndarray[(num_batches * K,), dtype_b]
@@ -185,7 +195,8 @@ def my_matvec(
         [
             TensorAccessPattern(
                 tensor_dims=L3_A_ty.__args__[0],
-                offset=col * (M // cols) * a_row_width + (batch // batch_group) * M * a_row_width,
+                offset=col * (M // cols) * a_row_width
+                + (batch // batch_group) * _AM * a_row_width,
                 sizes=[1, 1, 1, (M // cols) * a_row_width],
                 strides=[0, 0, 0, 1],
             )
@@ -277,7 +288,7 @@ def my_matvec(
     # num_batches is asserted ==1 for quantized weight_dtype, so `coalesce` below is always False
     # on that path and this arithmetic (sized for bf16's GRAN_ELEMS/MAX_STRIDE assumptions) is
     # never acted on.
-    A_run, A_bstride = (M // cols) * a_row_width, M * a_row_width
+    A_run, A_bstride = (M // cols) * a_row_width, _AM * a_row_width
     C_run, C_bstride = (M // cols), M
     A_split, C_split = split_run(A_run), split_run(C_run)
     coalesce = (
