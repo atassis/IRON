@@ -261,17 +261,25 @@ def my_matvec(
         and C_split is not None
     )
 
-    # The outer dim used to be a dead placeholder (size 1, stride 0). It carries the group now:
-    # [matrix, group_member, run_hi, run_lo]. A advances per MATRIX and holds still within a group
-    # (inner stride 0); C advances per BATCH, so its outer skips a whole group. At batch_group=1
-    # both collapse to the old single-iterated-batch BD, and a shim BD has exactly four dims -- this
-    # uses all of them, so a shape needing a third run dim cannot coalesce.
+    # The outer dim used to be a dead placeholder (size 1, stride 0). It carries the GROUP now:
+    # [group_member, matrix, run_hi, run_lo].
+    #
+    # The group must sit OUTERMOST because only the outer dim may have stride 0 -- aie.dma_bd
+    # rejects a zero stride further in ("Stride 2 must be a positive integer"), which is what a
+    # [matrix, group] ordering hits. So A repeats the whole matrix sweep per group member (outer
+    # stride 0, inner A_bstride), and C compensates: its outer advances ONE batch and its inner
+    # skips a whole group, so the output still lands at q = batch_group*matrix + member -- the
+    # natural query-head numbering, needing no reordering downstream.
+    #
+    # At batch_group=1 this is byte-for-byte the original tap: sizes=[1, num_batches, ...],
+    # strides=[0, bstride, ...]. A shim BD has exactly four dims and this uses all of them, so a
+    # shape whose run needs a third dim cannot coalesce.
     def coalesced_tap(L3_ty, col_off, split, outer_stride, inner_stride):
         run_hi, run_lo = split
         return TensorAccessPattern(
             tensor_dims=L3_ty.__args__[0],
             offset=col_off,
-            sizes=[n_matrices, batch_group, run_hi, run_lo],
+            sizes=[batch_group, n_matrices, run_hi, run_lo],
             strides=[outer_stride, inner_stride, run_lo, 1],
         )
 
@@ -286,11 +294,11 @@ def my_matvec(
             f.depth >= 2 for f in C_L1L3_fifos
         ), "coalesced GEMV wants A/C ObjectFifo depth>=2 for fill/compute overlap"
         A_taps_coalesced = [
-            coalesced_tap(L3_A_ty, col * (M // cols) * K, A_split, A_bstride, 0)
+            coalesced_tap(L3_A_ty, col * (M // cols) * K, A_split, 0, A_bstride)
             for col in range(cols)
         ]
         C_taps_coalesced = [
-            coalesced_tap(L3_C_ty, col * (M // cols), C_split, batch_group * C_bstride, C_bstride)
+            coalesced_tap(L3_C_ty, col * (M // cols), C_split, C_bstride, batch_group * C_bstride)
             for col in range(cols)
         ]
 

@@ -38,7 +38,12 @@ def shuffle_transpose(
 
     # Define tensor types. The runtime tensor spans all batches (contiguous matrices);
     # per-tile work on the cores is identical regardless of batch count.
+    # Two types, not one: the INPUT holds only the distinct matrices (batch_group batches share
+    # one), the OUTPUT still has a result per batch. They coincide at batch_group=1.
     tensor_ty = np.ndarray[(num_batches * num_elements,), np.dtype[dtype]]
+    in_tensor_ty = np.ndarray[
+        ((num_batches // batch_group) * num_elements,), np.dtype[dtype]
+    ]
     tile_ty = np.ndarray[(per_tile_elements,), np.dtype[dtype]]
 
     fifodepth = 1 if per_tile_elements > 4096 else 2
@@ -190,7 +195,7 @@ def shuffle_transpose(
     rt = Runtime(
         sequence,
         [
-            tensor_ty,
+            in_tensor_ty,
             tensor_ty,
             [of.prod() for of in of_in1s_L3L2],
             [of.cons() for of in of_outs],
