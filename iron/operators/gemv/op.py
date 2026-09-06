@@ -32,6 +32,14 @@ class GEMV(MLIROperator):
     # "none" (default) leaves the output unchanged; "gelu" applies GELU(tanh approx).
     # repr=False keeps operator/artifact names stable for the default path.
     epilogue: str = field(default="none", repr=False)
+    # Weight-stream format axis for A (the MxK matrix): "bf16" (default, unchanged), or
+    # "int4"/"int8" group-quantized with a per-row f32 scale per `group_size` columns,
+    # dequantized on-core right before the same bf16 MAC (see design.py / mv_quant.cc / quant.py).
+    # This is a byte-stream lever on the WEIGHT only -- B and C stay bf16 regardless.
+    # repr=False + the name/kernel-file overrides below keep the default path's artifact names
+    # stable, matching the epilogue field's convention.
+    weight_dtype: str = field(default="bf16", repr=False)
+    group_size: int = field(default=0, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -63,19 +71,49 @@ class GEMV(MLIROperator):
             raise ValueError(
                 f"gelu epilogue needs tile_size_output % 16 == 0 (got {self.tile_size_output})"
             )
+        if self.weight_dtype not in ("bf16", "int4", "int8"):
+            raise ValueError(
+                f"unknown weight_dtype {self.weight_dtype!r} (expected 'bf16', 'int4' or 'int8')"
+            )
+        if self.weight_dtype != "bf16":
+            if self.epilogue != "none":
+                # Untested combination, not a hardware conflict -- narrow scope until a caller
+                # needs both a quantized weight AND a fused epilogue on the same GEMV.
+                raise NotImplementedError(
+                    "GEMV weight_dtype != 'bf16' with a fused epilogue is not implemented"
+                )
+            if self.group_size <= 0:
+                raise ValueError("weight_dtype != 'bf16' needs an explicit group_size > 0")
+            if self.K % self.group_size != 0:
+                raise ValueError(
+                    f"K={self.K} must be a whole number of groups (group_size={self.group_size})"
+                )
+            if self.group_size % self.kernel_vector_size != 0:
+                # mv_quant.cc's vectorized dequant chunk (kernel_vector_size wide) must never
+                # straddle a quant-group boundary, or a chunk would need two scales.
+                raise ValueError(
+                    f"group_size={self.group_size} must be a multiple of kernel_vector_size="
+                    f"{self.kernel_vector_size}"
+                )
+            if self.num_batches != 1:
+                raise NotImplementedError(
+                    "GEMV weight_dtype != 'bf16' does not support num_batches>1 yet"
+                )
 
         MLIROperator.__init__(self, context=self.context)
 
     @property
     def name(self) -> str:
-        # epilogue is repr=False so the default path keeps a stable name, but the fused
-        # variant must not share an artifact name with the plain GEMV of the same shape:
-        # both would emit the same .mlir/.xclbin, and in a shared build dir a cached unfused
-        # build can then satisfy the fused op (running the raw matvec with no activation).
+        # epilogue/weight_dtype are repr=False so the default path keeps a stable name, but a
+        # non-default variant must not share an artifact name with the plain GEMV of the same
+        # shape: both would emit the same .mlir/.xclbin, and in a shared build dir a cached
+        # default build can then silently satisfy the non-default op.
         base = super().name
-        if self.epilogue == "none":
-            return base
-        return f"{base}_epi{self.epilogue}"
+        if self.epilogue != "none":
+            base = f"{base}_epi{self.epilogue}"
+        if self.weight_dtype != "bf16":
+            base = f"{base}_wdt{self.weight_dtype}g{self.group_size}"
+        return base
 
     @property
     def _kernel_link_file(self):
@@ -83,6 +121,8 @@ class GEMV(MLIROperator):
         # archive of (matvec, gelu); the plain matvec stays a single object.
         if self.epilogue == "gelu":
             return f"gemv_{self.K}k_{self.kernel_vector_size}vs_gelu_kernels.a"
+        if self.weight_dtype != "bf16":
+            return f"gemv_{self.K}k_{self.kernel_vector_size}vs_{self.weight_dtype}g{self.group_size}.o"
         return f"gemv_{self.K}k_{self.kernel_vector_size}vs.o"
 
     def get_mlir_artifact(self):
@@ -106,11 +146,29 @@ class GEMV(MLIROperator):
                     "verbose": mlir_verbose,
                     "kernel_object": self._kernel_link_file,
                     "epilogue": self.epilogue,
+                    "weight_dtype": self.weight_dtype,
+                    "group_size": self.group_size,
                 },
             ),
         )
 
     def get_kernel_artifacts(self):
+        if self.weight_dtype != "bf16":
+            return [
+                KernelObjectArtifact(
+                    self._kernel_link_file,
+                    dependencies=[
+                        SourceArtifact(
+                            self.context.base_dir / "aie_kernels" / "generic" / "mv_quant.cc"
+                        )
+                    ],
+                    extra_flags=[
+                        f"-DDIM_K={self.K}",
+                        f"-DVEC_SIZE={self.kernel_vector_size}",
+                        f"-DGROUP_SIZE={self.group_size}",
+                    ],
+                )
+            ]
         matvec_obj = KernelObjectArtifact(
             f"gemv_{self.K}k_{self.kernel_vector_size}vs.o",
             dependencies=[
@@ -146,11 +204,23 @@ class GEMV(MLIROperator):
         return [matvec_obj]
 
     def get_arg_spec(self):
+        import numpy as np
+
         batch_dim = (self.num_batches,) if self.num_batches > 1 else ()
+        if self.weight_dtype == "bf16":
+            matrix_spec = AIERuntimeArgSpec("in", batch_dim + (self.M, self.K))
+        else:
+            from iron.operators.gemv.quant import row_stride_bytes
+
+            stride = row_stride_bytes(self.K, self.group_size, self.weight_dtype)
+            # Flat byte buffer (int8-typed purely so the emitted shim BDs type as `i8`, matching
+            # decode_ddr_bytes.py's parser): M rows of `stride` packed bytes each, row layout in
+            # quant.py. num_batches is asserted ==1 for a non-bf16 weight_dtype in __post_init__.
+            matrix_spec = AIERuntimeArgSpec("in", batch_dim + (self.M * stride,), dtype=np.int8)
         return [
-            AIERuntimeArgSpec("in", batch_dim + (self.M, self.K)),  # matrix
-            AIERuntimeArgSpec("in", batch_dim + (self.K,)),  # vector
-            AIERuntimeArgSpec("out", batch_dim + (self.M,)),  # output
+            matrix_spec,  # matrix (A)
+            AIERuntimeArgSpec("in", batch_dim + (self.K,)),  # vector (B, always bf16)
+            AIERuntimeArgSpec("out", batch_dim + (self.M,)),  # output (C, always bf16)
         ]
 
     def reference(self, A, B):

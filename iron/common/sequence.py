@@ -646,9 +646,14 @@ class SequenceFullELFCallable(SequenceCallable):
         return sub
 
     def _sync_inputs(self):
-        # Sub-views handed out by get_buffer() share the parent's coherence map, so
-        # a write through one (e.g. torch_view()) marks its byte range host-dirty
-        # there too, and `to("npu")` here syncs every dirty range in one pass.
+        # Force host residency first, mirroring _sync_outputs three lines below (and for the
+        # same reason it gives): a caller that writes through get_buffer(...).data -- the
+        # unmediated handle, not mutate()/torch_view() -- never updates the coherence map, so
+        # after the first dispatch marks this arena "npu", a bare `to("npu")` early-returns and
+        # every later dispatch runs on the PREVIOUS token's input. Measured 12/12 on a Qwen3
+        # decode rail: teacher-forced parity read 7/8 (one miss at a 0.0203-margin "tie") before
+        # this, 8/8 after, with the miss being this race and not precision.
+        self.input_buffer.device = "cpu"
         self.input_buffer.to("npu")
 
     def _sync_outputs(self):

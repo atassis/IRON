@@ -37,6 +37,8 @@ def my_matvec(
     func_prefix="",
     verbose=False,
     epilogue="none",
+    weight_dtype="bf16",
+    group_size=0,
 ):
     if m_output is None:
         m_output = m_input
@@ -57,27 +59,50 @@ def my_matvec(
     assert (M // cols) % m_input == 0, "m_input must evenly divide M/cols"
 
     vectorized = True
-    dtype_in = np.dtype[bfloat16]
-    dtype_in_str = "bf16"
     dtype_out = np.dtype[bfloat16]
     dtype_out_str = "bf16"
+    # B (the vector) and C (the output) are always bf16 -- weight_dtype is an axis on A (the MxK
+    # weight matrix) only, never on the activation/output path.
+    dtype_b = np.dtype[bfloat16]
 
     assert M % cols == 0
+
+    if weight_dtype == "bf16":
+        dtype_in = np.dtype[bfloat16]
+        dtype_in_str = "bf16"
+        a_row_width = K  # elements/row, dtype_in-sized
+    else:
+        # Group-quantized A: see iron/operators/gemv/quant.py for the exact byte layout
+        # (`[n_groups x f32 scale][payload]` per row) and aie_kernels/generic/mv_quant.cc for the
+        # device-side dequant. Packing the scale into A's own buffer (rather than a 3rd FIFO) is
+        # forced by the 2-input-DMA-channel budget: A and B already spend both.
+        from iron.operators.gemv.quant import row_stride_bytes
+
+        assert weight_dtype in ("int4", "int8"), f"unknown weight_dtype {weight_dtype!r}"
+        assert num_batches == 1, (
+            "GEMV weight_dtype != 'bf16' does not support num_batches>1 yet -- the per-column "
+            "A layout assumes a single contiguous [row_stride-byte rows] slab per column "
+            "(YAGNI: no quantized decode caller needs batching today)"
+        )
+        assert group_size > 0, "weight_dtype != 'bf16' needs an explicit group_size"
+        dtype_in = np.dtype[np.int8]
+        dtype_in_str = weight_dtype
+        a_row_width = row_stride_bytes(K, group_size, weight_dtype)  # bytes/row, int8-sized
 
     L1_A_ty = np.ndarray[
         (
             m_input,
-            K,
+            a_row_width,
         ),
         dtype_in,
     ]
-    L1_B_ty = np.ndarray[(K,), dtype_in]
+    L1_B_ty = np.ndarray[(K,), dtype_b]
     L1_C_ty = np.ndarray[(m_output,), dtype_out]
     L3_A_ty = np.ndarray[
-        (num_batches * M * K,),
+        (num_batches * M * a_row_width,),
         dtype_in,
     ]
-    L3_B_ty = np.ndarray[(num_batches * K,), dtype_in]
+    L3_B_ty = np.ndarray[(num_batches * K,), dtype_b]
     L3_C_ty = np.ndarray[(num_batches * M,), dtype_out]
 
     func_type = "vectorized" if vectorized else "scalar"
@@ -151,8 +176,8 @@ def my_matvec(
         [
             TensorAccessPattern(
                 tensor_dims=L3_A_ty.__args__[0],
-                offset=col * (M // cols) * K + batch * M * K,
-                sizes=[1, 1, 1, (M // cols) * K],
+                offset=col * (M // cols) * a_row_width + batch * M * a_row_width,
+                sizes=[1, 1, 1, (M // cols) * a_row_width],
                 strides=[0, 0, 0, 1],
             )
             for batch in range(num_batches)
@@ -209,7 +234,11 @@ def my_matvec(
                 return (run // lo, lo)
         return None
 
-    A_run, A_bstride = (M // cols) * K, M * K
+    # a_row_width == K (elements) for bf16, or the packed row-stride (bytes) for a quantized A --
+    # num_batches is asserted ==1 for quantized weight_dtype, so `coalesce` below is always False
+    # on that path and this arithmetic (sized for bf16's GRAN_ELEMS/MAX_STRIDE assumptions) is
+    # never acted on.
+    A_run, A_bstride = (M // cols) * a_row_width, M * a_row_width
     C_run, C_bstride = (M // cols), M
     A_split, C_split = split_run(A_run), split_run(C_run)
     coalesce = (
