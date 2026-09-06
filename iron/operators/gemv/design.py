@@ -196,11 +196,18 @@ def my_matvec(
 
     # Every column gets the entirety of the vector B.
     # This design assumes that all of B fits on the cores.
+    # B must follow the SAME permutation as C. The core consumes B from its FIFO in ITERATION
+    # order, so once the A/C dims are [group, matrix] (forced: only the outermost dim may carry a
+    # zero stride) a flat linear B hands step i the vector of head i while A/C are addressing head
+    # group*matrix + member. That mismatch is silent -- every head simply gets the wrong query
+    # vector -- and it reads as 0/8 parity, not as a near miss.
+    #
+    # At batch_group=1 this is the old flat read: sizes=[1, num_batches, 1, K] with offset m*K.
     B_tap = TensorAccessPattern(
         tensor_dims=L3_B_ty.__args__[0],
         offset=0,
-        sizes=[1, 1, 1, num_batches * K],
-        strides=[0, 0, 0, 1],
+        sizes=[batch_group, n_matrices, 1, K],
+        strides=[K, batch_group * K, 0, 1],
     )
 
     # Collection pattern for the output vector C: each AIE core writes back its contiguous chunk of rows.
