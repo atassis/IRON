@@ -203,12 +203,48 @@ def my_matvec(
     # vector -- and it reads as 0/8 parity, not as a near miss.
     #
     # At batch_group=1 this is the old flat read: sizes=[1, num_batches, 1, K] with offset m*K.
-    B_tap = TensorAccessPattern(
-        tensor_dims=L3_B_ty.__args__[0],
-        offset=0,
-        sizes=[batch_group, n_matrices, 1, K],
-        strides=[K, batch_group * K, 0, 1],
-    )
+    MAX_WRAP = 1023
+    MAX_STRIDE = (1 << 20) - 1  # conservative element-stride bound for the wrap dims
+    GRAN_ELEMS = 2  # 4-byte shim granularity / 2-byte bf16 element
+
+    def split_run(run, lim=MAX_WRAP, gran=GRAN_ELEMS):
+        """Factor a contiguous run into (hi, lo), both <= lim and lo a multiple of gran
+        (the address-granularity-aligned inner size), lo maximal. None if no such
+        split exists (caller then falls back to the per-batch path)."""
+        lo_start = (lim // gran) * gran
+        for lo in range(lo_start, 0, -gran):
+            if run % lo == 0 and (run // lo) <= lim:
+                return (run // lo, lo)
+        return None
+
+    # At batch_group=1 keep the ORIGINAL flat one-dimensional read byte for byte: leading 1s make
+    # it a plain contiguous transfer whose length is not subject to the 10-bit wrap cap.
+    #
+    # When grouping, B must follow the SAME permutation as C -- the core consumes B from its FIFO in
+    # ITERATION order, and A/C are forced into [group, matrix] because only the outermost dim may
+    # carry a zero stride. A flat B then hands step i the vector of head i while A/C address head
+    # group*matrix + member, which is silent and reads as 0/8 parity.
+    #
+    # That makes it genuinely 4-D, so its innermost size IS wrap-capped and K must be split exactly
+    # like a run: op_ctx is gemv(M=head_dim, K=S), and at S=2048 an unsplit K trips
+    # "Size 0 exceeds the [0:1023] range". op_scores (K=head_dim=128) never would, which is why the
+    # k-only arm built and this one did not.
+    if batch_group == 1:
+        B_tap = TensorAccessPattern(
+            tensor_dims=L3_B_ty.__args__[0], offset=0,
+            sizes=[1, 1, 1, num_batches * K], strides=[0, 0, 0, 1],
+        )
+    else:
+        B_split = split_run(K)
+        assert B_split is not None, (
+            f"K ({K}) has no wrap-legal split; batch_group>1 needs a 4-D B tap"
+        )
+        k_hi, k_lo = B_split
+        B_tap = TensorAccessPattern(
+            tensor_dims=L3_B_ty.__args__[0], offset=0,
+            sizes=[batch_group, n_matrices, k_hi, k_lo],
+            strides=[K, batch_group * K, k_lo, 1],
+        )
 
     # Collection pattern for the output vector C: each AIE core writes back its contiguous chunk of rows.
     C_taps = [
@@ -236,19 +272,6 @@ def my_matvec(
     # FIXME: pull these shim BD bounds from the MLIR-AIE target model rather than
     # hard-coding them; they live in verifyStridesWraps in
     # https://github.com/Xilinx/mlir-aie/blob/main/lib/Dialect/AIEX/IR/AIEXDialect.cpp
-    MAX_WRAP = 1023
-    MAX_STRIDE = (1 << 20) - 1  # conservative element-stride bound for the wrap dims
-    GRAN_ELEMS = 2  # 4-byte shim granularity / 2-byte bf16 element
-
-    def split_run(run, lim=MAX_WRAP, gran=GRAN_ELEMS):
-        """Factor a contiguous run into (hi, lo), both <= lim and lo a multiple of gran
-        (the address-granularity-aligned inner size), lo maximal. None if no such
-        split exists (caller then falls back to the per-batch path)."""
-        lo_start = (lim // gran) * gran
-        for lo in range(lo_start, 0, -gran):
-            if run % lo == 0 and (run // lo) <= lim:
-                return (run // lo, lo)
-        return None
 
     # a_row_width == K (elements) for bf16, or the packed row-stride (bytes) for a quantized A --
     # num_batches is asserted ==1 for quantized weight_dtype, so `coalesce` below is always False
