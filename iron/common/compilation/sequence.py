@@ -12,9 +12,8 @@ import importlib.util
 from functools import partial
 from pathlib import Path
 from aie import ir
-from aie.dialects import aie, aiex, memref
+from aie.dialects import aie, aiex, arith, memref
 from aie.extras.context import mlir_mod_ctx
-import ml_dtypes
 
 from typing import Any
 
@@ -28,6 +27,39 @@ from . import (
 )
 
 RESET_DEVICE = "reset_device"
+
+
+def element_size_bytes(ty: ir.Type) -> int:
+    """Bytes one element of `ty` occupies. The single owner of this seam's byte<->element rate.
+
+    This used to be a hardcoded bf16 itemsize doing two unrelated jobs at once: addressing into
+    the consolidated arena, and typing each operator's view of it. Those coincide only while
+    every buffer is bf16, so any other buffer had its element count silently divided by 2 -- a
+    576-byte uint8 buffer (Dequant's packed input) was reported as 288 elements. The arena is
+    byte-addressed now, so this is only ever asked about an OPERATOR's declared element type.
+
+    Sub-byte types are rejected rather than rounded: a packed 4-bit buffer must declare the byte
+    type it actually occupies (i8), since no element count of any single type describes packed
+    nibbles plus interleaved scales.
+    """
+    # `MemRefType.element_type` returns an already-downcast type, so plain isinstance is the
+    # portable check here -- the static `Type.isinstance` classmethod is not in every binding.
+    if isinstance(ty, ir.IntegerType):
+        bits = ty.width
+    elif isinstance(ty, (ir.BF16Type, ir.F16Type)):
+        bits = 16
+    elif isinstance(ty, ir.F32Type):
+        bits = 32
+    elif isinstance(ty, ir.F64Type):
+        bits = 64
+    else:
+        raise ValueError(f"fused arena: unsupported element type {ty}")
+    if bits % 8:
+        raise ValueError(
+            f"fused arena: sub-byte element type {ty} cannot address a byte arena -- declare "
+            f"the packed byte type the buffer actually occupies"
+        )
+    return bits // 8
 
 
 # Compilation Artifacts
@@ -207,16 +239,17 @@ def fuse_mlir(artifact: SequenceMLIRArtifact) -> None:
         # Create the main device -- this contains the runtime sequence calling into the other devices
         @aie.device(device_ty)
         def main():
-            buf_dtype = np.dtype[
-                ml_dtypes.bfloat16
-            ]  # TODO: support for other data types
-            itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
+            # The consolidated arena is BYTE-addressed. `subbuffer_layout` already stores byte
+            # offsets and lengths, and an element type belongs to the operator that owns a buffer,
+            # not to the arena holding it -- so the arena has no business having one. Typing it
+            # bf16 forced a divisor here that was wrong for every other dtype.
+            buf_dtype = np.dtype[np.int8]
 
             # RuntimeSequenceOp
             @aiex.runtime_sequence(
-                np.ndarray[(input_buffer_size // itemsize,), buf_dtype],
-                np.ndarray[(output_buffer_size // itemsize,), buf_dtype],
-                np.ndarray[(scratch_buffer_size // itemsize,), buf_dtype],
+                np.ndarray[(input_buffer_size,), buf_dtype],
+                np.ndarray[(output_buffer_size,), buf_dtype],
+                np.ndarray[(scratch_buffer_size,), buf_dtype],
             )
             def sequence(input_buf, output_buf, scratch_buf):
                 consolidated_buffers = {
@@ -243,7 +276,7 @@ def fuse_mlir(artifact: SequenceMLIRArtifact) -> None:
 
                     with ir.InsertionPoint(configure_body):
 
-                        # For each buffer, add subview and reinterpret_cast ops
+                        # For each buffer, add a typed view into the byte arena
                         buffer_ssa_values = []
                         for idx, buf_name in enumerate(buffer_names):
                             # Check if this is a sliced buffer
@@ -262,47 +295,44 @@ def fuse_mlir(artifact: SequenceMLIRArtifact) -> None:
                                     buf_name
                                 ]
 
-                            # Subview Op
+                            # Typed view of the byte arena at this buffer's offset.
+                            #
+                            # memref.view, not subview + reinterpret_cast: the element type CHANGES
+                            # here (i8 arena -> whatever the operator declared), and
+                            # reinterpret_cast only re-lays-out a memref of the SAME element type.
+                            # view exists for exactly this -- a byte buffer plus a byte shift to a
+                            # typed one -- and it folds the two ops into one.
                             consolidated_buf = consolidated_buffers[buf_type]
-                            offset_elements = offset // itemsize
-                            size_elements = length // itemsize
-                            subview = memref.subview(
-                                consolidated_buf,
-                                [offset_elements],
-                                [size_elements],
-                                [1],
-                            )
-
-                            # Reinterpret_cast Op
                             target_type = expected_arg_types[idx]
                             expected_memref = ir.MemRefType(target_type)
                             target_shape = [
                                 expected_memref.shape[i]
                                 for i in range(expected_memref.rank)
                             ]
-                            expected_size = np.prod(target_shape)
-                            assert (
-                                expected_size == size_elements
-                            ), f"Size mismatch for buffer '{buf_name}': MLIR runtime sequence expected {expected_size}, Python fused operator provided {size_elements}"
-                            strides = []
-                            stride = 1
-                            for dim in reversed(target_shape):
-                                strides.insert(0, stride)
-                                stride *= dim
-                            result_type = ir.MemRefType.get(
-                                target_shape, ir.BF16Type.get()
+                            # `expected_arg_types` was parsed in the OPERATOR's own MLIR context,
+                            # so its element type cannot be used to build an op here -- MLIR
+                            # rejects a result type from a foreign context. Re-create it by name
+                            # in this context. The old code sidestepped this by constructing a
+                            # fresh BF16Type, so hardcoding the type was doubling as a
+                            # cross-context workaround, which is part of why it survived.
+                            elem_ty = ir.Type.parse(str(expected_memref.element_type))
+                            expected_bytes = int(np.prod(target_shape)) * element_size_bytes(
+                                elem_ty
                             )
-                            reinterpreted = memref.reinterpret_cast(
-                                result=result_type,
-                                source=subview,
-                                offsets=[],
-                                sizes=[],
-                                strides=[],
-                                static_offsets=[0],
-                                static_sizes=target_shape,
-                                static_strides=strides,
+                            # Compared in BYTES, the unit both sides actually have. The old assert
+                            # compared element counts derived with different rates on each side,
+                            # so it could only ever agree for bf16.
+                            assert expected_bytes == length, (
+                                f"Size mismatch for buffer '{buf_name}': operator declares "
+                                f"{int(np.prod(target_shape))} x {elem_ty} = {expected_bytes} "
+                                f"bytes, arena layout provides {length}"
                             )
-                            buffer_ssa_values.append(reinterpreted)
+                            result_type = ir.MemRefType.get(target_shape, elem_ty)
+                            byte_shift = arith.constant(ir.IndexType.get(), offset)
+                            viewed = memref.view(
+                                result_type, consolidated_buf, byte_shift, []
+                            )
+                            buffer_ssa_values.append(viewed)
 
                         # Run Op
                         sequence_sym_ref_attr = ir.FlatSymbolRefAttr.get("sequence")
