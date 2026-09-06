@@ -27,6 +27,11 @@ class GEMV(MLIROperator):
     tile_size_input: int = 2
     tile_size_output: int | None = None
     num_batches: int = 1
+    # How many CONSECUTIVE batches share one matrix. 1 = every batch has its own (the old
+    # behaviour). >1 expresses GQA directly: gqa_group query heads attend to one kv head, so the
+    # matrix operand holds num_batches//batch_group heads and the access pattern repeats each one
+    # instead of a Repeat op materialising a duplicate in DDR.
+    batch_group: int = 1
     kernel_vector_size: int = field(default=64, repr=False)
     # Optional fused activation applied to each output tile in the producing core.
     # "none" (default) leaves the output unchanged; "gelu" applies GELU(tanh approx).
@@ -48,6 +53,7 @@ class GEMV(MLIROperator):
         "tile_size_input": "tsi",
         "tile_size_output": "tso",
         "num_batches": "batch",
+        "batch_group": "bgrp",
     }
 
     def __post_init__(self):
@@ -63,6 +69,11 @@ class GEMV(MLIROperator):
             self.K >= self.kernel_vector_size and self.K % self.kernel_vector_size == 0
         ):
             raise ValueError("K must be multiple of kernel_vector_size")
+        if self.batch_group < 1 or self.num_batches % self.batch_group != 0:
+            raise ValueError(
+                f"num_batches ({self.num_batches}) must be a positive multiple of batch_group "
+                f"({self.batch_group})"
+            )
         if self.epilogue not in ("none", "gelu"):
             raise ValueError(
                 f"unknown epilogue {self.epilogue!r} (expected 'none' or 'gelu')"
@@ -141,6 +152,7 @@ class GEMV(MLIROperator):
                     self.tile_size_input,
                     self.tile_size_output,
                     self.num_batches,
+                    self.batch_group,
                 ),
                 {
                     "verbose": mlir_verbose,
@@ -207,8 +219,12 @@ class GEMV(MLIROperator):
         import numpy as np
 
         batch_dim = (self.num_batches,) if self.num_batches > 1 else ()
+        # A is indexed by MATRIX, not by batch: with batch_group>1 several batches read the same
+        # one, which is the whole point -- the operand shrinks by exactly that factor.
+        n_matrices = self.num_batches // self.batch_group
+        a_batch_dim = (n_matrices,) if n_matrices > 1 else ()
         if self.weight_dtype == "bf16":
-            matrix_spec = AIERuntimeArgSpec("in", batch_dim + (self.M, self.K))
+            matrix_spec = AIERuntimeArgSpec("in", a_batch_dim + (self.M, self.K))
         else:
             from iron.operators.gemv.quant import row_stride_bytes
 
@@ -216,7 +232,7 @@ class GEMV(MLIROperator):
             # Flat byte buffer (int8-typed purely so the emitted shim BDs type as `i8`, matching
             # decode_ddr_bytes.py's parser): M rows of `stride` packed bytes each, row layout in
             # quant.py. num_batches is asserted ==1 for a non-bf16 weight_dtype in __post_init__.
-            matrix_spec = AIERuntimeArgSpec("in", batch_dim + (self.M * stride,), dtype=np.int8)
+            matrix_spec = AIERuntimeArgSpec("in", a_batch_dim + (self.M * stride,), dtype=np.int8)
         return [
             matrix_spec,  # matrix (A)
             AIERuntimeArgSpec("in", batch_dim + (self.K,)),  # vector (B, always bf16)
