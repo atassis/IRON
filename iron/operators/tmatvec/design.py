@@ -108,6 +108,15 @@ def transposed_matvec(
 
     # A: column c reads matrix c, whole contiguous rows, chunk by chunk. The per-matrix stride is
     # the ALLOCATION (_AK), not the reduced extent, so a windowed read still lands on the right one.
+    # KNOWN DEFECT, diagnosed 2026-09-07, NOT fixed: this single fill of K*M elements lowers to
+    # ONE BD against a fifo whose object is rows_per_chunk*M -- 262144 elements streamed through a
+    # depth-2 16384-element L1 buffer with no per-object lock to gate it. Correct standalone
+    # (30/30 identical dispatches, rel-L2 at the bf16 floor) but it RACES once the design is
+    # invoked more than once inside one runtime sequence, which is what 2+ decoder layers are.
+    # Neither cheap fix works: one fill per object exceeds the shim's 16 BDs, and bounding them
+    # with a task group per chunk deadlocks (ERT_CMD_STATE_TIMEOUT). The real fix is to route A
+    # L3->L2->L1 through a MemTile, which has 48 BDs and 512 KB and does object-sized chunking with
+    # proper locks -- the pattern strided_copy uses via .forward().
     A_taps = [
         TensorAccessPattern(
             tensor_dims=L3_A_ty.__args__[0],
@@ -155,12 +164,26 @@ def transposed_matvec(
     ]
 
     def sequence(A, W, C, A_prods, W_prods, C_conss):
-        tg = TaskGroup()
+        # Mirrors gemv's structure, and the shape matters. W is the LONG-LIVED operand -- the core
+        # holds it across the whole chunk loop -- so it gets its OWN task group, finished LAST,
+        # exactly as gemv does with B. Putting it in the same group as the per-chunk A fills and the
+        # C drain, and interleaving the three per column, raced: two back-to-back invocations of
+        # this design inside one runtime sequence (which is what 2+ decoder layers are) produced
+        # different results run to run.
+        tg_w = TaskGroup()
         for c in range(cols):
-            W_prods[c].fill(W, W_taps[c], group=tg)
-            A_prods[c].fill(A, A_taps[c], group=tg)
-            C_conss[c].drain(C, C_taps[c], group=tg, wait=True)
-        tg.finish()
+            W_prods[c].fill(W, W_taps[c], group=tg_w)
+        # One group per chunk, finished before the next. A shim tile has 16 BDs, so issuing all
+        # n_chunks fills for all columns at once ("Too many simultaneously active buffer
+        # descriptors on tile (0,0)") is not an option -- gemv bounds the same way with its
+        # per-wait groups.
+        tg_ac = TaskGroup()
+        for c in range(cols):
+            A_prods[c].fill(A, A_taps[c], group=tg_ac)
+        for c in range(cols):
+            C_conss[c].drain(C, C_taps[c], group=tg_ac, wait=True)
+        tg_ac.finish()
+        tg_w.finish()
 
     rt = Runtime(
         sequence,
