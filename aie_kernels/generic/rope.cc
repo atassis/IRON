@@ -68,6 +68,18 @@ void rope_kernel_two_halves(const T *restrict input, const T *restrict lut, T *r
         ::aie::vector<T, N> y_second_half = ::aie::add(x2_cos, x1_sin);
         ::aie::store_v(output + v + dims_half, y_second_half);
     }
+    // Tail, for the same reason as add.cc/mul.cc: `v < dims_half` admits a final short iteration
+    // while every load_v/store_v here is N wide, so a head_dim whose half does not divide N reads
+    // and writes past input, lut and output. Both models in the spec table are safe today
+    // (head_dim 128 and 256 give dims_half 64 and 128, and N is 32), so this is latent rather than
+    // live -- which is exactly how the add.cc one survived until a model with a 640 d_model showed
+    // up. The LUT is interleaved [cos, sin] per element, matching filter_even/filter_odd above.
+    for (int v = (dims_half / N) * N, i = 2 * v; v < dims_half; v++, i += 2) {
+        const T c = lut[i], sn = lut[i + 1];
+        const T x1 = input[v], x2 = input[v + dims_half];
+        output[v] = x1 * c - x2 * sn;
+        output[v + dims_half] = x2 * c + x1 * sn;
+    }
     event1();
 }
 
