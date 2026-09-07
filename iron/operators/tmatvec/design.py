@@ -29,7 +29,63 @@ whole rows are 256 B and past it.
  - K: reduction extent == the matrix's row COUNT (sequence length)
  - rows_per_chunk: rows of A streamed per kernel call; sets the L1 A tile (rows_per_chunk*M elems)
  - batch_group: batches sharing one matrix (GQA: query heads per kv head)
+ - l1_bytes: core-tile local memory to size against; None = the AIE2P 64 KB
 """
+
+
+# AIE2P core-tile local memory. Stated, not derived: the Python bindings expose no accessor
+# (AIETargetModel::getLocalMemorySize() is C++ only). Callers may override per target.
+AIE2P_L1_BYTES = 65536
+# The core's stack and locals. The stack alone defaults to 0x400, and this tree has twice paid for
+# a frame that silently overwrote the objectFIFO buffers placed above it.
+L1_HEADROOM_BYTES = 4096
+
+
+def l1_footprint_bytes(M, K, batch_group, rows_per_chunk):
+    """Bytes this design places in one core's L1, by term.
+
+    Only the A term scales with rows_per_chunk, which is why that is the knob the error names.
+    """
+    return (
+        2 * rows_per_chunk * M * 2      # A objectfifo, depth 2, bf16
+        + batch_group * K * 2           # W objectfifo, depth 1, bf16
+        + 2 * batch_group * M * 2       # C objectfifo, depth 2, bf16
+        + batch_group * M * 4           # the f32 accumulator Buffer
+    )
+
+
+def largest_fitting_rows_per_chunk(M, K, batch_group, l1_bytes=None):
+    """The largest legal rows_per_chunk that FITS, or 0 if no chunking makes this shape fit."""
+    budget = AIE2P_L1_BYTES if l1_bytes is None else l1_bytes
+    ok = [r for r in (1, 2, 4, 8, 16, 32, 64, 128, 256)
+          if r <= K and K % r == 0
+          and l1_footprint_bytes(M, K, batch_group, r) + L1_HEADROOM_BYTES <= budget]
+    return max(ok) if ok else 0
+
+
+def check_l1_fits(M, K, batch_group, rows_per_chunk, l1_bytes=None):
+    """Raise if the tiling does not FIT. Returns the message, so callers pick the exception type.
+
+    KERNEL-CONTRACT K008: the tiling must FIT, not merely divide -- and nothing downstream checks
+    it. rows_per_chunk sets the A tile at rows_per_chunk*M, so the footprint scales with head_dim:
+    the default 64 fits at M=128 (42.0 KB) and does not at M=256 (88.0 KB), where aiecc reports
+    "'aie.tile' op Basic sequential allocation also failed" -- naming a TILE and not a SIZE, so it
+    reads as a placement bug rather than "your chunk is too big". MEASURED 2026-09-07 bringing up
+    Gemma-3-270M (M=256, batch_group=4): the default fails to build and 32 succeeds, which this
+    arithmetic reproduces exactly.
+    """
+    budget = AIE2P_L1_BYTES if l1_bytes is None else l1_bytes
+    used = l1_footprint_bytes(M, K, batch_group, rows_per_chunk)
+    if used + L1_HEADROOM_BYTES <= budget:
+        return None
+    fits = largest_fitting_rows_per_chunk(M, K, batch_group, l1_bytes)
+    return (
+        f"TMatVec does not fit L1: {used} B + {L1_HEADROOM_BYTES} B headroom exceeds {budget} B "
+        f"at M={M} K={K} batch_group={batch_group} rows_per_chunk={rows_per_chunk}. The A tile "
+        f"({2 * rows_per_chunk * M * 2} B) is the only term that scales with rows_per_chunk; "
+        + (f"largest value that fits here is {fits}."
+           if fits else "no rows_per_chunk fits -- this shape needs a MemTile stage for A.")
+    )
 
 
 def transposed_matvec(
@@ -44,6 +100,7 @@ def transposed_matvec(
     func_prefix="",
     verbose=False,
     alloc_K=None,
+    l1_bytes=None,
 ):
     assert num_batches % batch_group == 0, (
         f"num_batches ({num_batches}) must be a multiple of batch_group ({batch_group})"
@@ -64,6 +121,11 @@ def transposed_matvec(
     _AK = K if alloc_K is None else alloc_K
 
     n_chunks = K // rows_per_chunk
+
+    # K008: the tiling must FIT, not merely divide. op.py raises this at construction; the
+    # assert here covers the generator being driven directly.
+    _msg = check_l1_fits(M, K, batch_group, rows_per_chunk, l1_bytes)
+    assert _msg is None, _msg
 
     L1_A_ty = np.ndarray[(rows_per_chunk * M,), np.dtype[bfloat16]]
     L1_W_ty = np.ndarray[(batch_group * K,), np.dtype[bfloat16]]

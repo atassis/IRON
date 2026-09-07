@@ -35,6 +35,28 @@ def test_alloc_K_windowed_does_not_share_a_name_with_the_plain_op():
     assert win != plain and "ak2048" in win, win
 
 
+def test_rows_per_chunk_must_fit_l1_not_just_divide():
+    """K008: the default rows_per_chunk fits at head_dim 128 and does NOT at 256.
+
+    Without this the only thing that notices is aiecc, which says "'aie.tile' op Basic sequential
+    allocation also failed" -- a tile, not a size. Measured 2026-09-07 on Gemma-3-270M: the default
+    fails to build and 32 succeeds.
+    """
+    # Qwen3-0.6B's shape, the one in the shipped decode: unchanged by this check.
+    TMatVec(M=128, K=2048, num_aie_columns=8, num_batches=16, batch_group=2, rows_per_chunk=64)
+    # Gemma-3-270M's: head_dim 256 doubles the A tile to 64 KB on its own.
+    with pytest.raises(ValueError, match="does not fit L1"):
+        TMatVec(M=256, K=2048, num_aie_columns=1, num_batches=4, batch_group=4, rows_per_chunk=64)
+    TMatVec(M=256, K=2048, num_aie_columns=1, num_batches=4, batch_group=4, rows_per_chunk=32)
+
+
+def test_the_fit_error_names_the_value_that_works():
+    from iron.operators.tmatvec.design import largest_fitting_rows_per_chunk
+
+    assert largest_fitting_rows_per_chunk(M=256, K=2048, batch_group=4) == 32
+    assert largest_fitting_rows_per_chunk(M=128, K=2048, batch_group=2) == 64
+
+
 # The decode's own shape (Hq=16 query heads over Hkv=8 kv heads at head_dim 128), plus a small one.
 @pytest.mark.parametrize(
     "M,K,num_batches,batch_group,rows_per_chunk",
