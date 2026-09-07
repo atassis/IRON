@@ -159,7 +159,12 @@ class FusedDispatch(SequenceDispatch):
             objs = op.get_kernel_artifacts()
             for obj in objs:
                 obj.filename = f"op{idx}_{obj.filename}"
-                obj.prefix_symbols = f"op{idx}_"
+                # COMPOSE, do not replace. An operator may already set prefix_symbols for its OWN
+                # reason -- a fused design carrying two kernels that share an extern "C" name has to
+                # disambiguate them inside its single symbol table. Overwriting that made a design
+                # ask for op0_down_matvec_* while the object exported op0_matvec_*, an undefined
+                # symbol at the per-core link. Same mechanism, two purposes; both must survive.
+                obj.prefix_symbols = f"op{idx}_" + (getattr(obj, "prefix_symbols", None) or "")
             kernel_artifacts.extend(objs)
         return kernel_artifacts
 
