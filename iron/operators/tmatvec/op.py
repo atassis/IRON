@@ -67,6 +67,14 @@ class TMatVec(MLIROperator):
                 f"alloc_K ({self.alloc_K}) must be >= K ({self.K}): it is the ALLOCATED row "
                 f"count per matrix, not a second window"
             )
+        # K008 -- the tiling must FIT, not merely divide. Checked HERE, at construction, because
+        # the only other thing that notices is aiecc, which reports it as a placement failure
+        # naming a tile and not a size. Arithmetic lives once, in design.py.
+        from iron.operators.tmatvec.design import check_l1_fits
+
+        msg = check_l1_fits(self.M, self.K, self.batch_group, self.rows_per_chunk)
+        if msg is not None:
+            raise ValueError(msg)
         MLIROperator.__init__(self, context=self.context)
 
     @property
