@@ -392,7 +392,18 @@ class KernelObjectArtifact(CompilationArtifact):
 class KernelArchiveArtifact(CompilationArtifact):
     """A static archive (.a) bundling one or more KernelObjectArtifacts."""
 
-    pass
+    def __init__(
+        self,
+        filename: str,
+        dependencies: list[CompilationArtifact],
+        prefix_symbols: str | None = None,
+    ) -> None:
+        super().__init__(filename, dependencies)
+        # Declared here, defaulting to None, because ArchiveCompilationRule reads it. A fused
+        # OperatorSequence ASSIGNS it dynamically, so leaving it undeclared worked in the fused
+        # path and raised AttributeError in every standalone build -- which is exactly the half
+        # the fused-path test did not cover.
+        self.prefix_symbols = prefix_symbols
 
 
 class PythonGeneratedMLIRArtifact(MLIRArtifact):
