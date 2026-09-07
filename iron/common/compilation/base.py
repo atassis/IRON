@@ -392,7 +392,20 @@ class KernelObjectArtifact(CompilationArtifact):
 class KernelArchiveArtifact(CompilationArtifact):
     """A static archive (.a) bundling one or more KernelObjectArtifacts."""
 
-    pass
+    def __init__(
+        self,
+        filename: str,
+        dependencies: list[CompilationArtifact],
+        prefix_symbols: str | None = None,
+    ) -> None:
+        super().__init__(filename, dependencies)
+        # Defaults to None like KernelObjectArtifact.prefix_symbols -- ArchiveCompilationRule.
+        # compile() reads this attribute unconditionally (`if artifact.prefix_symbols:`), and
+        # the bare `pass` body never set it, so any caller building a KernelArchiveArtifact
+        # outside the fused-OperatorSequence path (which pokes .prefix_symbols on afterward)
+        # hit `AttributeError: 'KernelArchiveArtifact' object has no attribute 'prefix_symbols'`
+        # -- including GEMV's own standalone epilogue test (confirmed: same error, same call).
+        self.prefix_symbols = prefix_symbols
 
 
 class PythonGeneratedMLIRArtifact(MLIRArtifact):
