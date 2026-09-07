@@ -104,6 +104,68 @@ Known gaps, stated plainly:
     across repeated invocations of the same design within one runtime sequence -- which is exactly
     what N decoder layers are. This is not introduced by fusion; the shipped TMV_CTX=1 default
     already invokes TMatVec once per layer today.
+  - DOES NOT PLACE. `aiecc` rejects it with "no ShimNOCTile on the device has 0 input/1 output DMA
+    channel(s) free: all 8 ShimNOCTile(s) are at 9/16 input, 16/16 output channels used" -- a THIRD
+    hard wall, confirmed by bisection: op_sck+op_scv+op_scores ALONE (3 of the 7 ops, no
+    softmax/ctx/o at all) already exceeds it. AIE2P gives each shim tile only 2 DMA channels each
+    direction (8 tiles x 2 = 16 total, matching the message); this design's per-column-direct-fill
+    style spends 8 fill channels on scA + 8 more on scB for op_scores ALONE (matches: a standalone
+    `iron/operators/gemv/op.py` GEMV at this exact shape -- M=2048 K=128 cols=8 batch=16 bgrp=2 --
+    was independently confirmed to build using ALL 16 fill channels with ZERO left over), so the
+    two tiny k_in/v_in fills sck/scv add on top are what tips it over. Column parallelism is not
+    the issue here (see below) -- channel COUNT is: every per-column operand needs its OWN direct
+    shim channel in this style, and there are only 16 of each direction for the whole device.
+    The fix is architectural, not a tweak: route each per-column operand through a MemTile
+    split/join (fewer, wider shim transfers fanning out/in via the MemTile's own 6-channel budget)
+    instead of 8 direct per-column shim transfers -- cols=8 exceeds a single MemTile's 6-channel cap
+    too, so each such consolidation needs a 6+2 two-MemTile split, not a single one. Arithmetic: this
+    design has 9 operand-flows shaped "8 columns, genuinely different data per column" (scA, sc_in,
+    tA, tW, oA on the fill side; sc_out, sw_out, cx_out, oC on the drain side) plus 2 that are pure
+    broadcasts (scB, oB, collapsible to 1 shim fill each via repeated `.cons()`, no MemTile split
+    needed since every column wants identical data). Consolidating all 9 via 6+2 splits/joins brings
+    the device to ~14 fill / ~10 drain channels, comfortably under 16 each way -- but that is 9 new
+    split/join constructions, each with its own offset/dims_to_stream arithmetic, i.e. a build of
+    comparable size to this one, not a patch on top of it. NOT attempted here: the risk of a repeat
+    of the sc/softmax crossbar mistake (correctness silently wrong, undetectable device-free)
+    outweighed finishing it in the remaining budget. The one piece confirmed to build in isolation
+    at trivial cost: op_sck+op_scv alone (2 fill + 2 drain channels, no compute cores) -- 2
+    configures to 1, verified.
+
+Column parallelism this design retains (matters independently of whether it places): EVERY stage
+keeps cols=8 -- op_scores, op_softmax, op_ctx and op_o each use 8 cores, one per column, exactly
+the column width the unfused designs already use. Nothing here collapses to cols=1. But it is a
+SPATIAL PIPELINE ACROSS ROWS, not a per-column replicated chain: column c's op_scores core (row 2)
+is a DIFFERENT physical core from column c's op_softmax core (row 3), op_ctx core (row 4) and op_o
+core (row 5), and at any instant only ONE stage's 8 cores are active (the phase-gated TaskGroups in
+`sequence()` serialize scores -> softmax -> ctx -> o within one token's dispatch) -- 8 of 32 cores
+busy, 24 idle, at any given moment. This is NOT the M=1-decode MLP failure mode (Group C: `cols=1`,
+an 8x bandwidth collapse from spreading a matvec's weight stream across 1 core instead of 8) --
+every matvec-shaped stage here still spreads its OWN weight stream across all 8 columns. The
+cost is different: reconfiguration is saved, but nothing pipelines ACROSS stages (op_softmax's
+cores gain nothing from op_scores' cores finishing early, since they wait on ALL 8 of them via the
+DRAM round trip), so this design trades configure count for stage-level serialization, not for
+lost per-op bandwidth.
+
+Why per-column full-chain replication (attention's own version of what would let Group C's fix
+transfer here) was not built: it needs ONE consistent column meaning across ALL FOUR stages, and
+this design's default axes do not agree. op_softmax's column c is HEAD-PAIR [2c, 2c+1] (the shipped
+Softmax operator's own partition) and op_ctx's column c is KV-HEAD c (TMatVec's "one matrix per
+column" -- and kv-head c owns exactly query heads [2c, 2c+1], so these two ALREADY agree). op_scores
+as built here is the odd one out: it splits its OUTPUT by SEQUENCE POSITION (column c holds
+S_per_col of every head), not by head-pair, which is the root cause of the crossbar in "Why nothing
+stays on-chip" above. Re-deriving op_scores as a BATCH-per-column matvec instead (column c reads
+ONLY kv-head c's cache and computes the FULL S=2048-wide row for its 2 query heads, the same
+column-owns-one-matrix shape TMatVec already uses, rather than gemv's stock M-sliced-across-columns
+shape) would make op_scores' output land in EXACTLY the same per-column shape op_softmax already
+wants -- a plain shared fifo, no join/split, and it deletes the repeat_count-for-the-shared-matrix
+complication too, since column c would read its one kv-head matrix ONCE instead of twice. That
+would align 3 of 4 stages (scores, softmax, ctx) onto one column meaning and make a real per-column
+chain possible for them. op_o's column (a D-output slice, reducing over the FULL cx vector) is a
+fourth, genuinely different axis regardless -- chaining it in per-column would need a partial-sum
+accumulation across columns, not just a shape change. NOT IMPLEMENTED: this is a from-scratch
+rewrite of op_scores' core/tap structure (new to this codebase -- gemv/design.py has no
+batch-per-column mode, only M-per-column), identified during this task's writeup, not built or
+tested.
 """
 
 BF16 = bfloat16
