@@ -55,31 +55,33 @@ void matvec_int4_dequant(uint32_t m, const int8_t *__restrict a, const bfloat16 
   // cost 89 of the loop's 97 bundles (contract K013); the arithmetic here is the same sum in
   // exact arithmetic, and rounds less, because a_i is an exact small integer in bf16 and the
   // scale meets the partial in f32 rather than every product in bf16.
-  constexpr uint32_t chunks_per_group = g / r;
+  // Dequant follows aie_kernels/generic/expand.cc: the scale is broadcast and applied in BF16
+  // (one 512-bit register at r=32), and the widening stays narrow -- 4 -> 8 -> 16 -> bf16 -- so an
+  // f32 vector is never materialised. The earlier form multiplied in f32, which at r=64 is FOUR
+  // vector registers and measured 89 of the loop's 97 bundles (contract K013).
+  constexpr uint32_t blocks_per_group = g / r;
   for (uint32_t row = 0; row < m; row++) {
     const uint8_t *rowp = a_bytes + row * row_stride;
     const float *__restrict scale = reinterpret_cast<const float *>(rowp);
     const uint8_t *packed = rowp + n_groups * sizeof(float);
-    ::aie::vector<float, r> row_acc = ::aie::zeros<float, r>();
+    ::aie::accum<accfloat, r> acc = ::aie::zeros<accfloat, r>();
     AIE_LOOP_MIN_ITERATION_COUNT(n_groups)
     for (uint32_t gi = 0; gi < n_groups; gi++) {
+      const ::aie::vector<bfloat16, r> sfb =
+          ::aie::broadcast<bfloat16, r>(static_cast<bfloat16>(scale[gi]));
       const bfloat16 *__restrict b_cur = b + gi * g;
       const uint8_t *__restrict gp = packed + (gi * g) / 2;
-      ::aie::accum<accfloat, r> acc = ::aie::zeros<accfloat, r>();
       AIE_LOOP_UNROLL_FULL
-      for (uint32_t ci = 0; ci < chunks_per_group; ci++) {
-        ::aie::accum<accfloat, r> dq;
-        dq.from_vector(::aie::to_float(
-            ::aie::unpack(::aie::load_v<r>(reinterpret_cast<const int4 *>(gp + (ci * r) / 2))), 0));
-        acc = ::aie::mac(acc, dq.template to_vector<bfloat16>(),
-                         ::aie::load_v<r>(b_cur + ci * r));
+      for (uint32_t ci = 0; ci < blocks_per_group; ci++) {
+        ::aie::vector<int8_t, r> q8 =
+            ::aie::unpack(::aie::load_v<r>(reinterpret_cast<const int4 *>(gp + (ci * r) / 2)));
+        ::aie::vector<bfloat16, r> a_vec =
+            ::aie::to_float<bfloat16>(::aie::unpack(q8), 0);
+        ::aie::vector<bfloat16, r> scaled = ::aie::mul(a_vec, sfb);
+        acc = ::aie::mac(acc, scaled, ::aie::load_v<r>(b_cur + ci * r));
       }
-      // Reduce ONCE per row, not once per group: the group scale meets the group's still-vector
-      // partial, so a group costs one broadcast+multiply+add instead of a tree reduction.
-      row_acc = ::aie::add(row_acc, ::aie::mul(acc.template to_vector<float>(),
-                                               scale[gi]).template to_vector<float>());
     }
-    c[row] = static_cast<bfloat16>(::aie::reduce_add(row_acc));
+    c[row] = static_cast<bfloat16>(::aie::reduce_add(acc.template to_vector<float>()));
   }
   ::aie::set_rounding(saved_rounding);
 }
