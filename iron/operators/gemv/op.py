@@ -41,7 +41,10 @@ class GEMV(MLIROperator):
     alloc_M: int | None = field(default=None, repr=False)
     kernel_vector_size: int = field(default=64, repr=False)
     # Optional fused activation applied to each output tile in the producing core.
-    # "none" (default) leaves the output unchanged; "gelu" applies GELU(tanh approx).
+    # "none" (default) leaves the output unchanged; "gelu" applies GELU(tanh approx); "silu" applies
+    # SiLU(tanh approx), the same math as the standalone SiLU operator's kernel. Folding the
+    # activation in deletes a whole design from the graph, and a design costs an aiex.configure per
+    # layer whether or not it moves any bytes.
     # repr=False keeps operator/artifact names stable for the default path.
     epilogue: str = field(default="none", repr=False)
     # Weight-stream format axis for A (the MxK matrix): "bf16" (default, unchanged), or
@@ -86,13 +89,15 @@ class GEMV(MLIROperator):
                 f"num_batches ({self.num_batches}) must be a positive multiple of batch_group "
                 f"({self.batch_group})"
             )
-        if self.epilogue not in ("none", "gelu"):
+        if self.epilogue not in ("none", "gelu", "silu"):
             raise ValueError(
-                f"unknown epilogue {self.epilogue!r} (expected 'none' or 'gelu')"
+                f"unknown epilogue {self.epilogue!r} (expected 'none', 'gelu' or 'silu')"
             )
-        if self.epilogue == "gelu" and self.tile_size_output % 16 != 0:
+        # Both tile epilogues walk the C tile 32 lanes at a time from a 16-lane-aligned base.
+        if self.epilogue != "none" and self.tile_size_output % 32 != 0:
             raise ValueError(
-                f"gelu epilogue needs tile_size_output % 16 == 0 (got {self.tile_size_output})"
+                f"{self.epilogue} epilogue needs tile_size_output % 32 == 0 "
+                f"(got {self.tile_size_output})"
             )
         if self.weight_dtype not in ("bf16", "int4", "int8"):
             raise ValueError(
@@ -166,8 +171,8 @@ class GEMV(MLIROperator):
     def _kernel_link_file(self):
         # With the gelu epilogue the core also links the gelu kernel, so the object becomes an
         # archive of (matvec, gelu); the plain matvec stays a single object.
-        if self.epilogue == "gelu":
-            return f"gemv_{self.K}k_{self.kernel_vector_size}vs_gelu_kernels.a"
+        if self.epilogue != "none":
+            return f"gemv_{self.K}k_{self.kernel_vector_size}vs_{self.epilogue}_kernels.a"
         if self.weight_dtype != "bf16":
             return f"gemv_{self.K}k_{self.kernel_vector_size}vs_{self.weight_dtype}g{self.group_size}.o"
         return f"gemv_{self.K}k_{self.kernel_vector_size}vs.o"
@@ -230,24 +235,27 @@ class GEMV(MLIROperator):
                 f"-DVEC_SIZE={self.kernel_vector_size}",
             ],
         )
-        if self.epilogue == "gelu":
-            # The gelu kernel lives in aie2p/gelu.cc, so the fused epilogue is NPU2-only.
+        if self.epilogue != "none":
+            # Both epilogue kernels live under aie2p/, so a fused epilogue is NPU2-only.
             if get_kernel_dir() != "aie2p":
                 raise NotImplementedError(
-                    "gemv gelu epilogue is only available on NPU2 (aie2p); "
+                    f"gemv {self.epilogue} epilogue is only available on NPU2 (aie2p); "
                     f"current kernel dir is {get_kernel_dir()!r}"
                 )
-            gelu_obj = KernelObjectArtifact(
-                "gelu.o",
+            epi_obj = KernelObjectArtifact(
+                f"{self.epilogue}.o",
                 dependencies=[
                     SourceArtifact(
-                        self.context.base_dir / "aie_kernels" / "aie2p" / "gelu.cc"
+                        self.context.base_dir
+                        / "aie_kernels"
+                        / "aie2p"
+                        / f"{self.epilogue}.cc"
                     )
                 ],
             )
             return [
                 KernelArchiveArtifact(
-                    self._kernel_link_file, dependencies=[matvec_obj, gelu_obj]
+                    self._kernel_link_file, dependencies=[matvec_obj, epi_obj]
                 )
             ]
         return [matvec_obj]

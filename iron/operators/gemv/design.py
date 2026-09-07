@@ -133,14 +133,16 @@ def my_matvec(
     # Optional fused activation over the full m_output C-tile, applied once per tile in core_body
     # (after the matvec inner-loop has filled all rows) rather than per matvec call, whose m_input
     # tile can be smaller than the 16-wide activation vector.
-    assert epilogue in ("none", "gelu")
+    assert epilogue in ("none", "gelu", "silu")
     gelu_kernel = None
-    if epilogue == "gelu":
+    if epilogue != "none":
+        # 32, not 16: both tile epilogues walk the C tile with a 32-lane iterator, so a tile that is
+        # only 16-aligned makes the last iteration read and write past its end.
         assert (
-            m_output % 16 == 0
-        ), f"gelu epilogue needs m_output % 16 == 0 (got {m_output})"
+            m_output % 32 == 0
+        ), f"{epilogue} epilogue needs m_output % 32 == 0 (got {m_output})"
         gelu_kernel = Kernel(
-            f"{func_prefix}gelu_tile_bf16",
+            f"{func_prefix}{epilogue}_tile_bf16",
             f"{func_prefix}{kernel_object}",
             [np.int32, L1_C_ty],
         )
@@ -183,7 +185,7 @@ def my_matvec(
                 C_L1L3_fifos[i].prod(),
                 matvec,
             ]
-            + ([gelu_kernel] if epilogue == "gelu" else []),
+            + ([gelu_kernel] if epilogue != "none" else []),
         )
         for i in range(cols)
     ]
