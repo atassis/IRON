@@ -9,12 +9,18 @@ Deliberately does NOT touch /dev/accel -- no xclbin load, no NPUKernel, no run_t
 session owns the on-device gate; this only answers "does it place" (CPU-only aiecc).
 """
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 from iron.common import AIEContext
 from iron.operators.swiglu_mlp_fused.op import SwiGLUMLPFused
 from iron.operators.swiglu_mlp_fused.reference import generate_golden_reference
+
+PROGRAM_MEM_BYTES = 0x4000  # AIETargetModel.h getProgramMemorySize() for AIE2/AIE2P -- NOT 0x20000,
+                             # that figure is a dead hardcode in AIETargetLdScript.cpp's ld-script
+                             # emission and does not bound what a core can actually hold.
 
 
 def main():
@@ -47,6 +53,29 @@ def main():
     cols_used = sorted({c for c, r in placed_tiles})
     print(f"placed compute tiles (col,row): {placed_tiles}")
     print(f"columns used: {cols_used}")
+
+    # .text per core against the REAL 16 KB program-memory ceiling. Identify each core's role by
+    # its `call` targets in the optimized LLVM IR, not by buffer-symbol presence: the linker
+    # script lists neighbour-tile buffers too (address-space sharing), so that name search matches
+    # cores that never actually call the kernel.
+    llvm_size = shutil.which("llvm-size")
+    if llvm_size:
+        print(f"program memory per core: {PROGRAM_MEM_BYTES} B (0x{PROGRAM_MEM_BYTES:x})")
+        for col, row in placed_tiles:
+            elf = build_subdir / f"elfs_main_core_{col}_{row}" / f"elfs_main_core_{col}_{row}.elf"
+            ll = build_subdir / f"opted_main_core_{col}_{row}.ll"
+            calls = sorted(set(re.findall(r"call [\w ]*@(\w+)\(", ll.read_text()))) if ll.exists() else []
+            out = subprocess.run([llvm_size, "-A", str(elf)], capture_output=True, text=True)
+            text_bytes = next(
+                (int(line.split()[1]) for line in out.stdout.splitlines() if line.startswith(".text")),
+                None,
+            )
+            if text_bytes is not None:
+                pct = 100.0 * text_bytes / PROGRAM_MEM_BYTES
+                print(f"  ({col},{row}) [{','.join(calls) or '?'}]: .text={text_bytes} B "
+                      f"({pct:.1f}% of {PROGRAM_MEM_BYTES})")
+    else:
+        print("llvm-size not found on PATH -- skipping per-core .text measurement")
 
     xclbin = Path(op.xclbin_artifact.filename)
     insts = Path(op.insts_artifact.filename)

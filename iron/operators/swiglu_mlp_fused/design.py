@@ -45,6 +45,28 @@ MLIR MODULE (one `aie.device` == one symbol table), not per core's linked ELF, s
 declarations with the same name still verify-fail as "redefinition of symbol" even on different
 cores. op.py symbol-prefixes down's compiled object ("down_") so its Kernel() can use a distinct
 MLIR-level name.
+
+PROGRAM MEMORY IS 16 KB, NOT 128 KB. `AIETargetModel.h`'s `getProgramMemorySize()` returns
+0x4000 for AIE2/AIE2P (no NPU2 override); the 0x20000 figure was a dead hardcode in
+AIETargetLdScript.cpp's linker-script emission, decoupled from the real region. Measured via
+`llvm-size -A` on the built ELFs (identified by grepping each core's `.ll` for its `call`
+targets, not by buffer-symbol presence -- the linker script lists neighbour-tile buffers too):
+P1/P3 (add) 880 B (5.4% of 16384), P2 (weighted_rms_norm) 4304 B (26.3%, the max), core A
+(matvec+silu+mul) 2384 B (14.6%), core B (matvec) 1440 B (8.8%). None close to the ceiling.
+(Reference point: the 190 cores of the unfused 48-layer decode run min 864 / median 1760 / max
+3856 B -- core A's 3-kernel bundle still lands under that max; P2's single call is 12% over it.)
+
+WHAT THIS DESIGN GIVES UP IS CONCURRENCY, NOT TILE GRANULARITY. `tile_size_input` matches
+production exactly (gate/up 4, down 2 -- `_l1_single_core_tile` returns the identical values
+`gen_llm_decode.py`'s own `gemv_tile_output` would at these shapes), so per-call DMA/compute
+overlap and BD-loop shape are unchanged, and total matvec CALL count is unchanged too (768 gate +
+768 up + 512 down = 2048, same as summed across production's 24 gate/up/down columns at 8 each).
+What collapses is the column parallelism: production runs those 2048 calls across 24 physical
+cores, so per-stage wall time tracks ~96 (gate/up) or ~64 (down) call-latencies; here core A issues
+gate's 768 calls THEN up's 768 sequentially on one core (no cross-core overlap left to lose) and
+core B issues down's 512 alone -- call-count-derived estimates of ~16x and ~8x more sequential
+matvec-call latency for those two stages respectively, not a cycle measurement (this gate is
+device-free by design; the on-device number is for whoever runs the merged design next).
 """
 
 from ml_dtypes import bfloat16
