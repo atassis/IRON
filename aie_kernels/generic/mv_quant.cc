@@ -67,19 +67,23 @@ void matvec_int4_dequant(uint32_t m, const int8_t *__restrict a, const bfloat16 
     ::aie::accum<accfloat, r> acc = ::aie::zeros<accfloat, r>();
     AIE_LOOP_MIN_ITERATION_COUNT(n_groups)
     for (uint32_t gi = 0; gi < n_groups; gi++) {
-      const ::aie::vector<bfloat16, r> sfb =
-          ::aie::broadcast<bfloat16, r>(static_cast<bfloat16>(scale[gi]));
+      // Scale enters ONCE per group as the scalar multiplier of a MAC on the group's
+      // accumulator -- the form mlir-air's int4_awq/mv_int4_bf16.cc uses. Multiplying each
+      // block by a broadcast scale instead costs blocks_per_group vector multiplies per group.
+      const bfloat16 sa = static_cast<bfloat16>(scale[gi]);
       const bfloat16 *__restrict b_cur = b + gi * g;
       const uint8_t *__restrict gp = packed + (gi * g) / 2;
+      ::aie::accum<accfloat, r> g_acc;
+      g_acc.from_vector(::aie::zeros<float, r>());
       AIE_LOOP_UNROLL_FULL
       for (uint32_t ci = 0; ci < blocks_per_group; ci++) {
         ::aie::vector<int8_t, r> q8 =
             ::aie::unpack(::aie::load_v<r>(reinterpret_cast<const int4 *>(gp + (ci * r) / 2)));
         ::aie::vector<bfloat16, r> a_vec =
             ::aie::to_float<bfloat16>(::aie::unpack(q8), 0);
-        ::aie::vector<bfloat16, r> scaled = ::aie::mul(a_vec, sfb);
-        acc = ::aie::mac(acc, scaled, ::aie::load_v<r>(b_cur + ci * r));
+        g_acc = ::aie::mac(g_acc, a_vec, ::aie::load_v<r>(b_cur + ci * r));
       }
+      acc = ::aie::mac(acc, g_acc.template to_vector<bfloat16>(), sa);
     }
     c[row] = static_cast<bfloat16>(::aie::reduce_add(acc.template to_vector<float>()));
   }
