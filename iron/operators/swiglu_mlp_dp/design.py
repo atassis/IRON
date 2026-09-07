@@ -507,16 +507,23 @@ def my_swiglu_mlp_dp(
             misc_p.fill(a, _flat_tap(D, D), wait=True, group=tg1)
             misc_p.fill(npf, _flat_tap(D, D), wait=True, group=tg1)
         if n_aie_rows == 1:
-            for g in range(n_aie_cols):
-                gweight_ps[g].fill(
-                    Wg, _flat_tap(FF * D, FF_PER_CORE * D, g * FF_PER_CORE * D),
-                    wait=True, group=tg1,
-                )
-            for g in range(n_aie_cols):
-                gweight_ps[g].fill(
-                    Wu, _flat_tap(FF * D, FF_PER_CORE * D, g * FF_PER_CORE * D),
-                    wait=True, group=tg1,
-                )
+            # Wg/Wu belong in tg1 ONLY when nothing barriers the core between its Wo reads and its
+            # Wg reads. With fuse_o the core PRODUCES its a-slice in between, and that drain is in
+            # tg_a_drain -- so a Wg fill here can never complete: the core cannot reach step 3 to
+            # consume it until a drain that tg1.finish() is itself blocking gets issued.
+            # MEASURED as ERT_CMD_STATE_TIMEOUT with `Fatal error type: 0x0`. They are issued
+            # after tg_a_refill instead; see the invariant note there.
+            if not fuse_o:
+                for g in range(n_aie_cols):
+                    gweight_ps[g].fill(
+                        Wg, _flat_tap(FF * D, FF_PER_CORE * D, g * FF_PER_CORE * D),
+                        wait=True, group=tg1,
+                    )
+                for g in range(n_aie_cols):
+                    gweight_ps[g].fill(
+                        Wu, _flat_tap(FF * D, FF_PER_CORE * D, g * FF_PER_CORE * D),
+                        wait=True, group=tg1,
+                    )
             tg1.finish()
         else:
             tg1.finish()
@@ -567,6 +574,24 @@ def my_swiglu_mlp_dp(
             misc_p.fill(a_scratch, _flat_tap(D, D), wait=True, group=tg_a_refill)
             misc_p.fill(npf, _flat_tap(D, D), wait=True, group=tg_a_refill)
             tg_a_refill.finish()
+
+            # Wg/Wu, moved here from tg1. THE INVARIANT, stated one-directionally in TIME rather
+            # than by task kind: every task in group k must be reachable by the core using only
+            # groups <= k. A group is unsafe both when it holds a drain waiting on a later fill
+            # AND -- the case that hung this design -- when it holds a fill the core cannot reach
+            # until a later group's drain is issued.
+            tg_gu = TaskGroup()
+            for g in range(n_aie_cols):
+                gweight_ps[g].fill(
+                    Wg, _flat_tap(FF * D, FF_PER_CORE * D, g * FF_PER_CORE * D),
+                    wait=True, group=tg_gu,
+                )
+            for g in range(n_aie_cols):
+                gweight_ps[g].fill(
+                    Wu, _flat_tap(FF * D, FF_PER_CORE * D, g * FF_PER_CORE * D),
+                    wait=True, group=tg_gu,
+                )
+            tg_gu.finish()
 
         # Barrier: gh_scratch must be fully written before any core reads it back. Every core's R
         # output-fifo drains for gh land at disjoint, contiguous offsets that together cover all
