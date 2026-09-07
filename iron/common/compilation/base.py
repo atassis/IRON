@@ -481,6 +481,61 @@ class CompilationRule(ABC):
         """Apply this rule to the artifact graph, returning compilation commands. This should modify the artifact graph in-place to reflect the newly generated artifacts."""
         pass
 
+    # Tool lookup and symbol prefixing live on the BASE rule, not on the kernel rule, because both
+    # the object rule and the archive rule have to apply them. An archive that skips prefixing links
+    # against unrenamed symbols in a fused sequence -- see the note in _prefix_symbols.
+    def _find_tool(self, name):
+        return _find_tool(name, self.peano_dir, self.mlir_aie_dir)
+
+    def _find_working_tool(self, name):
+        return _find_working_tool(name, self.peano_dir, self.mlir_aie_dir)
+
+    def _prefix_symbols(self, artifact, prefix):
+        objcopy_path = self._find_working_tool("llvm-objcopy")
+        nm_path = self._find_working_tool("llvm-nm")
+        symbol_map_file = artifact.filename + ".symbol_map"
+
+        if os.name == "nt":
+            # Pure python code execution block wrapped cleanly for Windows
+            python_script = f"""
+import subprocess
+nm_cmd = [{repr(nm_path)}, '--defined-only', '--extern-only', {repr(artifact.filename)}]
+res = subprocess.run(nm_cmd, capture_output=True, text=True, check=True)
+lines = []
+for line in res.stdout.splitlines():
+    parts = line.strip().split()
+    if len(parts) == 3:
+        sym = parts[-1]
+        lines.append(f"{{sym}} {prefix}{{sym}}\\n")
+with open({repr(symbol_map_file)}, 'w') as f:
+    f.writelines(lines)
+"""
+            nm_cmd = [sys.executable, "-c", python_script.strip()]
+        else:
+            # Extract defined symbols and build the redefine-syms map. Run nm to a
+            # file, THEN awk (joined by `&&`) rather than `nm | awk`: a pipe reports
+            # only awk's exit status, so a failing nm silently produces an EMPTY map
+            # and the prefix rename is skipped, surfacing much later as
+            # `undefined symbol: {prefix}<sym>` at the per-core link. With `&&` a
+            # failed nm aborts here loudly instead.
+            nm_cmd = [
+                "sh",
+                "-c",
+                f"{nm_path} --defined-only --extern-only {artifact.filename} "
+                f"> {symbol_map_file}.syms && "
+                f"awk 'NF==3 {{print $3 \" {prefix}\" $3}}' {symbol_map_file}.syms "
+                f"> {symbol_map_file}",
+            ]
+
+        # Apply the renaming using the symbol map
+        objcopy_cmd = [
+            objcopy_path,
+            "--redefine-syms=" + symbol_map_file,
+            artifact.filename,
+        ]
+
+        return [ShellCompilationCommand(nm_cmd), ShellCompilationCommand(objcopy_cmd)]
+
 
 class GenerateMLIRFromPythonCompilationRule(CompilationRule):
     def matches(self, graph):
@@ -811,12 +866,6 @@ class KernelCompilationRule(CompilationRule):
 
         return commands
 
-    def _find_tool(self, name):
-        return _find_tool(name, self.peano_dir, self.mlir_aie_dir)
-
-    def _find_working_tool(self, name):
-        return _find_working_tool(name, self.peano_dir, self.mlir_aie_dir)
-
     def _rename_symbols(self, artifact):
         objcopy_path = self._find_working_tool("llvm-objcopy")
         cmd = [objcopy_path]
@@ -827,53 +876,6 @@ class KernelCompilationRule(CompilationRule):
             ]
         cmd += [artifact.filename]
         return [ShellCompilationCommand(cmd)]
-
-    def _prefix_symbols(self, artifact, prefix):
-        objcopy_path = self._find_working_tool("llvm-objcopy")
-        nm_path = self._find_working_tool("llvm-nm")
-        symbol_map_file = artifact.filename + ".symbol_map"
-
-        if os.name == "nt":
-            # Pure python code execution block wrapped cleanly for Windows
-            python_script = f"""
-import subprocess
-nm_cmd = [{repr(nm_path)}, '--defined-only', '--extern-only', {repr(artifact.filename)}]
-res = subprocess.run(nm_cmd, capture_output=True, text=True, check=True)
-lines = []
-for line in res.stdout.splitlines():
-    parts = line.strip().split()
-    if len(parts) >= 3:
-        sym = parts[-1]
-        lines.append(f"{{sym}} {prefix}{{sym}}\\n")
-with open({repr(symbol_map_file)}, 'w') as f:
-    f.writelines(lines)
-"""
-            nm_cmd = [sys.executable, "-c", python_script.strip()]
-        else:
-            # Extract defined symbols and build the redefine-syms map. Run nm to a
-            # file, THEN awk (joined by `&&`) rather than `nm | awk`: a pipe reports
-            # only awk's exit status, so a failing nm silently produces an EMPTY map
-            # and the prefix rename is skipped, surfacing much later as
-            # `undefined symbol: {prefix}<sym>` at the per-core link. With `&&` a
-            # failed nm aborts here loudly instead.
-            nm_cmd = [
-                "sh",
-                "-c",
-                f"{nm_path} --defined-only --extern-only {artifact.filename} "
-                f"> {symbol_map_file}.syms && "
-                f"awk '{{print $3 \" {prefix}\" $3}}' {symbol_map_file}.syms "
-                f"> {symbol_map_file}",
-            ]
-
-        # Apply the renaming using the symbol map
-        objcopy_cmd = [
-            objcopy_path,
-            "--redefine-syms=" + symbol_map_file,
-            artifact.filename,
-        ]
-
-        return [ShellCompilationCommand(nm_cmd), ShellCompilationCommand(objcopy_cmd)]
-
 
 class ArchiveCompilationRule(CompilationRule):
     """Bundle KernelObjectArtifacts into a static archive (.a)."""
@@ -898,5 +900,15 @@ class ArchiveCompilationRule(CompilationRule):
             ]
             cmd = [str(ar_path), "rcs", artifact.filename] + object_files
             commands.append(ShellCompilationCommand(cmd))
+            # An archive needs the SAME symbol prefixing an object gets. A fused OperatorSequence
+            # sets prefix_symbols on every design's kernel artifact so two designs can carry the
+            # same kernel names; without this the archive keeps the unprefixed names and the
+            # per-core link fails with `undefined symbol: op<N>_<sym>` -- for EVERY symbol in the
+            # archive, not just the one that made it an archive. llvm-objcopy rewrites archive
+            # members in place, so the object path's command pair works here unchanged.
+            if artifact.prefix_symbols:
+                commands.extend(
+                    self._prefix_symbols(artifact, artifact.prefix_symbols)
+                )
             artifact.available = True
         return commands
