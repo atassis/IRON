@@ -1,12 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Host-side packer for the GEMV `weight_dtype` axis (int4 / int8 group-quantized A).
+"""Host-side packer for the `weight_dtype` axis (int4 / int8 group-quantized weights).
 
 Byte-for-byte contract with aie_kernels/generic/mv_quant.cc: one row of the MxK weight matrix
 packs as ``[n_groups x f32 scale][payload]``, payload = K/2 nibble-packed bytes (int4, low nibble
-= even column) or K int8 bytes (int8, one byte per element). This lives beside the operator (not
-in a model generator) because it IS the kernel's on-wire format, not a model-specific concern --
-any caller of GEMV(weight_dtype=...) packs its weight the same way.
+= even column) or K int8 bytes (int8, one byte per element).
+
+Framework-level, not operator-level: GEMV and SwiGLUMLPDataParallel both declare buffers in this
+layout and both read it with mv_quant.cc, so it can have exactly ONE owner. It lived under
+iron/operators/gemv/ while GEMV was the only consumer; the second consumer is what moved it, since
+the alternative -- a second operator re-deriving `row_stride_bytes` -- is a byte-layout contract
+across an interface with no owner, the failure class that costs device runs to find.
 """
 
 import numpy as np

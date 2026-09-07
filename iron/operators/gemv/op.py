@@ -284,7 +284,7 @@ class GEMV(MLIROperator):
         if self.weight_dtype == "bf16":
             matrix_spec = AIERuntimeArgSpec("in", a_batch_dim + (a_rows, self.K))
         else:
-            from iron.operators.gemv.quant import row_stride_bytes
+            from iron.common.quant import row_stride_bytes
 
             stride = row_stride_bytes(self.K, self.group_size, self.weight_dtype)
             # Flat byte buffer (int8-typed purely so the emitted shim BDs type as `i8`, matching
