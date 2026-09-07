@@ -176,11 +176,11 @@ def my_matvec(
         a_row_width = K  # elements/row, dtype_in-sized
         itemsize_in = 2
     else:
-        # Group-quantized A: see iron/operators/gemv/quant.py for the exact byte layout
+        # Group-quantized A: see iron/common/quant.py for the exact byte layout
         # (`[n_groups x f32 scale][payload]` per row) and aie_kernels/generic/mv_quant.cc for the
         # device-side dequant. Packing the scale into A's own buffer (rather than a 3rd FIFO) is
         # forced by the 2-input-DMA-channel budget: A and B already spend both.
-        from iron.operators.gemv.quant import row_stride_bytes
+        from iron.common.quant import row_stride_bytes
 
         assert weight_dtype in ("int4", "int8", "int4a", "int8a"), \
             f"unknown weight_dtype {weight_dtype!r}"

@@ -45,7 +45,7 @@ def _mlp_l1_footprint_bytes(D, FF, mlp_cols, QD, tile_rows_gu, weight_depth, sta
     if weight_dtype == "bf16":
         wrow_d, wunit = D, 2
     else:
-        from iron.operators.gemv.quant import row_stride_bytes
+        from iron.common.quant import row_stride_bytes
         wrow_d, wunit = row_stride_bytes(D, group_size, weight_dtype), 1
     wtile_units = (tile_rows_gu or 6) * wrow_d
     tsi_o = ((tile_rows_gu or 6) * D) // QD
@@ -226,7 +226,7 @@ class DecodeLayerDataParallel(MLIROperator):
         # this class calls that design as a bare function, not through SwiGLUMLPDataParallel.
         # The attention half has no axis to check: it takes bf16 and nothing else.
         if self.weight_dtype != "bf16":
-            from iron.operators.gemv.quant import row_stride_bytes
+            from iron.common.quant import row_stride_bytes
             if self.group_size <= 0:
                 raise ValueError(
                     f"weight_dtype={self.weight_dtype!r} needs an explicit group_size > 0")
@@ -378,7 +378,7 @@ class DecodeLayerDataParallel(MLIROperator):
         if self.weight_dtype == "bf16":
             qvec = 64
         else:
-            from iron.operators.gemv.quant import max_legal_vec_size
+            from iron.common.quant import max_legal_vec_size
             qvec = max_legal_vec_size([self.D, self.FF, QD], self.group_size, self.weight_dtype)
             # Emit ONLY this dtype's wrapper. All four instantiate otherwise, and a template's
             # static_asserts fire on instantiation -- so one VEC_SIZE would have to be legal for
@@ -419,7 +419,7 @@ class DecodeLayerDataParallel(MLIROperator):
         """Wire units per weight ROW of width K: bf16 elements, or packed bytes when quantized."""
         if self.weight_dtype == "bf16":
             return K
-        from iron.operators.gemv.quant import row_stride_bytes
+        from iron.common.quant import row_stride_bytes
         return row_stride_bytes(K, self.group_size, self.weight_dtype)
 
     def _wspec(self, n_units):

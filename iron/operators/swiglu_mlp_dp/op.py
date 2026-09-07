@@ -141,7 +141,7 @@ class SwiGLUMLPDataParallel(MLIROperator):
         if self.weight_dtype == "bf16":
             _vec = 64
         else:
-            from iron.operators.gemv.quant import max_legal_vec_size
+            from iron.common.quant import max_legal_vec_size
             _ks = [self.D, self.FF] + ([self.QD] if self.fuse_o else [])
             _vec = max_legal_vec_size(_ks, self.group_size, self.weight_dtype)
             # Emit ONLY this dtype's wrapper. All four instantiate otherwise, and a template's
@@ -196,7 +196,7 @@ class SwiGLUMLPDataParallel(MLIROperator):
         """Wire units per weight ROW of width K: bf16 elements, or packed bytes when quantized."""
         if self.weight_dtype == "bf16":
             return K
-        from iron.operators.gemv.quant import row_stride_bytes
+        from iron.common.quant import row_stride_bytes
         return row_stride_bytes(K, self.group_size, self.weight_dtype)
 
     def _wspec(self, n_units, comment_unused=None):

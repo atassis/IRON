@@ -7,7 +7,7 @@ import aie.utils as aie_utils
 
 from iron.operators.gemv.design import MAX_GROUP_REUSE, my_matvec
 from iron.operators.gemv.op import GEMV
-from iron.operators.gemv.quant import quantize_weight, dequantize_weight
+from iron.common.quant import quantize_weight, dequantize_weight
 from iron.operators.gemv.reference import (
     generate_golden_reference,
     generate_golden_reference_batched,

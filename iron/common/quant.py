@@ -25,6 +25,12 @@ grew the `clip_search` / `scale_dtype` / `emulate_kernel_scale_cast` axes below:
 keyword-only and defaults to the old behavior (naive symmetric round-to-nearest, per-row-per-group
 absmax/qmax scale, f32 header). Flip a knob to opt into an axis; nothing here changes size or
 values for an existing caller that doesn't.
+
+Framework-level, not operator-level: GEMV and SwiGLUMLPDataParallel both declare buffers in this
+layout and both read it with mv_quant.cc, so it has exactly ONE owner. It lived under
+iron/operators/gemv/ while GEMV was the only consumer; the second consumer is what moved it -- the
+alternative, a second operator re-deriving `row_stride_bytes`, is a byte-layout contract across an
+interface with no owner, the failure class that costs device runs to find.
 """
 
 import numpy as np
