@@ -50,6 +50,25 @@ def test_rows_per_chunk_must_fit_l1_not_just_divide():
     TMatVec(M=256, K=2048, num_aie_columns=1, num_batches=4, batch_group=4, rows_per_chunk=32)
 
 
+def test_the_fit_error_names_the_BLOCKING_TERM_when_no_chunk_fits():
+    """At Gemma-4-12B's global geometry no rows_per_chunk fits, and A is not why.
+
+    head_dim 512, one kv head, gqa_group 16: W alone is 16*2048*2 = 65536 B, the entire L1, before
+    A/C/acc get a byte. Only A scales with rows_per_chunk, so the message must say the knob cannot
+    help and name the term that can -- an earlier version said "needs a MemTile stage for A", which
+    points at the wrong operand.
+    """
+    from iron.operators.tmatvec.design import check_l1_fits
+
+    msg = check_l1_fits(M=512, K=2048, batch_group=16, rows_per_chunk=64)
+    assert msg and "NO rows_per_chunk fits" in msg, msg
+    assert "W (batch_group*K)" in msg and "65536" in msg, msg
+    assert "cannot help" in msg, msg
+    # The A-dominated case must still name the value that works, not the blocking term.
+    tunable = check_l1_fits(M=256, K=2048, batch_group=4, rows_per_chunk=64)
+    assert tunable and "largest rows_per_chunk that fits here is 32" in tunable, tunable
+
+
 def test_the_fit_error_names_the_value_that_works():
     from iron.operators.tmatvec.design import largest_fitting_rows_per_chunk
 

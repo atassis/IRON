@@ -79,12 +79,29 @@ def check_l1_fits(M, K, batch_group, rows_per_chunk, l1_bytes=None):
     if used + L1_HEADROOM_BYTES <= budget:
         return None
     fits = largest_fitting_rows_per_chunk(M, K, batch_group, l1_bytes)
+    a, w = 2 * rows_per_chunk * M * 2, batch_group * K * 2
+    c, acc = 2 * batch_group * M * 2, batch_group * M * 4
+    # Report the BREAKDOWN, not just the total. Only A scales with rows_per_chunk, so when a shape
+    # cannot fit at any chunk size the blocker is one of the other three and shrinking the chunk can
+    # never help. MEASURED 2026-09-07 on Gemma-4-12B's global layers (head_dim 512, one kv head,
+    # gqa_group 16): W alone is 16*2048*2 = 65536 B, the ENTIRE L1, before A, C or acc get a byte.
+    # An earlier version of this message said "needs a MemTile stage for A" in that case, which
+    # names the wrong operand and would have sent the reader to tune the one knob that does nothing.
+    terms = f"A {a} + W {w} + C {c} + acc {acc}"
+    if fits:
+        advice = f"largest rows_per_chunk that fits here is {fits}."
+    else:
+        worst = max((w, "W (batch_group*K)"), (c, "C"), (acc, "acc"), key=lambda t: t[0])
+        advice = (
+            f"NO rows_per_chunk fits: A is the only term it scales, and the other three already "
+            f"total {w + c + acc} B. The dominant one is {worst[1]} at {worst[0]} B -- reduce "
+            f"batch_group or K, or stage that operand through a MemTile. Shrinking rows_per_chunk "
+            f"cannot help."
+        )
     return (
-        f"TMatVec does not fit L1: {used} B + {L1_HEADROOM_BYTES} B headroom exceeds {budget} B "
-        f"at M={M} K={K} batch_group={batch_group} rows_per_chunk={rows_per_chunk}. The A tile "
-        f"({2 * rows_per_chunk * M * 2} B) is the only term that scales with rows_per_chunk; "
-        + (f"largest value that fits here is {fits}."
-           if fits else "no rows_per_chunk fits -- this shape needs a MemTile stage for A.")
+        f"TMatVec does not fit L1: {used} B ({terms}) + {L1_HEADROOM_BYTES} B headroom exceeds "
+        f"{budget} B at M={M} K={K} batch_group={batch_group} rows_per_chunk={rows_per_chunk}. "
+        + advice
     )
 
 
