@@ -38,7 +38,30 @@ def reference(cur, a, n_pf, Wg, Wu, Wd, D, FF, epsilon=1e-5):
     return nxt.astype(bfloat16)
 
 
-def generate_golden_reference(D, FF, seed=42):
+def generate_golden_reference(D, FF, seed=42, weight_dtype="bf16", group_size=128):
+    """At a quantized weight_dtype the golden is computed from the DEQUANTIZED values, not the
+    originals, so the device is compared against the same numbers it is actually given."""
+    if weight_dtype != "bf16":
+        import numpy as _np
+        from iron.common.quant import quantize_weight, dequantize_weight
+
+        g = generate_golden_reference(D, FF, seed)
+        packed = {
+            "Wg": quantize_weight(_np.asarray(g["Wg"], _np.float32).reshape(FF, D), group_size, weight_dtype),
+            "Wu": quantize_weight(_np.asarray(g["Wu"], _np.float32).reshape(FF, D), group_size, weight_dtype),
+            "Wd": quantize_weight(_np.asarray(g["Wd"], _np.float32).reshape(D, FF), group_size, weight_dtype),
+        }
+        nxt = reference(
+            g["cur"], g["a"], g["n_pf"],
+            dequantize_weight(packed["Wg"], FF, D, group_size, weight_dtype),
+            dequantize_weight(packed["Wu"], FF, D, group_size, weight_dtype),
+            dequantize_weight(packed["Wd"], D, FF, group_size, weight_dtype),
+            D, FF)
+        return {"cur": g["cur"], "a": g["a"], "n_pf": g["n_pf"], **packed, "nxt": nxt}
+    return _generate_golden_reference_bf16(D, FF, seed)
+
+
+def _generate_golden_reference_bf16(D, FF, seed=42):
     rng = np.random.default_rng(seed)
     val_range = 1.0
     cur = (rng.standard_normal(D) * val_range).astype(bfloat16)

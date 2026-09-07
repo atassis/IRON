@@ -163,7 +163,8 @@ def _split_run(total, lim=1023, gran=2):
 
 def my_swiglu_mlp_dp(
     dev, D, FF, epsilon=1e-5, stack_size=0x800, func_prefix="", n_aie_cols=8, n_aie_rows=1,
-    QD=None, fuse_o=False,
+    QD=None, fuse_o=False, weight_dtype="bf16", group_size=0,
+    core_archive="swiglu_mlp_dp_core.a",
 ):
     """`func_prefix` is required (not optional) by iron.common.sequence.FusedDispatch the moment
     this design is placed in an OperatorSequence -- see gemv/design.py's identical parameter for
@@ -192,7 +193,41 @@ def my_swiglu_mlp_dp(
     )
     N_GU_TILES = FF_PER_CORE // TSI_GU
     N_D_TILES = D_PER_CORE // TSI_D
-    WTILE_ELEMS = TSI_GU * D
+
+    # Weight-stream format. Every weight extent below is a ROW WIDTH in w_dtype units -- elements
+    # at bf16, packed bytes when quantized -- so nothing carries a bare `D`/`FF` that silently
+    # means "bf16 element count".
+    if weight_dtype == "bf16":
+        w_scalar, w_dtype, w_dtype_str = bfloat16, np.dtype[bfloat16], "bf16"
+        gu_row_width, d_row_width = D, FF
+    else:
+        from iron.common.quant import row_stride_bytes
+
+        assert weight_dtype in ("int4", "int8"), f"unknown weight_dtype {weight_dtype!r}"
+        assert group_size > 0, "weight_dtype != 'bf16' needs an explicit group_size"
+        # Wo rides the SAME shared weight ObjectFifo as Wg/Wu/Wd (see the FUSE_O section), so a
+        # bf16 Wo cannot share a tile with quantized Wg/Wu/Wd -- the tile is one byte size. Either
+        # Wo joins the quantized stream or it needs its own channel, and the generator quantizes
+        # only the MLP weights today. Refuse rather than emit a tile that fits one and not the
+        # other: that mismatch is exactly what this axis was added to stop.
+        assert not fuse_o, (
+            "fuse_o with a quantized weight_dtype is not implemented: Wo shares the weight "
+            "ObjectFifo with Wg/Wu/Wd, so it would have to be quantized too"
+        )
+        w_scalar, w_dtype, w_dtype_str = np.int8, np.dtype[np.int8], weight_dtype
+        gu_row_width = row_stride_bytes(D, group_size, weight_dtype)
+        d_row_width = row_stride_bytes(FF, group_size, weight_dtype)
+    W_ITEMSIZE = np.dtype(w_scalar).itemsize
+
+    WTILE_ELEMS = TSI_GU * gu_row_width
+    # ONE tile shape serves Wg/Wu's TSI_GU D-wide rows and Wd's TSI_D FF-wide rows. That survives
+    # quantization because row_stride_bytes is linear in K with no constant term, so
+    # TSI_GU*D == TSI_D*FF carries over to the packed widths -- but that is a property of the
+    # PACKER, so check it here rather than inherit it.
+    assert TSI_GU * gu_row_width == TSI_D * d_row_width, (
+        f"{weight_dtype}: shared weight tile is not byte-identical for gate/up "
+        f"({TSI_GU}x{gu_row_width}) and down ({TSI_D}x{d_row_width})"
+    )
 
     if fuse_o:
         assert n_aie_rows == 1, "fuse_o is only derived for the plain (n_aie_rows=1) topology"
@@ -214,7 +249,7 @@ def my_swiglu_mlp_dp(
     # buffer is. Computed, not guessed: this is exactly the "hanging numbers are bugs" rule.
     L1_BYTES = 65536
     misc_bytes = 2 * (D * 2)  # depth=2
-    weight_bytes = 2 * (WTILE_ELEMS * 2)  # depth=2
+    weight_bytes = 2 * (WTILE_ELEMS * W_ITEMSIZE)  # depth=2
     out_bytes = 2 * (D_PER_CORE * 2)  # depth=2
     persistent_bytes = 2 * (D * 2) + (FF * 2) + 2 * (FF_PER_CORE * 2) + (D_PER_CORE * 2)
     # x1_buf + hf_buf         gh_buf      g_buf + u_buf          d_buf
@@ -232,9 +267,9 @@ def my_swiglu_mlp_dp(
     FF_ty = np.ndarray[(FF,), np.dtype[bfloat16]]
     DPC_ty = np.ndarray[(D_PER_CORE,), np.dtype[bfloat16]]
     FFPC_ty = np.ndarray[(FF_PER_CORE,), np.dtype[bfloat16]]
-    WTILE_ty = np.ndarray[(WTILE_ELEMS,), np.dtype[bfloat16]]
-    Wg_L3_ty = np.ndarray[(FF * D,), np.dtype[bfloat16]]
-    Wd_L3_ty = np.ndarray[(D * FF,), np.dtype[bfloat16]]
+    WTILE_ty = np.ndarray[(WTILE_ELEMS,), w_dtype]
+    Wg_L3_ty = np.ndarray[(FF * gu_row_width,), w_dtype]
+    Wd_L3_ty = np.ndarray[(D * d_row_width,), w_dtype]
     GH_SCRATCH_ty = np.ndarray[(FF,), np.dtype[bfloat16]]
     if fuse_o:
         QD_ty = np.ndarray[(QD,), np.dtype[bfloat16]]
@@ -243,7 +278,7 @@ def my_swiglu_mlp_dp(
         A_SCRATCH_ty = np.ndarray[(D,), np.dtype[bfloat16]]
 
     # ---- kernels (one archive per core -- every core plays every role) ----
-    CORE_ARCHIVE = f"{func_prefix}swiglu_mlp_dp_core.a"
+    CORE_ARCHIVE = f"{func_prefix}{core_archive}"
     # Two DIFFERENT bindings, not one reused: a Kernel() fixes ONE func.func signature for its
     # symbol, and the two call sites acquire differently-sized buffers (x1=cur+a is full-D; the
     # final residual is D/N-sized). The plain add costs nothing extra -- eltwise_add_bf16_vector
@@ -259,14 +294,14 @@ def my_swiglu_mlp_dp(
         f"{func_prefix}weighted_rms_norm", CORE_ARCHIVE, [D_ty, D_ty, D_ty, np.int32, np.float32]
     )
     mv_gu_kernel = Kernel(
-        f"{func_prefix}matvec_vectorized_bf16_bf16", CORE_ARCHIVE,
+        f"{func_prefix}matvec_vectorized_{w_dtype_str}_bf16", CORE_ARCHIVE,
         [np.int32, np.int32, WTILE_ty, D_ty, FFPC_ty],
     )
     # Down's own matvec: different DIM_K, same extern "C" name as mv_gu_kernel -- symbol
     # uniqueness is device-wide (one aie.device, one symbol table), so op.py compiles this one
     # from a prefixed object (see fuse/mlp-block's identical mv.cc reuse for the same reason).
     mv_d_kernel = Kernel(
-        f"{func_prefix}down_matvec_vectorized_bf16_bf16", CORE_ARCHIVE,
+        f"{func_prefix}down_matvec_vectorized_{w_dtype_str}_bf16", CORE_ARCHIVE,
         [np.int32, np.int32, WTILE_ty, FF_ty, DPC_ty],
     )
     silu_kernel = Kernel(f"{func_prefix}silu_tile_bf16", CORE_ARCHIVE, [np.int32, FFPC_ty])
@@ -317,7 +352,8 @@ def my_swiglu_mlp_dp(
         group_weight_ofs = weight_ofs  # sequence() fills/drains these directly, one per "group"
         group_out_ofs = out_ofs
     else:
-        RUN_HI, RUN_LO = _split_run(WTILE_ELEMS)
+        # gran = 4-byte shim granularity / element size: 2 at bf16, 4 at int8.
+        RUN_HI, RUN_LO = _split_run(WTILE_ELEMS, gran=4 // W_ITEMSIZE)
         GROUP_WTILE_ty = np.ndarray[(n_aie_rows * WTILE_ELEMS,), np.dtype[bfloat16]]
         GROUP_OTILE_ty = np.ndarray[(n_aie_rows * D_PER_CORE,), np.dtype[bfloat16]]
         group_weight_ofs = []
@@ -516,12 +552,12 @@ def my_swiglu_mlp_dp(
             if not fuse_o:
                 for g in range(n_aie_cols):
                     gweight_ps[g].fill(
-                        Wg, _flat_tap(FF * D, FF_PER_CORE * D, g * FF_PER_CORE * D),
+                        Wg, _flat_tap(FF * gu_row_width, FF_PER_CORE * gu_row_width, g * FF_PER_CORE * gu_row_width),
                         wait=True, group=tg1,
                     )
                 for g in range(n_aie_cols):
                     gweight_ps[g].fill(
-                        Wu, _flat_tap(FF * D, FF_PER_CORE * D, g * FF_PER_CORE * D),
+                        Wu, _flat_tap(FF * gu_row_width, FF_PER_CORE * gu_row_width, g * FF_PER_CORE * gu_row_width),
                         wait=True, group=tg1,
                     )
             tg1.finish()
@@ -536,22 +572,22 @@ def my_swiglu_mlp_dp(
             for i in range(N_GU_TILES):
                 tgw = TaskGroup()
                 for g in range(n_aie_cols):
-                    base = g * n_aie_rows * FF_PER_CORE * D
+                    base = g * n_aie_rows * FF_PER_CORE * gu_row_width
                     gweight_ps[g].fill(
                         Wg,
-                        _group_tap(FF * D, base + i * TSI_GU * D, n_aie_rows,
-                                   FF_PER_CORE * D, RUN_HI, RUN_LO),
+                        _group_tap(FF * gu_row_width, base + i * TSI_GU * gu_row_width, n_aie_rows,
+                                   FF_PER_CORE * gu_row_width, RUN_HI, RUN_LO),
                         wait=True, group=tgw,
                     )
                 tgw.finish()
             for i in range(N_GU_TILES):
                 tgw = TaskGroup()
                 for g in range(n_aie_cols):
-                    base = g * n_aie_rows * FF_PER_CORE * D
+                    base = g * n_aie_rows * FF_PER_CORE * gu_row_width
                     gweight_ps[g].fill(
                         Wu,
-                        _group_tap(FF * D, base + i * TSI_GU * D, n_aie_rows,
-                                   FF_PER_CORE * D, RUN_HI, RUN_LO),
+                        _group_tap(FF * gu_row_width, base + i * TSI_GU * gu_row_width, n_aie_rows,
+                                   FF_PER_CORE * gu_row_width, RUN_HI, RUN_LO),
                         wait=True, group=tgw,
                     )
                 tgw.finish()
@@ -583,12 +619,12 @@ def my_swiglu_mlp_dp(
             tg_gu = TaskGroup()
             for g in range(n_aie_cols):
                 gweight_ps[g].fill(
-                    Wg, _flat_tap(FF * D, FF_PER_CORE * D, g * FF_PER_CORE * D),
+                    Wg, _flat_tap(FF * gu_row_width, FF_PER_CORE * gu_row_width, g * FF_PER_CORE * gu_row_width),
                     wait=True, group=tg_gu,
                 )
             for g in range(n_aie_cols):
                 gweight_ps[g].fill(
-                    Wu, _flat_tap(FF * D, FF_PER_CORE * D, g * FF_PER_CORE * D),
+                    Wu, _flat_tap(FF * gu_row_width, FF_PER_CORE * gu_row_width, g * FF_PER_CORE * gu_row_width),
                     wait=True, group=tg_gu,
                 )
             tg_gu.finish()
@@ -617,7 +653,7 @@ def my_swiglu_mlp_dp(
         if n_aie_rows == 1:
             for g in range(n_aie_cols):
                 gweight_ps[g].fill(
-                    Wd, _flat_tap(D * FF, D_PER_CORE * FF, g * D_PER_CORE * FF),
+                    Wd, _flat_tap(D * d_row_width, D_PER_CORE * d_row_width, g * D_PER_CORE * d_row_width),
                     wait=True, group=tg3,
                 )
             tg3.finish()
@@ -626,11 +662,11 @@ def my_swiglu_mlp_dp(
             for i in range(N_D_TILES):
                 tgw = TaskGroup()
                 for g in range(n_aie_cols):
-                    base = g * n_aie_rows * D_PER_CORE * FF
+                    base = g * n_aie_rows * D_PER_CORE * d_row_width
                     gweight_ps[g].fill(
                         Wd,
-                        _group_tap(D * FF, base + i * TSI_D * FF, n_aie_rows,
-                                   D_PER_CORE * FF, RUN_HI, RUN_LO),
+                        _group_tap(D * d_row_width, base + i * TSI_D * d_row_width, n_aie_rows,
+                                   D_PER_CORE * d_row_width, RUN_HI, RUN_LO),
                         wait=True, group=tgw,
                     )
                 tgw.finish()

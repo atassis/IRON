@@ -39,6 +39,14 @@ class SwiGLUMLPDataParallel(MLIROperator):
     epsilon: float = 1e-5
     QD: int = None
     fuse_o: bool = False
+    # Weight-stream FORMAT axis for Wg/Wu/Wd, the same one GEMV carries and packed by the same
+    # iron/common/quant.py: "bf16" (default, byte-for-byte the pre-existing path) or "int4"/"int8"
+    # group-quantized, dequantized on-core by mv_quant.cc before the same bf16 MAC. Activations
+    # stay bf16 throughout. repr=False + the `name` override keep the default path's artifact
+    # names stable, matching GEMV's convention for the same field.
+    weight_dtype: str = field(default="bf16", repr=False)
+    group_size: int = field(default=0, repr=False)
+    kernel_vector_size: int = field(default=64, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -57,7 +65,70 @@ class SwiGLUMLPDataParallel(MLIROperator):
                 raise ValueError("fuse_o requires QD (the attention context width)")
             if self.num_aie_rows != 1:
                 raise ValueError("fuse_o is only derived for num_aie_rows=1 (see design.py)")
+        if self.weight_dtype not in ("bf16", "int4", "int8"):
+            raise ValueError(
+                f"unknown weight_dtype {self.weight_dtype!r} (expected 'bf16', 'int4' or 'int8')"
+            )
+        if self.weight_dtype != "bf16":
+            if self.fuse_o:
+                # Wo rides the SAME shared weight ObjectFifo as Wg/Wu/Wd, and that tile has ONE
+                # byte size. Quantizing three of the four and not the fourth cannot share it.
+                raise NotImplementedError(
+                    "fuse_o with a quantized weight_dtype is not implemented: Wo shares the "
+                    "weight ObjectFifo with Wg/Wu/Wd, so it would have to be quantized too"
+                )
+            if self.group_size <= 0:
+                raise ValueError("weight_dtype != 'bf16' needs an explicit group_size > 0")
+            # Same narrowing GEMV applies for the same measured reason: the quantized path
+            # amortises the group scale over group_size/kernel_vector_size chunks, so 32 beats
+            # the bf16-derived default of 64.
+            if self.kernel_vector_size == 64:
+                self.kernel_vector_size = 32
+            # BOTH matvecs read this format: gate/up at K=D, down at K=FF. A group_size that
+            # divides one and not the other would build a kernel whose static_assert fires.
+            for label, K in (("D", self.D), ("FF", self.FF)):
+                if K % self.group_size != 0:
+                    raise ValueError(
+                        f"{label}={K} must be a whole number of groups "
+                        f"(group_size={self.group_size})"
+                    )
+            if self.group_size % self.kernel_vector_size != 0:
+                # mv_quant.cc's vectorized dequant chunk must never straddle a group boundary.
+                raise ValueError(
+                    f"group_size={self.group_size} must be a multiple of kernel_vector_size="
+                    f"{self.kernel_vector_size}"
+                )
         MLIROperator.__init__(self, context=self.context)
+
+    @property
+    def name(self) -> str:
+        # weight_dtype is repr=False so the bf16 path keeps its existing artifact name, but a
+        # quantized variant must not share one with the bf16 op of the same shape: both would
+        # emit the same .mlir/.xclbin and a cached bf16 build would silently satisfy it.
+        base = super().name
+        if self.weight_dtype != "bf16":
+            base = f"{base}_wdt{self.weight_dtype}g{self.group_size}"
+        return base
+
+    @property
+    def _core_archive(self) -> str:
+        # Named by format for the same reason as `name`: the archive holds the matvec objects,
+        # and the bf16 and quantized ones export DIFFERENT symbols from DIFFERENT sources.
+        if self.weight_dtype == "bf16":
+            return "swiglu_mlp_dp_core.a"
+        return (f"swiglu_mlp_dp_core_{self.weight_dtype}g{self.group_size}"
+                f"_{self.kernel_vector_size}vs.a")
+
+    @property
+    def _row_widths(self):
+        """(gate/up, down) weight row width in arg-spec units -- elements at bf16, packed bytes
+        when quantized. design.py derives the same pair; both go through iron/common/quant.py."""
+        if self.weight_dtype == "bf16":
+            return self.D, self.FF
+        from iron.common.quant import row_stride_bytes
+
+        return (row_stride_bytes(self.D, self.group_size, self.weight_dtype),
+                row_stride_bytes(self.FF, self.group_size, self.weight_dtype))
 
     @property
     def _wo_rows_padded(self):
@@ -86,6 +157,9 @@ class SwiGLUMLPDataParallel(MLIROperator):
                     "n_aie_rows": self.num_aie_rows,
                     "QD": self.QD,
                     "fuse_o": self.fuse_o,
+                    "weight_dtype": self.weight_dtype,
+                    "group_size": self.group_size,
+                    "core_archive": self._core_archive,
                 },
             ),
         )
@@ -106,18 +180,26 @@ class SwiGLUMLPDataParallel(MLIROperator):
         silu_obj = KernelObjectArtifact(
             "silu.o", dependencies=[SourceArtifact(kdir / arch_dir / "silu.cc")]
         )
+        vs = self.kernel_vector_size
+        if self.weight_dtype == "bf16":
+            mv_src, mv_tag, mv_extra = kdir / "generic" / "mv.cc", f"{vs}vs", []
+        else:
+            # Same signature as mv.cc's, so only the source and the name change here.
+            mv_src = kdir / "generic" / "mv_quant.cc"
+            mv_tag = f"{self.weight_dtype}g{self.group_size}_{vs}vs"
+            mv_extra = [f"-DGROUP_SIZE={self.group_size}"]
         mv_gu_obj = KernelObjectArtifact(
-            f"gemv_{self.D}k_64vs.o",
-            dependencies=[SourceArtifact(kdir / "generic" / "mv.cc")],
-            extra_flags=[f"-DDIM_K={self.D}", "-DVEC_SIZE=64"],
+            f"gemv_{self.D}k_{mv_tag}.o",
+            dependencies=[SourceArtifact(mv_src)],
+            extra_flags=[f"-DDIM_K={self.D}", f"-DVEC_SIZE={vs}", *mv_extra],
         )
         # Same exported symbol as mv_gu_obj (DIM_K is baked in, not part of the name); this
         # object's own device-wide symbol table entry must be distinct, so it is compiled with a
         # prefix -- see design.py's mv_d_kernel comment and fuse/mlp-block's identical mechanism.
         mv_d_obj = KernelObjectArtifact(
-            f"down_gemv_{self.FF}k_64vs.o",
-            dependencies=[SourceArtifact(kdir / "generic" / "mv.cc")],
-            extra_flags=[f"-DDIM_K={self.FF}", "-DVEC_SIZE=64"],
+            f"down_gemv_{self.FF}k_{mv_tag}.o",
+            dependencies=[SourceArtifact(mv_src)],
+            extra_flags=[f"-DDIM_K={self.FF}", f"-DVEC_SIZE={vs}", *mv_extra],
             prefix_symbols="down_",
         )
         deps = [add_obj, mul_obj, rms_norm_obj, silu_obj, mv_gu_obj, mv_d_obj]
@@ -144,7 +226,7 @@ class SwiGLUMLPDataParallel(MLIROperator):
                 prefix_symbols="oa_",
             )
             deps += [mv_o_obj, cx_copy_obj, oa_copy_obj]
-        core_archive = KernelArchiveArtifact("swiglu_mlp_dp_core.a", dependencies=deps)
+        core_archive = KernelArchiveArtifact(self._core_archive, dependencies=deps)
         return [core_archive]
 
     def get_arg_spec(self):
@@ -161,19 +243,35 @@ class SwiGLUMLPDataParallel(MLIROperator):
                 AIERuntimeArgSpec("inout", (self.D,)),                    # a_scratch
                 AIERuntimeArgSpec("out", (self.D,)),                      # nxt
             ]
+        import numpy as np
+
+        gu_row, d_row = self._row_widths
+        # Quantized weights are flat byte buffers, int8-typed purely so the emitted shim BDs type
+        # as `i8` (matching decode_ddr_bytes.py's parser); the values are opaque packed bytes.
+        w_kw = {} if self.weight_dtype == "bf16" else dict(dtype=np.int8)
         return [
             AIERuntimeArgSpec("in", (self.D,)),                 # cur
             AIERuntimeArgSpec("in", (self.D,)),                 # a
             AIERuntimeArgSpec("in", (self.D,)),                 # n_pf
-            AIERuntimeArgSpec("in", (self.FF * self.D,)),       # Wg, flat [FF,D]
-            AIERuntimeArgSpec("in", (self.FF * self.D,)),       # Wu, flat [FF,D]
-            AIERuntimeArgSpec("in", (self.D * self.FF,)),       # Wd, flat [D,FF]
+            AIERuntimeArgSpec("in", (self.FF * gu_row,), **w_kw),  # Wg, FF rows of gu_row
+            AIERuntimeArgSpec("in", (self.FF * gu_row,), **w_kw),  # Wu, FF rows of gu_row
+            AIERuntimeArgSpec("in", (self.D * d_row,), **w_kw),    # Wd, D rows of d_row
             AIERuntimeArgSpec("inout", (self.FF,)),             # gh_scratch (internal round-trip)
             AIERuntimeArgSpec("out", (self.D,)),                # nxt
         ]
 
     def reference(self, cur, cx_or_a, n_pf, *rest):
         from iron.operators.swiglu_mlp_dp.reference import reference, reference_fused_o
+
+        if self.weight_dtype != "bf16":
+            # fuse_o is refused for a quantized weight_dtype, so `rest` is (Wg, Wu, Wd[, scratch]).
+            from iron.common.quant import dequantize_weight
+
+            g, u, d = rest[:3]
+            rest = (dequantize_weight(g, self.FF, self.D, self.group_size, self.weight_dtype),
+                    dequantize_weight(u, self.FF, self.D, self.group_size, self.weight_dtype),
+                    dequantize_weight(d, self.D, self.FF, self.group_size, self.weight_dtype),
+                    *rest[3:])
 
         if self.fuse_o:
             Wo, Wg, Wu, Wd = rest[:4]

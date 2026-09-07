@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Build-only gate for the data-parallel SwiGLU MLP block: does aiecc PLACE and BUILD one
+"""test.py [N] [weight_dtype] [group_size]   (FUSE_O=1 in env for the op_o-folded arm)
+
+Build-only gate for the data-parallel SwiGLU MLP block: does aiecc PLACE and BUILD one
 `aie.device` running every stage on N cores' own 1/N slice? Deliberately does NOT touch
 /dev/accel -- CPU-only aiecc. `N` is passed as sys.argv[1] (default 8); FUSE_O=1 in the
 environment builds the op_o-folded arm instead (see design.py's FUSE_O module docstring).
@@ -13,6 +15,8 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+import numpy as np
 
 from iron.common import AIEContext
 from iron.operators.swiglu_mlp_dp.op import SwiGLUMLPDataParallel
@@ -28,6 +32,12 @@ def main():
     D, FF, QD = 1024, 3072, 2048  # Qwen3-0.6B decode shapes (d_model, ffn, attn context width)
     N = int(sys.argv[1]) if len(sys.argv) > 1 else 8
     fuse_o = os.environ.get("FUSE_O", "0") == "1"
+    weight_dtype = sys.argv[2] if len(sys.argv) > 2 else "bf16"
+    group_size = int(sys.argv[3]) if len(sys.argv) > 3 else 128
+    quant_kw = ({} if weight_dtype == "bf16"
+                else dict(weight_dtype=weight_dtype, group_size=group_size))
+    tag = ("_fo" if fuse_o else "") + ("" if weight_dtype == "bf16"
+                                       else f"_{weight_dtype}g{group_size}")
     # N<=8: one core per column (n_aie_rows=1, plain ObjectFifos -- placement PROVED this at N=8).
     # N>8: n_aie_cols=8, n_aie_rows=N/8 (MemTile split/join -- see design.py's module docstring).
     n_aie_cols = min(N, 8)
@@ -36,11 +46,11 @@ def main():
     if fuse_o and n_aie_rows != 1:
         raise NotImplementedError("FUSE_O is only derived for n_aie_rows=1 (N<=8) -- see design.py")
 
-    build_dir = Path(__file__).resolve().parents[4] / "build" / f"swiglu_mlp_dp_n{N}{'_fo' if fuse_o else ''}"
+    build_dir = Path(__file__).resolve().parents[4] / "build" / f"swiglu_mlp_dp_n{N}{tag}"
     ctx = AIEContext(build_dir=build_dir)
     op = SwiGLUMLPDataParallel(
         D=D, FF=FF, num_aie_columns=n_aie_cols, num_aie_rows=n_aie_rows,
-        QD=QD if fuse_o else None, fuse_o=fuse_o, context=ctx,
+        QD=QD if fuse_o else None, fuse_o=fuse_o, context=ctx, **quant_kw,
     )
     print(f"operator: {op.name}")
     print(f"build dir: {build_dir}")
@@ -92,12 +102,21 @@ def main():
     if fuse_o:
         golden = generate_golden_reference_fused_o(D, FF, QD, wo_rows_padded=op._wo_rows_padded)
     else:
-        golden = generate_golden_reference(D, FF)
+        golden = generate_golden_reference(D, FF, weight_dtype=weight_dtype,
+                                          group_size=group_size)
+        # The declared weight buffers are exactly what iron/common/quant.py emits -- the check the
+        # fused decode graph's own `weight byte-size mismatch` assert was making far too late.
+        spec = op.get_arg_spec()
+        for i, key in ((3, "Wg"), (4, "Wu"), (5, "Wd")):
+            declared = int(np.prod(spec[i].shape)) * np.dtype(spec[i].dtype).itemsize
+            packed = np.asarray(golden[key]).nbytes
+            print(f"  {key}: declared {declared} B, packed {packed} B")
+            assert declared == packed, f"{key}: declares {declared} B, packer emits {packed} B"
     print(f"host reference nxt[:8] = {golden['nxt'][:8]}")
 
     print(f"PASS: one aie.device, aiecc placed and built it ({n_cores} aie.core across "
           f"{len(placed_tiles)} tiles, columns {cols_used}, rows {rows_used}, "
-          f"max .text {max_pct:.1f}%{', fuse_o=1' if fuse_o else ''}).")
+          f"max .text {max_pct:.1f}%{', fuse_o=1' if fuse_o else ''}, weights {weight_dtype}).")
 
 
 if __name__ == "__main__":
