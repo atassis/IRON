@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 from dataclasses import dataclass, field
 from typing import ClassVar, Dict
 
@@ -112,6 +114,12 @@ class GEMV(MLIROperator):
                 )
             if self.group_size <= 0:
                 raise ValueError("weight_dtype != 'bf16' needs an explicit group_size > 0")
+            # The quantized path amortises the group scale over group_size/kernel_vector_size
+            # chunks, so a NARROWER vector is faster here than the bf16-derived default of 64:
+            # measured 84.0 ms/token at 32 against 87-91 at 64 on the Qwen3-0.6B decode. 16 does
+            # not build -- aie_api has no vector_storage<int4, 16>.
+            if self.kernel_vector_size == 64:
+                self.kernel_vector_size = 32
             if self.K % self.group_size != 0:
                 raise ValueError(
                     f"K={self.K} must be a whole number of groups (group_size={self.group_size})"
@@ -174,7 +182,8 @@ class GEMV(MLIROperator):
         if self.epilogue != "none":
             return f"gemv_{self.K}k_{self.kernel_vector_size}vs_{self.epilogue}_kernels.a"
         if self.weight_dtype != "bf16":
-            return f"gemv_{self.K}k_{self.kernel_vector_size}vs_{self.weight_dtype}g{self.group_size}.o"
+            return (f"gemv_{self.K}k_{self.kernel_vector_size}vs_"
+                    f"{self.weight_dtype}g{self.group_size}.o")
         return f"gemv_{self.K}k_{self.kernel_vector_size}vs.o"
 
     def get_mlir_artifact(self):
