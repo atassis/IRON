@@ -52,7 +52,8 @@ import numpy as np
 
 from aie.helpers.dialects.scf import _for as range_
 from aie.helpers.taplib import TensorAccessPattern
-from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
+from aie.iron import (Buffer, Kernel, ObjectFifo, Program, Runtime, ScratchpadParameter,
+                      TaskGroup, Worker, sync_parameters)
 
 BF16 = bfloat16
 
@@ -70,11 +71,13 @@ def qkv_head_dp(
     HD,
     Hq,
     Hkv,
+    max_seq,
     epsilon=1e-6,
     tile_size_input=4,
     stack_size=0xD00,
     func_prefix="",
     n_aie_cols=8,
+    kv_offset_parameter="kv_off",
 ):
     """`func_prefix` is not optional once this design is placed in an OperatorSequence -- see
     gemv/design.py's identical parameter. N = n_aie_cols, one core per column."""
@@ -106,11 +109,20 @@ def qkv_head_dp(
         f"persistent={persistent_bytes} stack={stack_size})"
     )
 
+    # k and v are drained STRAIGHT into the KV caches at the token's own offset instead of into a
+    # `qkv` buffer that a StridedCopy then re-reads and re-writes. The caches are the only consumer
+    # of either (op_scores reads kc, TMatVec reads vc), so the intermediate never had a reader --
+    # it existed because the append was a separate operator. Deletes two runs and one configure per
+    # layer, and the k/v DDR round trip with them.
+    kv_off_param = (ScratchpadParameter(kv_offset_parameter, np.int32)
+                    if kv_offset_parameter is not None else None)
+
     D_ty = np.ndarray[(D,), np.dtype[BF16]]
     HD_ty = np.ndarray[(HD,), np.dtype[BF16]]
     WTILE_ty = np.ndarray[(WTILE_ELEMS,), np.dtype[BF16]]
     W_L3_ty = np.ndarray[(TOT * D,), np.dtype[BF16]]
-    OUT_L3_ty = np.ndarray[(TOT,), np.dtype[BF16]]
+    Q_L3_ty = np.ndarray[(QD,), np.dtype[BF16]]
+    KV_L3_ty = np.ndarray[(Hkv * max_seq * HD,), np.dtype[BF16]]
 
     # ---- kernels: one archive, every core plays every role ----
     CORE_ARCHIVE = f"{func_prefix}qkv_head_dp_core.a"
@@ -199,7 +211,7 @@ def qkv_head_dp(
             )
         )
 
-    def sequence(cur, nin, wqkv, nqn, nkn, ang, out, misc_p, weight_ps, out_cs):
+    def sequence(cur, nin, wqkv, nqn, nkn, ang, q, kc, vc, misc_p, weight_ps, out_cs):
         # ONE TaskGroup for the fills AND the drains, and that is load-bearing rather than tidy.
         # Runtime.finish_task_group awaits at group CLOSE, not at issue, so a group's BDs are all
         # programmed first -- but a group boundary is a hard barrier. Splitting fills and drains
@@ -216,6 +228,8 @@ def qkv_head_dp(
         #
         # Per-tile active BDs stay inside the 16 aiecc allows: each column carries 1 weight fill +
         # HEADS_PER_CORE drains, and the misc producer's 5 fills land on one tile.
+        if kv_off_param is not None:
+            sync_parameters()
         tg = TaskGroup()
         misc_p.fill(cur, _flat_tap(D, D), wait=True, group=tg)
         misc_p.fill(nin, _flat_tap(D, D), wait=True, group=tg)
@@ -232,13 +246,27 @@ def qkv_head_dp(
             )
             for h in range(HEADS_PER_CORE):
                 g = c * HEADS_PER_CORE + h
-                out_cs[c].drain(out, _flat_tap(TOT, HD, g * HD), wait=True, group=tg)
+                kind = head_kind(g)
+                if kind == "q":
+                    # q keeps a plain L3 buffer: the scores GEMV reads it whole, per token.
+                    out_cs[c].drain(q, _flat_tap(QD, HD, g * HD), wait=True, group=tg)
+                else:
+                    # k/v land at [head][n_past][HD] of their cache. The head term is static; the
+                    # position term is `kv_off` (element units), patched into the BD base address
+                    # per dispatch -- the same mechanism the StridedCopy this replaces used, so
+                    # the cache layout and the host's parameter write are both unchanged.
+                    cache = kc if kind == "k" else vc
+                    hh = g - Hq if kind == "k" else g - Hq - Hkv
+                    out_cs[c].drain(
+                        cache, _flat_tap(Hkv * max_seq * HD, HD, hh * max_seq * HD),
+                        wait=True, group=tg, offset_parameter=kv_off_param,
+                    )
         tg.finish()
 
     rt = Runtime(
         sequence,
         [
-            D_ty, D_ty, W_L3_ty, HD_ty, HD_ty, HD_ty, OUT_L3_ty,
+            D_ty, D_ty, W_L3_ty, HD_ty, HD_ty, HD_ty, Q_L3_ty, KV_L3_ty, KV_L3_ty,
             misc_of.prod(),
             [of.prod() for of in weight_ofs], [of.cons() for of in out_ofs],
         ],

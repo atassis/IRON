@@ -35,10 +35,12 @@ class QKVHeadDataParallel(MLIROperator):
     HD: int
     Hq: int
     Hkv: int
+    max_seq: int
     num_aie_columns: int = 8
     epsilon: float = 1e-6
     tile_size_input: int = 4
     stack_size: int = 0xD00
+    kv_offset_parameter: str | None = "kv_off"
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -47,6 +49,8 @@ class QKVHeadDataParallel(MLIROperator):
         "epsilon": "eps",
         "tile_size_input": "tsi",
         "stack_size": "ss",
+        "max_seq": "S",
+        "kv_offset_parameter": "kvpar",
     }
 
     def __post_init__(self):
@@ -74,9 +78,11 @@ class QKVHeadDataParallel(MLIROperator):
             DesignGenerator(
                 self.operator_dir / "design.py",
                 "qkv_head_dp",
-                (aie_utils.get_current_device(), self.D, self.HD, self.Hq, self.Hkv),
+                (aie_utils.get_current_device(), self.D, self.HD, self.Hq, self.Hkv,
+                 self.max_seq),
                 {
                     "epsilon": self.epsilon,
+                    "kv_offset_parameter": self.kv_offset_parameter,
                     "tile_size_input": self.tile_size_input,
                     "stack_size": self.stack_size,
                     "n_aie_cols": self.num_aie_columns,
@@ -121,6 +127,7 @@ class QKVHeadDataParallel(MLIROperator):
 
     def get_arg_spec(self):
         QD, KVD = self.Hq * self.HD, self.Hkv * self.HD
+        cache = self.Hkv * self.max_seq * self.HD
         return [
             AIERuntimeArgSpec("in", (self.D,)),                    # cur
             AIERuntimeArgSpec("in", (self.D,)),                    # n_in
@@ -128,10 +135,14 @@ class QKVHeadDataParallel(MLIROperator):
             AIERuntimeArgSpec("in", (self.HD,)),                   # n_qn
             AIERuntimeArgSpec("in", (self.HD,)),                   # n_kn
             AIERuntimeArgSpec("in", (self.HD,)),                   # ang
-            AIERuntimeArgSpec("out", (QD + 2 * KVD,)),             # qkv
+            AIERuntimeArgSpec("out", (QD,)),                       # q
+            AIERuntimeArgSpec("inout", (cache,)),                  # kc, appended at kv_off
+            AIERuntimeArgSpec("inout", (cache,)),                  # vc, appended at kv_off
         ]
 
     def reference(self, cur, n_in, wqkv, n_qn, n_kn, ang):
+        """Returns the concatenated [q | k | v]; the caller places k and v itself. The device
+        appends them to the caches directly, so there is no single output to compare against."""
         from iron.operators.qkv_head_dp.reference import reference
 
         return reference(cur, n_in, wqkv, n_qn, n_kn, ang,

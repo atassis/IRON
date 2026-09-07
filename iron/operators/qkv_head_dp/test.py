@@ -35,10 +35,17 @@ def main():
     argv = [a for a in sys.argv[1:] if a != "--device"]
     on_device = "--device" in sys.argv
     tsi = int(argv[0]) if argv else 4
+    # The device arm drops the kv_off ScratchpadParameter -- run_test has no way to write one --
+    # and appends at a static offset 0. That leaves BD patching ungated HERE; it is gated by the
+    # full-graph token-parity run, and it is StridedCopy's own long-standing path. Placement is
+    # checked WITH the parameter, since that is the configuration that ships.
+    S = 512 if on_device else 2048
+    kvpar = None if on_device else "kv_off"
 
-    build_dir = Path(__file__).resolve().parents[4] / "build" / f"qkv_head_dp_tsi{tsi}"
-    op = QKVHeadDataParallel(D=D, HD=HD, Hq=Hq, Hkv=Hkv, num_aie_columns=N,
-                             tile_size_input=tsi, context=AIEContext(build_dir=build_dir))
+    build_dir = Path(__file__).resolve().parents[4] / "build" / f"qkv_head_dp_tsi{tsi}_S{S}"
+    op = QKVHeadDataParallel(D=D, HD=HD, Hq=Hq, Hkv=Hkv, max_seq=S, num_aie_columns=N,
+                             tile_size_input=tsi, kv_offset_parameter=kvpar,
+                             context=AIEContext(build_dir=build_dir))
     print(f"operator: {op.name}")
     op.compile()   # raises on any failed command, aiecc placement included
 
@@ -70,11 +77,11 @@ def main():
     print(f"PLACES: one aie.device, {n_cores} cores over {len(tiles)} tiles, "
           f"tile_size_input={tsi}, max .text {max_pct:.1f}% of {PROGRAM_MEM_BYTES} B.")
     if on_device:
-        run_on_device(op, D, HD, Hq, Hkv)
+        run_on_device(op, D, HD, Hq, Hkv, S)
     print("PASS")
 
 
-def run_on_device(op, D, HD, Hq, Hkv):
+def run_on_device(op, D, HD, Hq, Hkv, S):
     import torch
     from iron.common.test_utils import run_test
     from iron.operators.qkv_head_dp.reference import reference
@@ -90,11 +97,22 @@ def run_on_device(op, D, HD, Hq, Hkv):
     n_qn, n_kn, ang = rnd(HD), rnd(HD), rnd(HD)
     golden = reference(cur, n_in, wqkv.reshape(-1), n_qn, n_kn, ang, D, HD, Hq, Hkv, op.epsilon)
 
+    # k and v are APPENDED to the caches at [head][pos][HD]; at kv_off=0 that is row 0 of each
+    # head, so the expected cache is zeros with one HD-wide row written per head.
+    kc = torch.zeros(Hkv * S * HD, dtype=torch.bfloat16)
+    vc = torch.zeros(Hkv * S * HD, dtype=torch.bfloat16)
+    for h in range(Hkv):
+        kc[h * S * HD: h * S * HD + HD] = golden[QD + h * HD: QD + (h + 1) * HD]
+        vc[h * S * HD: h * S * HD + HD] = golden[QD + KVD + h * HD: QD + KVD + (h + 1) * HD]
+
+    # kc/vc are `inout`: run_test takes their INITIAL contents from the input dict (zeros, the
+    # cache before this token) and compares the SAME buffer against the output dict afterwards.
     errors, latency_us, _ = run_test(
         op,
         {"cur": cur, "n_in": n_in, "wqkv": wqkv.reshape(-1),
-         "n_qn": n_qn, "n_kn": n_kn, "ang": ang},
-        {"qkv": golden},
+         "n_qn": n_qn, "n_kn": n_kn, "ang": ang,
+         "kc": torch.zeros_like(kc), "vc": torch.zeros_like(vc)},
+        {"q": golden[:QD], "kc": kc, "vc": vc},
         rel_tol=0.05, abs_tol=0.5,
     )
     # rel-L2 alongside the elementwise check: this is a NOTE, not the gate (error-metrics-are-
