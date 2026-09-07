@@ -35,8 +35,21 @@ class Softmax(MLIROperator):
         return self.rows * self.cols
 
     def __post_init__(self):
-        if self.rows % 16 != 0:
-            raise ValueError(f"rows ({self.rows}) must be a multiple of 16")
+        # `rows % 16` was rejected here with no stated derivation, and design.py does not need it:
+        # rows are split across cores and each core then walks `N_div_n = per_core_elements // cols`
+        # TILES, so what the design requires of rows is (a) divisibility by the split, checked just
+        # below, and (b) at least one tile per core -- rows >= num_aie_columns * num_channels. The
+        # %16 rejected Gemma-3's 4 query heads, which run correctly at num_aie_columns=4
+        # (N_div_n=1). Checking the real constraint instead, and naming the fix in the message,
+        # because a head count under the split otherwise produces N_div_n=0 and an op that
+        # silently computes nothing.
+        cores = self.num_aie_columns * self.num_channels
+        if self.rows < cores:
+            raise ValueError(
+                f"rows ({self.rows}) < num_aie_columns*num_channels ({cores}): each core would get "
+                f"less than one {self.cols}-element tile and the op would compute nothing. "
+                f"Lower num_aie_columns to at most {self.rows}."
+            )
         if self.cols % 16 != 0:
             raise ValueError(f"cols ({self.cols}) must be a multiple of 16")
         if self.rows % self.num_aie_columns != 0:
