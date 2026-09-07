@@ -54,4 +54,14 @@ void eltwise_mul_bf16_vector(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out, in
 {
     eltwise_vmul<bfloat16, bfloat16>(a_in, b_in, c_out, size);
 }
+
+// Same op, but `a_in`/`b_in` are read starting `ab_offset` elements in. swiglu_mlp_dp calls this
+// to emit gh = silu(g)*u in D/N-sized chunks straight out of the core's full FF/N-sized g/u
+// buffers, so the chunk can be written directly into the shared output ObjectFifo tile (see this
+// design's core_fn) instead of needing a separate gh-sized scratch buffer.
+void eltwise_mul_offset_ab_bf16_vector(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out, int size,
+                                        int ab_offset)
+{
+    eltwise_vmul<bfloat16, bfloat16>(a_in + ab_offset, b_in + ab_offset, c_out, size);
+}
 } // extern "C"
