@@ -35,13 +35,15 @@ class SwiGLUMLPDataParallel(MLIROperator):
     D: int
     FF: int
     num_aie_columns: int = 8
+    num_aie_rows: int = 1
     epsilon: float = 1e-5
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
         **MLIROperator._name_aliases,
         "epsilon": "eps",
-        "num_aie_columns": "n",
+        "num_aie_columns": "cols",
+        "num_aie_rows": "rows",
     }
 
     def __post_init__(self):
@@ -57,7 +59,11 @@ class SwiGLUMLPDataParallel(MLIROperator):
                 self.operator_dir / "design.py",
                 "my_swiglu_mlp_dp",
                 (aie_utils.get_current_device(), self.D, self.FF, self.epsilon),
-                {"stack_size": 0x800, "n_aie_cols": self.num_aie_columns},
+                {
+                    "stack_size": 0x800,
+                    "n_aie_cols": self.num_aie_columns,
+                    "n_aie_rows": self.num_aie_rows,
+                },
             ),
         )
 
