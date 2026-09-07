@@ -19,7 +19,11 @@ void saxpy(bfloat16 *restrict x, bfloat16 *restrict y, const float a, bfloat16 *
     ::aie::vector<bfloat16, 64> a_v =
         ::aie::broadcast<bfloat16, 64>(aie::to_float<bfloat16>(a, 0)); // Convert to bfloat16
                                                                        // #pragma clang loop min_iteration_count(4)
-    for (int i = 0; i < vector_size; i += 64) {
+    // Bound on the last FULL vector. `i < vector_size` admits a final iteration with fewer than
+    // 64 elements left while load_v/store_v stay full-width, so it reads and WRITES up to 63
+    // elements past x, y and z. Same class as add.cc and mul.cc; see the comment in mul.cc.
+    const int F = vector_size / 64;
+    for (int i = 0; i < F * 64; i += 64) {
         ::aie::vector<bfloat16, 64> x_v = ::aie::load_v<64>(x);
         x += 64;
         ::aie::vector<bfloat16, 64> y_v = ::aie::load_v<64>(y);
@@ -29,6 +33,11 @@ void saxpy(bfloat16 *restrict x, bfloat16 *restrict y, const float a, bfloat16 *
         ::aie::vector<bfloat16, 64> z_v_converted = z_v.to_vector<bfloat16>();
         ::aie::store_v(z, z_v_converted);
         z += 64;
+    }
+    // x/y/z already point past the vector body.
+    const float a_f = aie::to_float<bfloat16>(a, 0);
+    for (int i = 0; i < vector_size - F * 64; i++) {
+        z[i] = (bfloat16)(a_f * (float)x[i] + (float)y[i]);
     }
     event1();
 }

@@ -38,6 +38,16 @@ template <typename T_in, typename T_out> void eltwise_vadd(T_in *a, T_in *b, T_o
         aie::store_v(pC1, cout);
         pC1 += vec_factor;
     }
+    // Tail. `size` is a per-core tile size chosen by the caller and nothing upstream requires it to
+    // be a multiple of vec_factor, so without this the last `size % 32` outputs are NEVER WRITTEN
+    // and the consumer reads whatever the buffer held. Silent, not a crash, and invisible to any
+    // model whose tile happens to divide 32: Qwen3-0.6B's residual tile is 1024/8 = 128 = 32*4 and
+    // is correct, while Gemma-3-270M's is 640/8 = 80 = 32*2 + 16, dropping 20% of every residual
+    // add and turning full-depth decode into garbage tokens.
+    const int tail = size - F * vec_factor;   // pA1/pB1/pC1 already point past the vector body
+    for (int i = 0; i < tail; i++) {
+        pC1[i] = pA1[i] + pB1[i];
+    }
     event1();
 }
 
