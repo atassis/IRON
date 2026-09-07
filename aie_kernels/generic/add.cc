@@ -63,4 +63,27 @@ void eltwise_add_bf16_vector(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out, in
     eltwise_vadd<bfloat16, bfloat16>(a_in, b_in, c_out, size);
 }
 
+// Same op, but `a_in` is read starting `a_offset` elements in -- the swiglu_mlp_dp core's own
+// slice of a REPLICATED full-D buffer (every core holds the whole x1, but the final residual only
+// needs its own D/N rows of it). Mirrors mv.cc's row_offset: the offset is a kernel argument, not
+// caller-side pointer arithmetic on an acquired ObjectFifo tile (no subview support end to end --
+// see the design.py this is called from).
+void eltwise_add_offset_a_bf16_vector(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out, int size,
+                                       int a_offset)
+{
+    eltwise_vadd<bfloat16, bfloat16>(a_in + a_offset, b_in, c_out, size);
+}
+
+// Plain element copy, `size` elements, writing `dst` starting at `dst_offset`. Used once per
+// swiglu_mlp_dp core to reassemble the all-gathered gh vector from misc-fifo chunks smaller than
+// FF. Not vectorized -- called 3x per token (D-sized chunks), nowhere near this design's
+// bottleneck (the weight stream), so the extra code size of a vector loop isn't worth it.
+void copy_offset_bf16_vector(bfloat16 *dst, bfloat16 *src, int size, int dst_offset)
+{
+    dst += dst_offset;
+    for (int i = 0; i < size; i++) {
+        dst[i] = src[i];
+    }
+}
+
 } // extern "C"
