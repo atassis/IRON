@@ -22,10 +22,17 @@ PROGRAM_MEM_BYTES = 0x4000  # AIETargetModel.h getProgramMemorySize() for AIE2/A
 def main():
     D, FF = 1024, 3072  # Qwen3-0.6B decode shapes (d_model, ffn)
     N = int(sys.argv[1]) if len(sys.argv) > 1 else 8
+    # N<=8: one core per column (n_aie_rows=1, plain ObjectFifos -- placement PROVED this at N=8).
+    # N>8: n_aie_cols=8, n_aie_rows=N/8 (MemTile split/join -- see design.py's module docstring).
+    n_aie_cols = min(N, 8)
+    n_aie_rows = N // n_aie_cols
+    assert n_aie_cols * n_aie_rows == N
 
     build_dir = Path(__file__).resolve().parents[4] / "build" / f"swiglu_mlp_dp_n{N}"
     ctx = AIEContext(build_dir=build_dir)
-    op = SwiGLUMLPDataParallel(D=D, FF=FF, num_aie_columns=N, context=ctx)
+    op = SwiGLUMLPDataParallel(
+        D=D, FF=FF, num_aie_columns=n_aie_cols, num_aie_rows=n_aie_rows, context=ctx
+    )
     print(f"operator: {op.name}")
     print(f"build dir: {build_dir}")
 

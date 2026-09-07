@@ -45,10 +45,31 @@ each core already owns a whole column's slice), then every core re-reads the FUL
 back over the MISC channel. Cost is trivial (2*FF elements moved, ~0.03% of the layer's traffic);
 correctness rests only on a TaskGroup barrier separating the drains from the refill.
 
-n_aie_rows is fixed at 1 (N == n_aie_cols, one core per column, no within-column MemTile
-split/join): that is the only topology this file builds and gates. Extending to n_aie_rows>1
-(N=16/32, spreading a column's slice across its 4 physical rows) needs an additional per-column
-MemTile join (gh) / split (weight) stage and is NOT implemented here -- see the operator report.
+MEASURED (device-free, aiecc placement): n_aie_rows=1 (N=n_aie_cols<=8) places with plain flat
+per-core ObjectFifos -- no explicit MemTile step needed, the automatic placer inserts whatever
+staging one column needs (it column-major-fills 4 rows before moving to the next column, so N=8
+lands on physical columns 0-1, not 0-7, and that is fine -- the design never assumes a "logical
+core c" is "physical column c"). Both N=16 and N=32 fail there: aiecc's error is explicit --
+"no ShimNOCTile ... free: all 8 ShimNOCTile(s) are at 16/16 input... channels used" -- the
+DEVICE-WIDE ShimDMA budget (16, matching get_shim_dma_limit()) is spent one channel per DISTINCT
+shim-facing ObjectFifo, not "2 per tile" as the compute-tile figure might suggest; misc(1) +
+weight(N) already exceeds it at N=16.
+
+n_aie_rows>1 fixes this with the SAME two combinators fuse/mlp-block's own report cites as the
+proven multi-row pattern in this codebase (whole_array_silu_iron.py's A-split / C-join): per
+GROUP of n_aie_rows cores sharing one shim source,
+  - WEIGHT: one group-level ObjectFifo (n_aie_rows*WTILE_ELEMS per fill) is `.split()` into
+    n_aie_rows row sub-fifos (WTILE_ty each) at a MemTile. One fill per weight-tile ROUND gathers
+    all n_aie_rows rows' data for that round with a strided TAP (rows are NOT adjacent in Wg/Wd's
+    own row-major layout -- consecutive rows in one group are FF_PER_CORE, resp. D_PER_CORE,
+    elements apart), correct because ObjectFifoLink's own offsets place them contiguously in the
+    fetched tile in row order, matching the `.split()` offsets below.
+  - OUTPUT: one group-level ObjectFifo is `.join()` from n_aie_rows row sub-fifos (DPC_ty each);
+    cores write into the row sub-fifo exactly as at n_aie_rows=1. Draining gh needs the same
+    strided TAP (destination rows are FF_PER_CORE apart) since the join's own buffer is
+    contiguous by row; draining the final nxt round does not (D_PER_CORE apart on both sides).
+This only reduces the number of DISTINCT shim-facing ObjectFifos from N to n_aie_cols for both
+weight and output -- misc is already 1 regardless of n_aie_rows (see the MISC paragraph above).
 """
 
 from ml_dtypes import bfloat16
@@ -67,15 +88,44 @@ TSI_GU = 6
 TSI_D = 2
 
 
-def _flat_tap(n, offset=0):
-    return TensorAccessPattern((1, n), offset, [1, 1, 1, n], [0, 0, 0, 1])
+def _flat_tap(total, size, offset=0):
+    """A contiguous [offset:offset+size) read/write into an L3 buffer of `total` elements.
+    `total` is the FULL buffer's own declared size (TensorAccessPattern validates offset+extent
+    against it), which is why a bare (size,) tensor_dims -- correct only at offset=0 -- silently
+    rejects every sliced fill/drain this design needs once `total` differs from `size`."""
+    return TensorAccessPattern((1, total), offset, [1, 1, 1, size], [0, 0, 0, 1])
 
 
-def my_swiglu_mlp_dp(dev, D, FF, epsilon=1e-5, stack_size=0x800, func_prefix="", n_aie_cols=8):
+def _group_tap(total, offset, n_rows, row_stride, run_hi, run_lo):
+    """A group-of-`n_rows` gather/scatter: row r's `run_hi*run_lo`-element contiguous run sits
+    `r*row_stride` elements apart in the L3 buffer, but CONTIGUOUS (row order) in the L2/L1 tile
+    on the other end of the ObjectFifoLink -- exactly what `.split()`/`.join()`'s own `offsets=`
+    (row r at r*run_hi*run_lo in the fetched/joined tile) assume. `run_hi*run_lo` splits a
+    per-row run that exceeds the shim's 1023-element wrap cap into two dims (see _split_run) --
+    at n_rows==1 this degenerates to _flat_tap's own [0,1,1,size] shape."""
+    return TensorAccessPattern(
+        (1, total), offset, [1, n_rows, run_hi, run_lo], [0, row_stride, run_lo, 1]
+    )
+
+
+def _split_run(total, lim=1023, gran=2):
+    """Largest (hi, lo) with hi*lo == total, lo <= lim, lo a multiple of `gran` -- the shim BD
+    4-dim wrap-size cap (mlir-aie's verifyStridesWraps), same constraint gemv/design.py's own
+    split_run guards. Raises if no such split exists."""
+    for lo in range(lim - (lim % gran), 0, -gran):
+        if total % lo == 0:
+            return total // lo, lo
+    raise ValueError(f"{total} has no wrap-legal split (lim={lim}, gran={gran})")
+
+
+def my_swiglu_mlp_dp(
+    dev, D, FF, epsilon=1e-5, stack_size=0x800, func_prefix="", n_aie_cols=8, n_aie_rows=1
+):
     """`func_prefix` is required (not optional) by iron.common.sequence.FusedDispatch the moment
     this design is placed in an OperatorSequence -- see gemv/design.py's identical parameter for
-    the same reason. `n_aie_cols` is N here (n_aie_rows fixed at 1, see module docstring)."""
-    N = n_aie_cols
+    the same reason. N = n_aie_cols * n_aie_rows; n_aie_rows=1 is the plain-ObjectFifo topology,
+    n_aie_rows>1 uses the MemTile split/join topology -- see the module docstring for both."""
+    N = n_aie_cols * n_aie_rows
     assert FF % D == 0, f"this design assumes FF ({FF}) is a whole multiple of D ({D})"
     R = FF // D  # =3 at Qwen3-0.6B's shape; also N_GH_CHUNKS (misc) and N_GH_ROUNDS (output)
     assert D % N == 0 and FF % N == 0, f"D={D}, FF={FF} must both be divisible by N={N}"
@@ -154,12 +204,48 @@ def my_swiglu_mlp_dp(dev, D, FF, epsilon=1e-5, stack_size=0x800, func_prefix="",
         f"{func_prefix}copy_offset_bf16_vector", CORE_ARCHIVE, [FF_ty, D_ty, np.int32, np.int32]
     )
 
-    # ---- ObjectFifos: misc(1) + weight(N) + output(N), all direct L3<->L1 (n_aie_rows=1 --
-    # no MemTile split/join needed; the automatic placer inserts whatever staging one column
-    # needs, exactly as the existing 8-column GEMV/RMSNorm/SiLU designs already rely on). ----
+    # ---- ObjectFifos: misc(1, always) + weight(n_aie_cols groups) + output(n_aie_cols groups).
+    # n_aie_rows==1: plain per-core ObjectFifos, direct L3<->L1 (no MemTile step in this file --
+    # the automatic placer inserts whatever staging one column needs). n_aie_rows>1: one
+    # group-level ObjectFifo per column, split (weight) / joined (output) into n_aie_rows row
+    # sub-fifos at a MemTile -- see module docstring. Either way `weight_ofs[c]`/`out_ofs[c]`
+    # (c = g*n_aie_rows + r) end up as the per-core handles core_fn acquires/releases from; it
+    # does not know or care which path built them. ----
     misc_of = ObjectFifo(D_ty, name="misc", depth=2)
-    weight_ofs = [ObjectFifo(WTILE_ty, name=f"weight_{c}", depth=2) for c in range(N)]
-    out_ofs = [ObjectFifo(DPC_ty, name=f"out_{c}", depth=2) for c in range(N)]
+    weight_ofs = [None] * N
+    out_ofs = [None] * N
+    if n_aie_rows == 1:
+        for c in range(N):
+            weight_ofs[c] = ObjectFifo(WTILE_ty, name=f"weight_{c}", depth=2)
+            out_ofs[c] = ObjectFifo(DPC_ty, name=f"out_{c}", depth=2)
+        group_weight_ofs = weight_ofs  # sequence() fills/drains these directly, one per "group"
+        group_out_ofs = out_ofs
+    else:
+        RUN_HI, RUN_LO = _split_run(WTILE_ELEMS)
+        GROUP_WTILE_ty = np.ndarray[(n_aie_rows * WTILE_ELEMS,), np.dtype[bfloat16]]
+        GROUP_OTILE_ty = np.ndarray[(n_aie_rows * D_PER_CORE,), np.dtype[bfloat16]]
+        group_weight_ofs = []
+        group_out_ofs = []
+        for g in range(n_aie_cols):
+            gw = ObjectFifo(GROUP_WTILE_ty, name=f"weight_g{g}", depth=2)
+            sub_w = gw.cons().split(
+                [r * WTILE_ELEMS for r in range(n_aie_rows)],
+                obj_types=[WTILE_ty] * n_aie_rows,
+                names=[f"weight_{g}_{r}" for r in range(n_aie_rows)],
+                depths=[2] * n_aie_rows,
+            )
+            go = ObjectFifo(GROUP_OTILE_ty, name=f"out_g{g}", depth=2)
+            sub_o = go.prod().join(
+                [r * D_PER_CORE for r in range(n_aie_rows)],
+                obj_types=[DPC_ty] * n_aie_rows,
+                names=[f"out_{g}_{r}" for r in range(n_aie_rows)],
+                depths=[2] * n_aie_rows,
+            )
+            for r in range(n_aie_rows):
+                weight_ofs[g * n_aie_rows + r] = sub_w[r]
+                out_ofs[g * n_aie_rows + r] = sub_o[r]
+            group_weight_ofs.append(gw)
+            group_out_ofs.append(go)
 
     def core_fn(misc_c, weight_c, out_p,
                 x1_buf, hf_buf, gh_buf, g_buf, u_buf, d_buf,
@@ -244,46 +330,125 @@ def my_swiglu_mlp_dp(dev, D, FF, epsilon=1e-5, stack_size=0x800, func_prefix="",
         )
 
     def sequence(cur, a, npf, Wg, Wu, Wd, gh_scratch, nxt,
-                 misc_p, weight_ps, out_cs):
+                 misc_p, gweight_ps, gout_cs):
+        # `wait=True` EVERYWHERE, not just on the drains: a plain TaskGroup.finish() with no
+        # wait=True lowers to dma_free_task, which is compile-time BD-ID recycling ONLY -- no
+        # hardware wait is emitted (AIEAssignRuntimeSequenceBDIDs.cpp; AIEDMATasksToNPU.cpp never
+        # even sees dma_free_task). BD-ID pools are allocated PER SHIM TILE, shared across every
+        # ObjectFifo mapped to that tile, so a later fill/drain on the SAME tile (misc, weight and
+        # output are only 1-2 distinct shim tiles at N=8, since the placer fills 4 rows per column
+        # before moving on) can get a recycled BD ID reprogrammed while the freed one's transfer
+        # is still in flight -- a lock-count race, not a copy race, so it does not corrupt data,
+        # it desyncs an ObjectFifo's acquire()/release() and hangs. Only wait=True lowers to a
+        # real `dma_await_task`/NpuSyncOp barrier. MEASURED: without this, every N (including
+        # N=8, which has no split/join to blame) hit a genuine device-side TDR
+        # (aie2_tdr_detect, journalctl -k) and ERT_CMD_STATE_TIMEOUT, not just a host illusion.
         tg1 = TaskGroup()
-        misc_p.fill(cur, _flat_tap(D), group=tg1)
-        misc_p.fill(a, _flat_tap(D), group=tg1)
-        misc_p.fill(npf, _flat_tap(D), group=tg1)
-        for c in range(N):
-            weight_ps[c].fill(Wg, _flat_tap(FF_PER_CORE * D, c * FF_PER_CORE * D), group=tg1)
-        for c in range(N):
-            weight_ps[c].fill(Wu, _flat_tap(FF_PER_CORE * D, c * FF_PER_CORE * D), group=tg1)
-        for c in range(N):
-            weight_ps[c].fill(Wd, _flat_tap(D_PER_CORE * FF, c * D_PER_CORE * FF), group=tg1)
-        tg1.finish()
+        misc_p.fill(cur, _flat_tap(D, D), wait=True, group=tg1)
+        misc_p.fill(a, _flat_tap(D, D), wait=True, group=tg1)
+        misc_p.fill(npf, _flat_tap(D, D), wait=True, group=tg1)
+        if n_aie_rows == 1:
+            for g in range(n_aie_cols):
+                gweight_ps[g].fill(
+                    Wg, _flat_tap(FF * D, FF_PER_CORE * D, g * FF_PER_CORE * D),
+                    wait=True, group=tg1,
+                )
+            for g in range(n_aie_cols):
+                gweight_ps[g].fill(
+                    Wu, _flat_tap(FF * D, FF_PER_CORE * D, g * FF_PER_CORE * D),
+                    wait=True, group=tg1,
+                )
+            tg1.finish()
+        else:
+            tg1.finish()
+            # Round-major, group-minor, with a finish() per round: each round issues exactly
+            # n_aie_cols fills (one per shim tile), so no tile ever has more than 1 in flight.
+            # Batching all rounds into one TaskGroup instead hit aiecc's real per-tile BD queue
+            # depth (16) -- shim (0,0) alone would have queued N_GU_TILES*2 (Wg+Wu) unfreed
+            # descriptors for group 0. Gathers all n_aie_rows rows' data for one round with a
+            # strided TAP (see _group_tap / module docstring).
+            for i in range(N_GU_TILES):
+                tgw = TaskGroup()
+                for g in range(n_aie_cols):
+                    base = g * n_aie_rows * FF_PER_CORE * D
+                    gweight_ps[g].fill(
+                        Wg,
+                        _group_tap(FF * D, base + i * TSI_GU * D, n_aie_rows,
+                                   FF_PER_CORE * D, RUN_HI, RUN_LO),
+                        wait=True, group=tgw,
+                    )
+                tgw.finish()
+            for i in range(N_GU_TILES):
+                tgw = TaskGroup()
+                for g in range(n_aie_cols):
+                    base = g * n_aie_rows * FF_PER_CORE * D
+                    gweight_ps[g].fill(
+                        Wu,
+                        _group_tap(FF * D, base + i * TSI_GU * D, n_aie_rows,
+                                   FF_PER_CORE * D, RUN_HI, RUN_LO),
+                        wait=True, group=tgw,
+                    )
+                tgw.finish()
 
         # Barrier: gh_scratch must be fully written before any core reads it back. Every core's R
         # output-fifo drains for gh land at disjoint, contiguous offsets that together cover all
         # of gh_scratch exactly once, in the natural FF order Wd's rows expect.
         tg2 = TaskGroup()
-        for c in range(N):
+        for g in range(n_aie_cols):
             for r in range(R):
-                out_cs[c].drain(
-                    gh_scratch, _flat_tap(D_PER_CORE, c * FF_PER_CORE + r * D_PER_CORE),
-                    wait=True, group=tg2,
-                )
+                if n_aie_rows == 1:
+                    tap = _flat_tap(FF, D_PER_CORE, g * FF_PER_CORE + r * D_PER_CORE)
+                else:
+                    tap = _group_tap(
+                        FF, g * n_aie_rows * FF_PER_CORE + r * D_PER_CORE,
+                        n_aie_rows, FF_PER_CORE, 1, D_PER_CORE,
+                    )
+                gout_cs[g].drain(gh_scratch, tap, wait=True, group=tg2)
         tg2.finish()
 
+        # gh_scratch refill AND Wd share this group: both are exactly what the core's down-matvec
+        # step needs next, and neither has an ordering hazard against anything still pending.
         tg3 = TaskGroup()
         for i in range(R):
-            misc_p.fill(gh_scratch, _flat_tap(D, i * D), group=tg3)
-        tg3.finish()
+            misc_p.fill(gh_scratch, _flat_tap(FF, D, i * D), wait=True, group=tg3)
+        if n_aie_rows == 1:
+            for g in range(n_aie_cols):
+                gweight_ps[g].fill(
+                    Wd, _flat_tap(D * FF, D_PER_CORE * FF, g * D_PER_CORE * FF),
+                    wait=True, group=tg3,
+                )
+            tg3.finish()
+        else:
+            tg3.finish()
+            for i in range(N_D_TILES):
+                tgw = TaskGroup()
+                for g in range(n_aie_cols):
+                    base = g * n_aie_rows * D_PER_CORE * FF
+                    gweight_ps[g].fill(
+                        Wd,
+                        _group_tap(D * FF, base + i * TSI_D * FF, n_aie_rows,
+                                   D_PER_CORE * FF, RUN_HI, RUN_LO),
+                        wait=True, group=tgw,
+                    )
+                tgw.finish()
 
         tg4 = TaskGroup()
-        for c in range(N):
-            out_cs[c].drain(nxt, _flat_tap(D_PER_CORE, c * D_PER_CORE), wait=True, group=tg4)
+        for g in range(n_aie_cols):
+            # Final residual: joined-buffer row order and nxt's own indexing both step by
+            # D_PER_CORE, so this drain -- unlike gh's -- is a plain contiguous run even at
+            # n_aie_rows>1.
+            gout_cs[g].drain(
+                nxt, _flat_tap(D, n_aie_rows * D_PER_CORE, g * n_aie_rows * D_PER_CORE),
+                wait=True, group=tg4,
+            )
         tg4.finish()
 
     rt = Runtime(
         sequence,
         [
             D_ty, D_ty, D_ty, Wg_L3_ty, Wg_L3_ty, Wd_L3_ty, GH_SCRATCH_ty, D_ty,
-            misc_of.prod(), [of.prod() for of in weight_ofs], [of.cons() for of in out_ofs],
+            misc_of.prod(),
+            [of.prod() for of in group_weight_ofs], [of.cons() for of in group_out_ofs],
         ],
     )
 
