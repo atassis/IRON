@@ -4,8 +4,10 @@
 
 """Build-only gate for the data-parallel SwiGLU MLP block: does aiecc PLACE and BUILD one
 `aie.device` running every stage on N cores' own 1/N slice? Deliberately does NOT touch
-/dev/accel -- CPU-only aiecc. `N` is passed as sys.argv[1] (default 8).
+/dev/accel -- CPU-only aiecc. `N` is passed as sys.argv[1] (default 8); FUSE_O=1 in the
+environment builds the op_o-folded arm instead (see design.py's FUSE_O module docstring).
 """
+import os
 import re
 import shutil
 import subprocess
@@ -14,24 +16,31 @@ from pathlib import Path
 
 from iron.common import AIEContext
 from iron.operators.swiglu_mlp_dp.op import SwiGLUMLPDataParallel
-from iron.operators.swiglu_mlp_dp.reference import generate_golden_reference
+from iron.operators.swiglu_mlp_dp.reference import (
+    generate_golden_reference,
+    generate_golden_reference_fused_o,
+)
 
 PROGRAM_MEM_BYTES = 0x4000  # AIETargetModel.h getProgramMemorySize() for AIE2/AIE2P.
 
 
 def main():
-    D, FF = 1024, 3072  # Qwen3-0.6B decode shapes (d_model, ffn)
+    D, FF, QD = 1024, 3072, 2048  # Qwen3-0.6B decode shapes (d_model, ffn, attn context width)
     N = int(sys.argv[1]) if len(sys.argv) > 1 else 8
+    fuse_o = os.environ.get("FUSE_O", "0") == "1"
     # N<=8: one core per column (n_aie_rows=1, plain ObjectFifos -- placement PROVED this at N=8).
     # N>8: n_aie_cols=8, n_aie_rows=N/8 (MemTile split/join -- see design.py's module docstring).
     n_aie_cols = min(N, 8)
     n_aie_rows = N // n_aie_cols
     assert n_aie_cols * n_aie_rows == N
+    if fuse_o and n_aie_rows != 1:
+        raise NotImplementedError("FUSE_O is only derived for n_aie_rows=1 (N<=8) -- see design.py")
 
-    build_dir = Path(__file__).resolve().parents[4] / "build" / f"swiglu_mlp_dp_n{N}"
+    build_dir = Path(__file__).resolve().parents[4] / "build" / f"swiglu_mlp_dp_n{N}{'_fo' if fuse_o else ''}"
     ctx = AIEContext(build_dir=build_dir)
     op = SwiGLUMLPDataParallel(
-        D=D, FF=FF, num_aie_columns=n_aie_cols, num_aie_rows=n_aie_rows, context=ctx
+        D=D, FF=FF, num_aie_columns=n_aie_cols, num_aie_rows=n_aie_rows,
+        QD=QD if fuse_o else None, fuse_o=fuse_o, context=ctx,
     )
     print(f"operator: {op.name}")
     print(f"build dir: {build_dir}")
@@ -80,12 +89,15 @@ def main():
     print(f"xclbin: {xclbin} ({xclbin.stat().st_size} bytes)")
     print(f"insts:  {insts} ({insts.stat().st_size} bytes)")
 
-    golden = generate_golden_reference(D, FF)
+    if fuse_o:
+        golden = generate_golden_reference_fused_o(D, FF, QD, wo_rows_padded=op._wo_rows_padded)
+    else:
+        golden = generate_golden_reference(D, FF)
     print(f"host reference nxt[:8] = {golden['nxt'][:8]}")
 
     print(f"PASS: one aie.device, aiecc placed and built it ({n_cores} aie.core across "
           f"{len(placed_tiles)} tiles, columns {cols_used}, rows {rows_used}, "
-          f"max .text {max_pct:.1f}%).")
+          f"max .text {max_pct:.1f}%{', fuse_o=1' if fuse_o else ''}).")
 
 
 if __name__ == "__main__":

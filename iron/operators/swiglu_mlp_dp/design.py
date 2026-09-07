@@ -70,6 +70,49 @@ GROUP of n_aie_rows cores sharing one shim source,
     contiguous by row; draining the final nxt round does not (D_PER_CORE apart on both sides).
 This only reduces the number of DISTINCT shim-facing ObjectFifos from N to n_aie_cols for both
 weight and output -- misc is already 1 regardless of n_aie_rows (see the MISC paragraph above).
+
+FUSE_O (fuse_o=True, n_aie_rows=1 only -- see below): folds the attention output projection
+`a = Wo @ cx` into this design too, deleting a whole standalone GEMV design/configure/run from the
+decode runlist. `a` was the ONLY external input this design didn't already compute on-chip; now
+`cx` (QD-wide) and `Wo` ([D, QD]) arrive instead, and every core computes its own D/N slice of `a`
+from its own row-slice of Wo, exactly like the existing Wd/d_buf step. Two wrinkles this adds:
+
+  cx reassembly: QD is a whole multiple of D (R_CX = QD/D), so cx arrives as R_CX D-sized misc
+  broadcasts and is reassembled by the SAME explicit-offset-copy idiom gh already uses -- no new
+  channel, just more rounds through the existing one.
+
+  Wo's row-tile CANNOT share Wg/Wu/Wd's byte-identical WTILE_ty tile cleanly: the shared tile size
+  is forced to lcm(D, FF, QD) = 6*D (FF=3D, QD=2D here), which makes TSI_O = 6*D/QD a multiple of
+  3, and D_PER_CORE = D/N a power of two for every N this codebase places -- a multiple of 3 can
+  never divide a power of two, so a uniform TSI_O-row tiling of D_PER_CORE always leaves a
+  remainder, for ANY N. Reusing the channel anyway with a "short" final fill was rejected: nothing
+  in this codebase does a partial-tile fill into a fixed-shape ObjectFifo object (see
+  qkv_head_dp/design.py's identical refusal, "a D-wide tile would need a 128-of-1024 partial fill
+  ... which nothing in this codebase does"), and a dedicated second weight channel for Wo is a
+  non-starter on ITS OWN merits: misc(1)+weight(N)+weight_o(N) is 17 input channels at N=8, one
+  over the same 16-channel device-wide budget that already caps this design at N=8 (see above) --
+  confirmed independently by attn_core's fusion attempt, which hit exactly this wall trying to
+  fold op_o in elsewhere ("all 8 ShimNOCTile(s) are at 9/16 input, 16/16 output channels used").
+
+  The fix is a 1-row OVERLAP, not a partial fill: every core reads ceil(D_PER_CORE/TSI_O) FULL
+  TSI_O-row tiles (a window of N_O_TILES*TSI_O rows, >= D_PER_CORE), starting at its own
+  c*D_PER_CORE offset in Wo. For every core but the last this window simply reads a few of the
+  NEXT core's real rows too (harmless -- Wo is read-only, and the extra rows are computed but
+  never drained). Only the LAST core's window would run past Wo's true D rows, so Wo is padded
+  with O_OVERLAP (< TSI_O) zero rows at the very end -- a single, tiny, explicit append, not an
+  assumption about stale buffer contents. Every fill is a full, byte-identical WTILE_ty tile,
+  identical in shape to the existing Wg/Wu/Wd fills; only the LAST core's window ever touches a
+  padding row, and that row's own output (computed, never drained) is exactly zero. The per-core
+  matvec output lands in a plain (n_aie_rows=1-scoped) O_WINDOW-sized scratch buffer, not
+  ObjectFifo-backed, so the overlap/pad tail costs nothing beyond that buffer's own bytes; only
+  its first D_PER_CORE elements -- this core's real slice -- are drained.
+
+  `a`'s own all-gather reuses gh's exact mechanism: each core drains its D_PER_CORE-wide real
+  slice onto the shared OUTPUT channel (now a NEW, first round ahead of gh's own R rounds), then
+  every core re-reads the full D-wide result over MISC once the drains are barriered -- structured
+  as its own TaskGroup pair (tg_a_drain/tg_a_refill) ahead of the existing gh pair, because this
+  core now produces its FIRST output (the a-slice drain) before consuming cur/n_pf, not after (see
+  op.py's Runtime docstring for why a stale two-group split would deadlock here).
 """
 
 from ml_dtypes import bfloat16
@@ -119,12 +162,19 @@ def _split_run(total, lim=1023, gran=2):
 
 
 def my_swiglu_mlp_dp(
-    dev, D, FF, epsilon=1e-5, stack_size=0x800, func_prefix="", n_aie_cols=8, n_aie_rows=1
+    dev, D, FF, epsilon=1e-5, stack_size=0x800, func_prefix="", n_aie_cols=8, n_aie_rows=1,
+    QD=None, fuse_o=False,
 ):
     """`func_prefix` is required (not optional) by iron.common.sequence.FusedDispatch the moment
     this design is placed in an OperatorSequence -- see gemv/design.py's identical parameter for
     the same reason. N = n_aie_cols * n_aie_rows; n_aie_rows=1 is the plain-ObjectFifo topology,
-    n_aie_rows>1 uses the MemTile split/join topology -- see the module docstring for both."""
+    n_aie_rows>1 uses the MemTile split/join topology -- see the module docstring for both.
+
+    `fuse_o=True` folds `a = Wo @ cx` into this design (see module docstring's FUSE_O section);
+    it needs `QD` (the attention context width) and is currently n_aie_rows==1 only -- the
+    overlap/pad arithmetic below is derived for the plain per-core-direct-fill topology and has
+    not been re-derived for the MemTile split/join one.
+    """
     N = n_aie_cols * n_aie_rows
     assert FF % D == 0, f"this design assumes FF ({FF}) is a whole multiple of D ({D})"
     R = FF // D  # =3 at Qwen3-0.6B's shape; also N_GH_CHUNKS (misc) and N_GH_ROUNDS (output)
@@ -144,6 +194,22 @@ def my_swiglu_mlp_dp(
     N_D_TILES = D_PER_CORE // TSI_D
     WTILE_ELEMS = TSI_GU * D
 
+    if fuse_o:
+        assert n_aie_rows == 1, "fuse_o is only derived for the plain (n_aie_rows=1) topology"
+        assert QD is not None, "fuse_o needs QD (the attention context width)"
+        assert QD % D == 0, f"fuse_o assumes QD ({QD}) is a whole multiple of D ({D})"
+        R_CX = QD // D
+        assert WTILE_ELEMS % QD == 0, (
+            f"fuse_o needs the shared weight tile ({WTILE_ELEMS} elem) to be a whole number of "
+            f"Wo rows (QD={QD}); it isn't, so Wo can't share this channel -- see module docstring"
+        )
+        TSI_O = WTILE_ELEMS // QD
+        N_O_TILES = -(-D_PER_CORE // TSI_O)          # ceil division
+        O_WINDOW = N_O_TILES * TSI_O                 # rows actually read per core (>= D_PER_CORE)
+        O_OVERLAP = O_WINDOW - D_PER_CORE             # extra rows read past this core's own slice
+        assert O_OVERLAP < TSI_O                      # ceil() guarantees this; sanity check
+        WO_ROWS_PADDED = D + O_OVERLAP                # Wo's own arg spec size, in rows
+
     # L1 budget check (64 KB/core) -- see module docstring's channel accounting for what each
     # buffer is. Computed, not guessed: this is exactly the "hanging numbers are bugs" rule.
     L1_BYTES = 65536
@@ -152,6 +218,9 @@ def my_swiglu_mlp_dp(
     out_bytes = 2 * (D_PER_CORE * 2)  # depth=2
     persistent_bytes = 2 * (D * 2) + (FF * 2) + 2 * (FF_PER_CORE * 2) + (D_PER_CORE * 2)
     # x1_buf + hf_buf         gh_buf      g_buf + u_buf          d_buf
+    if fuse_o:
+        persistent_bytes += (QD * 2) + (O_WINDOW * 2)
+        # cx_buf                a_slice_buf
     total = misc_bytes + weight_bytes + out_bytes + persistent_bytes + stack_size
     assert total <= L1_BYTES, (
         f"N={N}: estimated L1 use {total} B exceeds {L1_BYTES} B "
@@ -167,6 +236,11 @@ def my_swiglu_mlp_dp(
     Wg_L3_ty = np.ndarray[(FF * D,), np.dtype[bfloat16]]
     Wd_L3_ty = np.ndarray[(D * FF,), np.dtype[bfloat16]]
     GH_SCRATCH_ty = np.ndarray[(FF,), np.dtype[bfloat16]]
+    if fuse_o:
+        QD_ty = np.ndarray[(QD,), np.dtype[bfloat16]]
+        OWIN_ty = np.ndarray[(O_WINDOW,), np.dtype[bfloat16]]
+        Wo_L3_ty = np.ndarray[(WO_ROWS_PADDED * QD,), np.dtype[bfloat16]]
+        A_SCRATCH_ty = np.ndarray[(D,), np.dtype[bfloat16]]
 
     # ---- kernels (one archive per core -- every core plays every role) ----
     CORE_ARCHIVE = f"{func_prefix}swiglu_mlp_dp_core.a"
@@ -203,6 +277,26 @@ def my_swiglu_mlp_dp(
     copy_off_kernel = Kernel(
         f"{func_prefix}copy_offset_bf16_vector", CORE_ARCHIVE, [FF_ty, D_ty, np.int32, np.int32]
     )
+    if fuse_o:
+        # o's own matvec: DIM_K=QD, distinct from mv_gu (DIM_K=D) and mv_d (DIM_K=FF) -- same
+        # symbol-uniqueness reasoning as mv_d_kernel above.
+        mv_o_kernel = Kernel(
+            f"{func_prefix}o_matvec_vectorized_bf16_bf16", CORE_ARCHIVE,
+            [np.int32, np.int32, WTILE_ty, QD_ty, OWIN_ty],
+        )
+        # copy_offset_bf16_vector is (dst, src, size, dst_offset) over raw pointers -- no
+        # compile-time size baked in -- but a func.func symbol is keyed by NAME only, and MLIR's
+        # verifier refuses two declarations of the same symbol with different memref types
+        # ("redefinition of symbol"), so each new call-site shape needs its own renamed object
+        # (op.py's cx_copy_obj/oa_copy_obj), exactly like mv_d_kernel's "down_" prefix below.
+        copy_off_cx_kernel = Kernel(
+            f"{func_prefix}cx_copy_offset_bf16_vector", CORE_ARCHIVE,
+            [QD_ty, D_ty, np.int32, np.int32],
+        )
+        copy_off_a_kernel = Kernel(
+            f"{func_prefix}oa_copy_offset_bf16_vector", CORE_ARCHIVE,
+            [DPC_ty, OWIN_ty, np.int32, np.int32],
+        )
 
     # ---- ObjectFifos: misc(1, always) + weight(n_aie_cols groups) + output(n_aie_cols groups).
     # n_aie_rows==1: plain per-core ObjectFifos, direct L3<->L1 (no MemTile step in this file --
@@ -210,7 +304,9 @@ def my_swiglu_mlp_dp(
     # group-level ObjectFifo per column, split (weight) / joined (output) into n_aie_rows row
     # sub-fifos at a MemTile -- see module docstring. Either way `weight_ofs[c]`/`out_ofs[c]`
     # (c = g*n_aie_rows + r) end up as the per-core handles core_fn acquires/releases from; it
-    # does not know or care which path built them. ----
+    # does not know or care which path built them. fuse_o adds no new shim-facing ObjectFifo: Wo
+    # rides the SAME weight_ofs/gweight_ps channel as Wg/Wu/Wd, and `a`'s all-gather rides the
+    # SAME out_ofs/gout_cs channel gh's all-gather already uses (see module docstring). ----
     misc_of = ObjectFifo(D_ty, name="misc", depth=2)
     weight_ofs = [None] * N
     out_ofs = [None] * N
@@ -250,11 +346,45 @@ def my_swiglu_mlp_dp(
     def core_fn(misc_c, weight_c, out_p,
                 x1_buf, hf_buf, gh_buf, g_buf, u_buf, d_buf,
                 add_k, add_off_k, wnorm_k, mv_gu_k, mv_d_k, silu_k, mul_off_k, copy_off_k,
-                core_id):
-        # step 1: x1 = cur + a, full D, replicated on every core.
-        pair = misc_c.acquire(2)
-        add_k(pair[0], pair[1], x1_buf, D)
-        misc_c.release(2)
+                core_id, *fo):
+        if fuse_o:
+            (cx_buf, a_slice_buf, mv_o_k, copy_off_cx_k, copy_off_a_k) = fo
+
+            # step -1: reassemble cx (QD-wide) from R_CX D-sized misc broadcasts.
+            for i in range(R_CX):
+                chunk = misc_c.acquire(1)
+                copy_off_cx_k(cx_buf, chunk, D, i * D)
+                misc_c.release(1)
+
+            # step 0: a_slice[0:O_WINDOW) = Wo[my window] @ cx -- a window of N_O_TILES full
+            # TSI_O-row tiles, always >= D_PER_CORE rows (see module docstring's FUSE_O section).
+            for j in range_(N_O_TILES):
+                j32 = index.casts(T.i32(), j)
+                row_off = j32 * TSI_O
+                wt = weight_c.acquire(1)
+                mv_o_k(TSI_O, row_off, wt, cx_buf, a_slice_buf)
+                weight_c.release(1)
+
+            # step 0b: drain only this core's real D_PER_CORE-wide prefix (discard the overlap
+            # tail) onto the shared output channel -- the FIRST round through it now, ahead of
+            # gh's own R rounds.
+            ot = out_p.acquire(1)
+            copy_off_a_k(ot, a_slice_buf, D_PER_CORE, 0)
+            out_p.release(1)
+
+            # step 0c: refill full `a` (barriered by the caller between 0b and here -- see
+            # sequence()'s tg_a_drain/tg_a_refill split) and `cur`, adjacent in the misc queue by
+            # construction (sequence() fills them as the last two items before this barrier and
+            # the first item after it), so one acquire(2) still returns them as a pair exactly
+            # like the non-fused-o arm below.
+            pair = misc_c.acquire(2)
+            add_k(pair[0], pair[1], x1_buf, D)
+            misc_c.release(2)
+        else:
+            # step 1: x1 = cur + a, full D, replicated on every core.
+            pair = misc_c.acquire(2)
+            add_k(pair[0], pair[1], x1_buf, D)
+            misc_c.release(2)
 
         # step 2: hf = weighted_rms_norm(x1, n_pf), full D, replicated.
         npf = misc_c.acquire(1)
@@ -315,22 +445,26 @@ def my_swiglu_mlp_dp(
         g_buf = Buffer(FFPC_ty, name=f"g_{c}")
         u_buf = Buffer(FFPC_ty, name=f"u_{c}")
         d_buf = Buffer(DPC_ty, name=f"d_{c}")
-        workers.append(
-            Worker(
-                core_fn,
-                [
-                    misc_of.cons(), weight_ofs[c].cons(), out_ofs[c].prod(),
-                    x1_buf, hf_buf, gh_buf, g_buf, u_buf, d_buf,
-                    add_kernel, add_off_kernel, wnorm_kernel, mv_gu_kernel, mv_d_kernel,
-                    silu_kernel, mul_off_kernel, copy_off_kernel,
-                    c,
-                ],
-                stack_size=stack_size,
-            )
-        )
+        core_args = [
+            misc_of.cons(), weight_ofs[c].cons(), out_ofs[c].prod(),
+            x1_buf, hf_buf, gh_buf, g_buf, u_buf, d_buf,
+            add_kernel, add_off_kernel, wnorm_kernel, mv_gu_kernel, mv_d_kernel,
+            silu_kernel, mul_off_kernel, copy_off_kernel,
+            c,
+        ]
+        if fuse_o:
+            cx_buf = Buffer(QD_ty, name=f"cx_{c}")
+            a_slice_buf = Buffer(OWIN_ty, name=f"aslice_{c}")
+            core_args += [cx_buf, a_slice_buf, mv_o_kernel, copy_off_cx_kernel, copy_off_a_kernel]
+        workers.append(Worker(core_fn, core_args, stack_size=stack_size))
 
-    def sequence(cur, a, npf, Wg, Wu, Wd, gh_scratch, nxt,
-                 misc_p, gweight_ps, gout_cs):
+    def sequence(*args):
+        if fuse_o:
+            (cur, cx, npf, Wo, Wg, Wu, Wd, gh_scratch, a_scratch, nxt,
+             misc_p, gweight_ps, gout_cs) = args
+        else:
+            (cur, a, npf, Wg, Wu, Wd, gh_scratch, nxt,
+             misc_p, gweight_ps, gout_cs) = args
         # `wait=True` EVERYWHERE, not just on the drains: a plain TaskGroup.finish() with no
         # wait=True lowers to dma_free_task, which is compile-time BD-ID recycling ONLY -- no
         # hardware wait is emitted (AIEAssignRuntimeSequenceBDIDs.cpp; AIEDMATasksToNPU.cpp never
@@ -343,10 +477,35 @@ def my_swiglu_mlp_dp(
         # real `dma_await_task`/NpuSyncOp barrier. MEASURED: without this, every N (including
         # N=8, which has no split/join to blame) hit a genuine device-side TDR
         # (aie2_tdr_detect, journalctl -k) and ERT_CMD_STATE_TIMEOUT, not just a host illusion.
+        #
+        # fuse_o inserts tg_a_drain/tg_a_refill AHEAD of this group (not merged into it): this
+        # core now produces its FIRST output (the a-slice drain) before it has consumed cur/n_pf,
+        # where the un-fused-o arm produces its first output (gh) only after consuming ALL of its
+        # input. A TaskGroup boundary is a hard barrier (Runtime.finish_task_group awaits at group
+        # close), so folding a's fills into tg1 unchanged while a's drain waits behind it would be
+        # fine -- but folding the REFILL in with it would not: cur/n_pf are needed for step 1/2,
+        # AFTER a is refilled, so their fill has to land in the group that FOLLOWS the a-slice
+        # drain barrier, not the one that precedes it. Splitting fills vs drains across groups is
+        # always safe; it is only unsafe to place a drain that depends on a not-yet-issued fill in
+        # the SAME or an EARLIER group than that fill.
         tg1 = TaskGroup()
-        misc_p.fill(cur, _flat_tap(D, D), wait=True, group=tg1)
-        misc_p.fill(a, _flat_tap(D, D), wait=True, group=tg1)
-        misc_p.fill(npf, _flat_tap(D, D), wait=True, group=tg1)
+        if fuse_o:
+            for i in range(R_CX):
+                misc_p.fill(cx, _flat_tap(QD, D, i * D), wait=True, group=tg1)
+            # cur is filled here (fills-only group, before the a barrier) but not CONSUMED until
+            # after a is refilled -- see core_fn's step 0c. It stays adjacent to a's own refill in
+            # the misc queue only because nothing else is filled into misc between here and
+            # tg_a_refill below (n_pf is deliberately deferred to that same later group).
+            misc_p.fill(cur, _flat_tap(D, D), wait=True, group=tg1)
+            for g in range(n_aie_cols):
+                gweight_ps[g].fill(
+                    Wo, _flat_tap(WO_ROWS_PADDED * QD, O_WINDOW * QD, g * D_PER_CORE * QD),
+                    wait=True, group=tg1,
+                )
+        else:
+            misc_p.fill(cur, _flat_tap(D, D), wait=True, group=tg1)
+            misc_p.fill(a, _flat_tap(D, D), wait=True, group=tg1)
+            misc_p.fill(npf, _flat_tap(D, D), wait=True, group=tg1)
         if n_aie_rows == 1:
             for g in range(n_aie_cols):
                 gweight_ps[g].fill(
@@ -389,6 +548,25 @@ def my_swiglu_mlp_dp(
                         wait=True, group=tgw,
                     )
                 tgw.finish()
+
+        if fuse_o:
+            # tg_a_drain: every core's real D_PER_CORE-wide a-slice, the FIRST round through the
+            # shared output channel (gh's own R rounds and the final residual follow it).
+            tg_a_drain = TaskGroup()
+            for g in range(n_aie_cols):
+                gout_cs[g].drain(
+                    a_scratch, _flat_tap(D, D_PER_CORE, g * D_PER_CORE),
+                    wait=True, group=tg_a_drain,
+                )
+            tg_a_drain.finish()
+
+            # tg_a_refill: full `a` back to every core (misc), plus n_pf (deferred here so it
+            # stays AFTER cur in the misc queue -- core_fn's pair-acquire needs cur and this fill
+            # adjacent, and n_pf is consumed only after that pair, so its position here is fine).
+            tg_a_refill = TaskGroup()
+            misc_p.fill(a_scratch, _flat_tap(D, D), wait=True, group=tg_a_refill)
+            misc_p.fill(npf, _flat_tap(D, D), wait=True, group=tg_a_refill)
+            tg_a_refill.finish()
 
         # Barrier: gh_scratch must be fully written before any core reads it back. Every core's R
         # output-fifo drains for gh land at disjoint, contiguous offsets that together cover all
@@ -443,13 +621,19 @@ def my_swiglu_mlp_dp(
             )
         tg4.finish()
 
-    rt = Runtime(
-        sequence,
-        [
+    if fuse_o:
+        rt_args = [
+            D_ty, QD_ty, D_ty, Wo_L3_ty, Wg_L3_ty, Wg_L3_ty, Wd_L3_ty, GH_SCRATCH_ty, A_SCRATCH_ty,
+            D_ty,
+            misc_of.prod(),
+            [of.prod() for of in group_weight_ofs], [of.cons() for of in group_out_ofs],
+        ]
+    else:
+        rt_args = [
             D_ty, D_ty, D_ty, Wg_L3_ty, Wg_L3_ty, Wd_L3_ty, GH_SCRATCH_ty, D_ty,
             misc_of.prod(),
             [of.prod() for of in group_weight_ofs], [of.cons() for of in group_out_ofs],
-        ],
-    )
+        ]
+    rt = Runtime(sequence, rt_args)
 
     return Program(dev, rt, workers=workers).resolve_program()
