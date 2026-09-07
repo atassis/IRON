@@ -144,6 +144,24 @@ class GEMV(MLIROperator):
             base = f"{base}_am{self.alloc_M}"
         return base
 
+    def design_key(self):
+        """Every argument that reaches design.py, so two GEMVs sharing this key emit the same MLIR.
+
+        The decode graph builds gate and up as separate GEMV instances of the SAME shape, adjacent
+        in the runlist, and without sharing they compile to two designs and cost two
+        `aiex.configure` per layer where one would do. Listed explicitly rather than derived from
+        `name`, because `kernel_vector_size` is repr=False and absent from it.
+        """
+        return "|".join(str(x) for x in (
+            "GEMV",
+            self.num_aie_columns, self.M, self.K,
+            self.tile_size_input, self.tile_size_output,
+            self.num_batches, self.batch_group,
+            self.epilogue, self.weight_dtype, self.group_size,
+            self.alloc_M, self.kernel_vector_size,
+            self._kernel_link_file,
+        ))
+
     @property
     def _kernel_link_file(self):
         # With the gelu epilogue the core also links the gelu kernel, so the object becomes an

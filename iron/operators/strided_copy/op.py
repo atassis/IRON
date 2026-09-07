@@ -62,6 +62,22 @@ class StridedCopy(MLIROperator):
             )
         MLIROperator.__init__(self, context=self.context)
 
+    def design_key(self):
+        """Every argument that reaches design.py, so two copies sharing this key emit the same MLIR.
+
+        The decode graph appends K and V to their caches with two StridedCopy instances that are
+        adjacent and identically shaped; without sharing they are two designs and two configures per
+        layer. `kwargs` is included because it is forwarded to the generator verbatim.
+        """
+        return "|".join(str(x) for x in (
+            "StridedCopy", self.dtype,
+            self.input_buffer_size, self.input_sizes, self.input_strides, self.input_offset,
+            self.output_buffer_size, self.output_sizes, self.output_strides, self.output_offset,
+            self.transfer_size, self.num_aie_channels,
+            self.input_offset_parameter, self.output_offset_parameter,
+            sorted(self.kwargs.items()),
+        ))
+
     def get_mlir_artifact(self):
         return PythonGeneratedMLIRArtifact(
             f"{self.name}.mlir",
