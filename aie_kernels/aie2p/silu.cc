@@ -11,6 +11,11 @@ using namespace aie;
 void silu_tanh_approx_bf16(bfloat16 *restrict input_vector, bfloat16 *restrict output_vector, const int32_t vector_size)
 {
     event0();
+    // Ambient core state, and this kernel never set it: the bf16 conversions in the polynomial and
+    // the final x*sigmoid product inherit whatever the last kernel on this core left. mv.cc and
+    // rms_norm.cc have always set it; softmax_simple_bf16 did not, and setting it there removed
+    // 73% of a measured 0.49% systematic bias with token parity unchanged.
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
 
     int num_elems = vector_size;
     auto it_in = aie::begin_restrict_vector<32>((bfloat16 *)input_vector);
@@ -53,6 +58,11 @@ void silu_tanh_approx_bf16(bfloat16 *restrict input_vector, bfloat16 *restrict o
 static inline void silu_tanh_approx_inplace_bf16(bfloat16 *restrict v, const int32_t vector_size)
 {
     event0();
+    // Ambient core state, and this kernel never set it: the bf16 conversions in the polynomial and
+    // the final x*sigmoid product inherit whatever the last kernel on this core left. mv.cc and
+    // rms_norm.cc have always set it; softmax_simple_bf16 did not, and setting it there removed
+    // 73% of a measured 0.49% systematic bias with token parity unchanged.
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
 
     auto it = aie::begin_restrict_vector<32>(v);
 

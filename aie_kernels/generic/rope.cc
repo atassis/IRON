@@ -11,6 +11,11 @@ template <typename T, int N>
 void rope_kernel_interleaved(const T *restrict input, const T *restrict lut, T *restrict output, int32_t dims)
 {
     event0();
+    // Every aie::mul/add/sub here takes two bf16 vectors and yields an ACCUMULATOR; assigning it
+    // back to vector<T,N> is a conversion, so the core's rounding mode applies to each RoPE output
+    // element. The mode is ambient core state and this kernel never set it, so it inherited
+    // whatever ran last -- see mv.cc and rms_norm.cc, which have always set it.
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
 
     for (int v = 0; v < dims; v += N) {
         ::aie::vector<T, N> x = ::aie::load_v<N>(input + v);
@@ -42,6 +47,11 @@ template <typename T, int N>
 void rope_kernel_two_halves(const T *restrict input, const T *restrict lut, T *restrict output, int32_t dims)
 {
     event0();
+    // Every aie::mul/add/sub here takes two bf16 vectors and yields an ACCUMULATOR; assigning it
+    // back to vector<T,N> is a conversion, so the core's rounding mode applies to each RoPE output
+    // element. The mode is ambient core state and this kernel never set it, so it inherited
+    // whatever ran last -- see mv.cc and rms_norm.cc, which have always set it.
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
 
     auto dims_half = dims / 2;
     for (int v = 0, i = 0; v < dims_half; v += N, i += 2 * N) {
