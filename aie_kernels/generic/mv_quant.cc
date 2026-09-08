@@ -58,28 +58,22 @@ void matvec_int4_dequant(uint32_t m, const int8_t *__restrict a, const bfloat16 
     const uint8_t *rowp = a_bytes + row * row_stride;
     const float *scale = reinterpret_cast<const float *>(rowp);
     const int8_t *packed = reinterpret_cast<const int8_t *>(rowp + n_groups * sizeof(float));
-    const bfloat16 *__restrict b_cur = b;
-    float row_sum = 0.0f;
-    for (uint32_t gi = 0; gi < n_groups; gi++) {
-      // The scale is constant across the group, and the matvec is linear in it, so it comes OUT
-      // of the inner loop: one scalar multiply per group instead of `g` vector-lane multiplies.
-      // That is also strictly MORE accurate -- int4 values (-7..7) are exact in bf16, so the
-      // operand fed to the MAC is exact and the only rounding left is the accumulate.
-      ::aie::accum<accfloat, r> acc = ::aie::zeros<accfloat, r>();
-      for (uint32_t ci = 0; ci < chunks_per_group; ci++) {
-        // r nibbles = r/2 bytes. Load them as int8, reinterpret as an r-element int4 vector
-        // (same 4*r bits), then unpack to int8 with sign extension -- the vector form of the
-        // per-nibble shift/mask this loop used to do one element at a time on the stack.
-        ::aie::vector<int8, r / 2> raw =
-            ::aie::load_v<r / 2>(packed + (gi * chunks_per_group + ci) * (r / 2));
-        ::aie::vector<int8, r> q8 = ::aie::unpack(::aie::vector_cast<int4>(raw));
-        ::aie::vector<bfloat16, r> qbf = ::aie::to_float<bfloat16>(q8, 0);
-        acc = ::aie::mac(acc, qbf, ::aie::load_v<r>(b_cur));
-        b_cur += r;
-      }
-      row_sum += scale[gi] * ::aie::reduce_add(acc.template to_vector<float>());
+    // ONE flat loop and ONE reduce per row. Hoisting the scale per GROUP is arithmetically nicer
+    // but costs a reduce_add per group (8 per row at k=1024,g=128) against the 16 vector muls it
+    // saves, and a 64-lane reduce is a log-depth shuffle chain -- far more than a vector mul.
+    // It also nests the loops, and hardware loops are innermost-only (contract K013).
+    ::aie::accum<accfloat, r> acc = ::aie::zeros<accfloat, r>();
+    uint32_t chunk = 0;
+    for (const bfloat16 *__restrict b_cur = b; b_cur < b + k; b_cur += r, chunk++) {
+      ::aie::vector<int8, r / 2> raw = ::aie::load_v<r / 2>(packed + chunk * (r / 2));
+      ::aie::vector<int8, r> q8 = ::aie::unpack(::aie::vector_cast<int4>(raw));
+      ::aie::vector<bfloat16, r> qbf = ::aie::to_float<bfloat16>(q8, 0);
+      ::aie::vector<bfloat16, r> sv =
+          ::aie::broadcast<bfloat16, r>((bfloat16)scale[(chunk * r) / g]);
+      acc = ::aie::mac(acc, ::aie::mul(qbf, sv).template to_vector<bfloat16>(),
+                       ::aie::load_v<r>(b_cur));
     }
-    c[row] = static_cast<bfloat16>(row_sum);
+    c[row] = static_cast<bfloat16>(::aie::reduce_add(acc.template to_vector<float>()));
   }
   ::aie::set_rounding(saved_rounding);
 }
