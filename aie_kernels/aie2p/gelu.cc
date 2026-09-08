@@ -37,6 +37,13 @@ static inline aie::vector<bfloat16, 32> gelu_tanh_approx(aie::vector<bfloat16, 3
 void gelu_tanh_approx_bf16(bfloat16 *restrict input_vector, bfloat16 *restrict output_vector, const int32_t vector_size)
 {
     event0();
+    // Ambient core state: this kernel converts to bf16 and never set the rounding mode, so it
+    // inherited whatever the last kernel on this core left. mv.cc and rms_norm.cc have always set
+    // it; softmax_simple_bf16 did not, and setting it there removed 73% of a measured 0.49%
+    // systematic bias with token parity unchanged. This is Gemma's activation, so the Qwen3 parity
+    // gate does NOT exercise it -- it is set here for the same structural reason, ahead of the
+    // Gemma-4 bring-up, so that work does not inherit the bias into its baseline.
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
     auto it_in = aie::begin_restrict_vector<32>((bfloat16 *)input_vector);
     auto it_out = aie::begin_restrict_vector<32>((bfloat16 *)output_vector);
 
@@ -54,6 +61,13 @@ void gelu_tanh_approx_bf16(bfloat16 *restrict input_vector, bfloat16 *restrict o
 static inline void gelu_tanh_approx_inplace_bf16(bfloat16 *restrict v, const int32_t vector_size)
 {
     event0();
+    // Ambient core state: this kernel converts to bf16 and never set the rounding mode, so it
+    // inherited whatever the last kernel on this core left. mv.cc and rms_norm.cc have always set
+    // it; softmax_simple_bf16 did not, and setting it there removed 73% of a measured 0.49%
+    // systematic bias with token parity unchanged. This is Gemma's activation, so the Qwen3 parity
+    // gate does NOT exercise it -- it is set here for the same structural reason, ahead of the
+    // Gemma-4 bring-up, so that work does not inherit the bias into its baseline.
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
     auto it = aie::begin_restrict_vector<32>(v);
     auto body = [&]() __attribute__((always_inline))
     {

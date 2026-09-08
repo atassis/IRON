@@ -23,6 +23,11 @@ template <typename T_in, typename T_out> void eltwise_vadd(T_in *a, T_in *b, T_o
 
     constexpr int vec_factor = 32;
     event0();
+    // Ambient core state: this kernel converts to bf16 and never set the rounding mode, so it
+    // inherited whatever the last kernel on this core left. mv.cc and rms_norm.cc have always set
+    // it; softmax_simple_bf16 did not, and setting it there removed 73% of a measured 0.49%
+    // systematic bias with token parity unchanged.
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
     T_in *__restrict pA1 = a;
     T_in *__restrict pB1 = b;
     T_out *__restrict pC1 = c;

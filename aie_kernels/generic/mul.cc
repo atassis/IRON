@@ -21,6 +21,11 @@ template <typename T_in, typename T_out> void eltwise_vmul(T_in *a, T_in *b, T_o
 
     constexpr int vec_factor = 32;
     event0();
+    // Ambient core state: this kernel converts to bf16 and never set the rounding mode, so it
+    // inherited whatever the last kernel on this core left. mv.cc and rms_norm.cc have always set
+    // it; softmax_simple_bf16 did not, and setting it there removed 73% of a measured 0.49%
+    // systematic bias with token parity unchanged.
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
     // `size` is a per-core tile the CALLER picks and nothing upstream requires it to divide
     // vec_factor. The bound must be the last FULL vector, not `size`: `i < size` admits a final
     // iteration with fewer than vec_factor elements left, and load_v/store_v are full-width
