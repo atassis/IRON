@@ -12,6 +12,12 @@ using namespace aie;
 void softmax_simple_bf16(bfloat16 *restrict input_vector, bfloat16 *restrict output_vector, const int32_t vector_size)
 {
     event0();
+    // Match partial_softmax_alias_bf16 below, which has always set this. Without it the bf16
+    // conversions here inherit the core's default rounding mode, which is toward zero, so every
+    // exp value is biased low and the softmax row sums to less than 1. MEASURED on the fused
+    // decode: 0.995138 over the valid width, and CONSTANT across widths 2..32 -- a per-element
+    // bias does not care how many elements are summed, which is what rules out the reduction.
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
 
     // VJUNG: We do 3 passes on the vector:
     // 1. Find the max value scaled by log2e in the vector
