@@ -290,6 +290,11 @@ class OperatorSequence(AIEOperatorBase):
             also runs the operator's CPU reference on the NPU-produced
             inputs and logs the deviation for testing/debugging.  Pass a
             :class:`CompareDispatch` instance to tune the compare tolerances.
+        scratch_order: Optional list of scratch-buffer names to place first in
+            the scratch arena, in the given order; every other scratch buffer
+            follows in its usual (first-appearance-in-runlist) order. Default
+            ``None`` keeps today's layout (first-appearance order for every
+            scratch buffer) unchanged.
     """
 
     def __init__(
@@ -302,6 +307,7 @@ class OperatorSequence(AIEOperatorBase):
         dispatch="auto",
         extra_flags=None,
         share_designs=False,
+        scratch_order=None,
         *args,
         **kwargs,
     ):
@@ -327,6 +333,7 @@ class OperatorSequence(AIEOperatorBase):
         # Extra aiecc flags forwarded to the full-ELF build.
         self.extra_flags = extra_flags or []
         self.share_designs = share_designs
+        self.scratch_order = scratch_order
         self._dispatch = dispatch
 
     @staticmethod
@@ -370,6 +377,31 @@ class OperatorSequence(AIEOperatorBase):
             design_of[id(op)] = len(designs)
             designs.append(op)
         return designs, design_of
+
+    def _ordered_scratch_args(self, scratch_args):
+        """Reorder ``scratch_args`` (today's first-appearance order) so the
+        names in ``self.scratch_order`` come first, in the given order,
+        followed by the rest unchanged.
+        """
+        scratch_set = set(scratch_args)
+        seen = set()
+        for name in self.scratch_order:
+            if name in seen:
+                raise ValueError(f"scratch_order contains duplicate name '{name}'")
+            seen.add(name)
+            if name not in scratch_set:
+                if name in self.input_args or name in self.output_args:
+                    raise ValueError(
+                        f"scratch_order names '{name}', which is an input/output "
+                        "argument of this sequence, not a scratch buffer"
+                    )
+                raise ValueError(
+                    f"scratch_order names '{name}', which is not a scratch "
+                    "buffer of this sequence"
+                )
+        return list(self.scratch_order) + [
+            arg for arg in scratch_args if arg not in seen
+        ]
 
     def calculate_buffer_layout(self):
         args = {}  # base_buffer_name -> args_spec
@@ -460,6 +492,8 @@ class OperatorSequence(AIEOperatorBase):
                 and explicit_buf not in scratch_args
             ):
                 scratch_args.append(explicit_buf)
+        if self.scratch_order is not None:
+            scratch_args = self._ordered_scratch_args(scratch_args)
         scratch_buffer_size = add_buffers("scratch", scratch_args)
 
         buffer_sizes = (input_buffer_size, output_buffer_size, scratch_buffer_size)
