@@ -50,34 +50,36 @@ void matvec_int4_dequant(uint32_t m, const int8_t *__restrict a, const bfloat16 
   constexpr uint32_t n_groups = k / g;
   constexpr uint32_t row_stride = n_groups * sizeof(float) + k / 2;
   static_assert(row_stride % 4 == 0, "row stride must be 4-byte aligned (per-row f32 scale read)");
+  constexpr uint32_t chunks_per_group = g / r;
 
   const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   const uint8_t *a_bytes = reinterpret_cast<const uint8_t *>(a);
-  const bfloat16 *b_end = b + k;
   for (uint32_t row = 0; row < m; row++) {
     const uint8_t *rowp = a_bytes + row * row_stride;
     const float *scale = reinterpret_cast<const float *>(rowp);
-    const uint8_t *packed = rowp + n_groups * sizeof(float);
-    aie::accum acc = aie::zeros<accfloat, r>();
-    uint32_t chunk = 0;
-    for (const bfloat16 *__restrict b_cur = b; b_cur < b_end; b_cur += r, chunk++) {
-      const float s = scale[(chunk * r) / g];
-      const uint8_t *chunk_packed = packed + (chunk * r) / 2;
-      float unpacked[r];
-      for (uint32_t i = 0; i < r; i += 2) {
-        const uint8_t byte = chunk_packed[i / 2];
-        unpacked[i] = (float)sext4(byte & 0x0F);
-        unpacked[i + 1] = (float)sext4((byte >> 4) & 0x0F);
+    const int8_t *packed = reinterpret_cast<const int8_t *>(rowp + n_groups * sizeof(float));
+    const bfloat16 *__restrict b_cur = b;
+    float row_sum = 0.0f;
+    for (uint32_t gi = 0; gi < n_groups; gi++) {
+      // The scale is constant across the group, and the matvec is linear in it, so it comes OUT
+      // of the inner loop: one scalar multiply per group instead of `g` vector-lane multiplies.
+      // That is also strictly MORE accurate -- int4 values (-7..7) are exact in bf16, so the
+      // operand fed to the MAC is exact and the only rounding left is the accumulate.
+      ::aie::accum<accfloat, r> acc = ::aie::zeros<accfloat, r>();
+      for (uint32_t ci = 0; ci < chunks_per_group; ci++) {
+        // r nibbles = r/2 bytes. Load them as int8, reinterpret as an r-element int4 vector
+        // (same 4*r bits), then unpack to int8 with sign extension -- the vector form of the
+        // per-nibble shift/mask this loop used to do one element at a time on the stack.
+        ::aie::vector<int8, r / 2> raw =
+            ::aie::load_v<r / 2>(packed + (gi * chunks_per_group + ci) * (r / 2));
+        ::aie::vector<int8, r> q8 = ::aie::unpack(::aie::vector_cast<int4>(raw));
+        ::aie::vector<bfloat16, r> qbf = ::aie::to_float<bfloat16>(q8, 0);
+        acc = ::aie::mac(acc, qbf, ::aie::load_v<r>(b_cur));
+        b_cur += r;
       }
-      ::aie::vector<float, r> qv = ::aie::load_v<r>(unpacked);
-      ::aie::vector<float, r> sv = ::aie::broadcast<float, r>(s);
-      ::aie::accum<accfloat, r> dq;
-      dq.from_vector(::aie::mul(qv, sv).template to_vector<float>());
-      ::aie::vector<bfloat16, r> a_vec = dq.template to_vector<bfloat16>();
-      ::aie::vector<bfloat16, r> b_vec = ::aie::load_v<r>(b_cur);
-      acc = ::aie::mac(acc, a_vec, b_vec);
+      row_sum += scale[gi] * ::aie::reduce_add(acc.template to_vector<float>());
     }
-    c[row] = static_cast<bfloat16>(aie::reduce_add(acc.template to_vector<float>()));
+    c[row] = static_cast<bfloat16>(row_sum);
   }
   ::aie::set_rounding(saved_rounding);
 }
@@ -90,30 +92,28 @@ void matvec_int8_dequant(uint32_t m, const int8_t *__restrict a, const bfloat16 
   constexpr uint32_t n_groups = k / g;
   constexpr uint32_t row_stride = n_groups * sizeof(float) + k;
   static_assert(row_stride % 4 == 0, "row stride must be 4-byte aligned (per-row f32 scale read)");
+  constexpr uint32_t chunks_per_group = g / r;
 
   const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   const uint8_t *a_bytes = reinterpret_cast<const uint8_t *>(a);
-  const bfloat16 *b_end = b + k;
   for (uint32_t row = 0; row < m; row++) {
     const uint8_t *rowp = a_bytes + row * row_stride;
     const float *scale = reinterpret_cast<const float *>(rowp);
     const int8_t *packed = reinterpret_cast<const int8_t *>(rowp + n_groups * sizeof(float));
-    aie::accum acc = aie::zeros<accfloat, r>();
-    uint32_t chunk = 0;
-    for (const bfloat16 *__restrict b_cur = b; b_cur < b_end; b_cur += r, chunk++) {
-      const float s = scale[(chunk * r) / g];
-      const int8_t *chunk_packed = packed + chunk * r;
-      float unpacked[r];
-      for (uint32_t i = 0; i < r; i++) unpacked[i] = (float)chunk_packed[i];
-      ::aie::vector<float, r> qv = ::aie::load_v<r>(unpacked);
-      ::aie::vector<float, r> sv = ::aie::broadcast<float, r>(s);
-      ::aie::accum<accfloat, r> dq;
-      dq.from_vector(::aie::mul(qv, sv).template to_vector<float>());
-      ::aie::vector<bfloat16, r> a_vec = dq.template to_vector<bfloat16>();
-      ::aie::vector<bfloat16, r> b_vec = ::aie::load_v<r>(b_cur);
-      acc = ::aie::mac(acc, a_vec, b_vec);
+    const bfloat16 *__restrict b_cur = b;
+    float row_sum = 0.0f;
+    for (uint32_t gi = 0; gi < n_groups; gi++) {
+      // Same per-group scale hoist as the int4 form; int8 (-127..127) is exact in bf16 too.
+      ::aie::accum<accfloat, r> acc = ::aie::zeros<accfloat, r>();
+      for (uint32_t ci = 0; ci < chunks_per_group; ci++) {
+        ::aie::vector<int8, r> q8 = ::aie::load_v<r>(packed + (gi * chunks_per_group + ci) * r);
+        ::aie::vector<bfloat16, r> qbf = ::aie::to_float<bfloat16>(q8, 0);
+        acc = ::aie::mac(acc, qbf, ::aie::load_v<r>(b_cur));
+        b_cur += r;
+      }
+      row_sum += scale[gi] * ::aie::reduce_add(acc.template to_vector<float>());
     }
-    c[row] = static_cast<bfloat16>(aie::reduce_add(acc.template to_vector<float>()));
+    c[row] = static_cast<bfloat16>(row_sum);
   }
   ::aie::set_rounding(saved_rounding);
 }
