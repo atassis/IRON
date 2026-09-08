@@ -101,7 +101,9 @@ class SwiGLUMLPDataParallel(MLIROperator):
             "mul.o", dependencies=[SourceArtifact(kdir / "generic" / "mul.cc")]
         )
         rms_norm_obj = KernelObjectArtifact(
-            "rms_norm.o", dependencies=[SourceArtifact(kdir / arch_dir / "rms_norm.cc")]
+            f"rms_norm_{self.D}.o",
+            dependencies=[SourceArtifact(kdir / arch_dir / "rms_norm.cc")],
+            extra_flags=[f"-DRMS_COLS={self.D}"],
         )
         silu_obj = KernelObjectArtifact(
             "silu.o", dependencies=[SourceArtifact(kdir / arch_dir / "silu.cc")]

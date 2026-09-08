@@ -137,11 +137,12 @@ def qkv_head_dp(
     # mechanism swiglu_mlp_dp uses for its two matvec DIM_Ks, rather than a local copy of the
     # vendored kernel under a second name (which is what fuse/qkv-head did).
     wnorm_d_kernel = Kernel(
-        f"{func_prefix}weighted_rms_norm", CORE_ARCHIVE, [D_ty, D_ty, D_ty, np.int32, np.float32]
+        f"{func_prefix}weighted_rms_norm_fixed", CORE_ARCHIVE,
+        [D_ty, D_ty, D_ty, np.float32]
     )
     wnorm_hd_kernel = Kernel(
-        f"{func_prefix}hd_weighted_rms_norm", CORE_ARCHIVE,
-        [HD_ty, HD_ty, HD_ty, np.int32, np.float32],
+        f"{func_prefix}hd_weighted_rms_norm_fixed", CORE_ARCHIVE,
+        [HD_ty, HD_ty, HD_ty, np.float32]
     )
     mv_kernel = Kernel(
         f"{func_prefix}matvec_vectorized_bf16_bf16", CORE_ARCHIVE,
@@ -170,7 +171,7 @@ def qkv_head_dp(
             ch = misc_c.acquire(1)
             copy_k(nin_buf, ch, HD, i * HD)
             misc_c.release(1)
-        wnorm_d_k(cur_buf, nin_buf, hn_buf, D, epsilon)
+        wnorm_d_k(cur_buf, nin_buf, hn_buf, epsilon)
 
         # step 2: n_qn, n_kn, ang -- read once per head, so acquired once and held to the end.
         w3 = misc_c.acquire(3)
@@ -187,7 +188,7 @@ def qkv_head_dp(
                 mv_k(tsi, row_off, wt, hn_buf, dst)
                 weight_c.release(1)
             if kind != "v":
-                wnorm_hd_k(raw_buf, nqn_t if kind == "q" else nkn_t, nrm_buf, HD, epsilon)
+                wnorm_hd_k(raw_buf, nqn_t if kind == "q" else nkn_t, nrm_buf, epsilon)
                 rope_k(nrm_buf, ang_t, out_t, HD)
             out_p.release(1)
 

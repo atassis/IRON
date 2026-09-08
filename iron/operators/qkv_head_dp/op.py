@@ -97,15 +97,18 @@ class QKVHeadDataParallel(MLIROperator):
             "add.o", dependencies=[SourceArtifact(kdir / "generic" / "add.cc")]
         )
         rms_obj = KernelObjectArtifact(
-            "rms_norm.o", dependencies=[SourceArtifact(kdir / arch_dir / "rms_norm.cc")]
+            f"rms_norm_{self.D}.o",
+            dependencies=[SourceArtifact(kdir / arch_dir / "rms_norm.cc")],
+            extra_flags=[f"-DRMS_COLS={self.D}"],
         )
         # Same source, second symbol: this core calls weighted_rms_norm at D and at HD, and one
         # Kernel() binding fixes one signature per symbol. Prefixing a second object is what
         # swiglu_mlp_dp does for its two matvec DIM_Ks; the alternative -- a local copy of the
         # vendored kernel under two names -- is the duplication one-kernel-three-repos warns about.
         rms_hd_obj = KernelObjectArtifact(
-            "hd_rms_norm.o",
+            f"hd_rms_norm_{self.HD}.o",
             dependencies=[SourceArtifact(kdir / arch_dir / "rms_norm.cc")],
+            extra_flags=[f"-DRMS_COLS={self.HD}"],
             prefix_symbols="hd_",
         )
         mv_obj = KernelObjectArtifact(

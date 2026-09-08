@@ -258,7 +258,7 @@ def my_swiglu_mlp_dp(
         [D_ty, DPC_ty, DPC_ty, np.int32, np.int32],
     )
     wnorm_kernel = Kernel(
-        f"{func_prefix}weighted_rms_norm", CORE_ARCHIVE, [D_ty, D_ty, D_ty, np.int32, np.float32]
+        f"{func_prefix}weighted_rms_norm_fixed", CORE_ARCHIVE, [D_ty, D_ty, D_ty, np.float32]
     )
     mv_gu_kernel = Kernel(
         f"{func_prefix}matvec_vectorized_bf16_bf16", CORE_ARCHIVE,
@@ -390,7 +390,7 @@ def my_swiglu_mlp_dp(
 
         # step 2: hf = weighted_rms_norm(x1, n_pf), full D, replicated.
         npf = misc_c.acquire(1)
-        wnorm_k(x1_buf, npf, hf_buf, D, epsilon)
+        wnorm_k(x1_buf, npf, hf_buf, epsilon)
         misc_c.release(1)
 
         # step 3: g = Wg[my rows] @ hf, then u = Wu[my rows] @ hf -- same shared weight channel,
