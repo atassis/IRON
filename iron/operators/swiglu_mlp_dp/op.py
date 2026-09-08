@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
+
+import numpy as np
 from typing import ClassVar, Dict
 
 from iron.common import (
@@ -39,6 +41,10 @@ class SwiGLUMLPDataParallel(MLIROperator):
     epsilon: float = 1e-5
     QD: int = None
     fuse_o: bool = False
+    # Group-quantized weight stream (Wg/Wu/Wd, and Wo under fuse_o). bf16 is the
+    # byte-for-byte pre-existing path; see design.py's WEIGHT WIRE UNITS block.
+    weight_dtype: str = field(default="bf16", repr=False)
+    group_size: int = field(default=0, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -47,6 +53,8 @@ class SwiGLUMLPDataParallel(MLIROperator):
         "num_aie_columns": "cols",
         "num_aie_rows": "rows",
         "fuse_o": "fo",
+        "weight_dtype": "wdt",
+        "group_size": "g",
     }
 
     def __post_init__(self):
@@ -86,6 +94,8 @@ class SwiGLUMLPDataParallel(MLIROperator):
                     "n_aie_rows": self.num_aie_rows,
                     "QD": self.QD,
                     "fuse_o": self.fuse_o,
+                    "weight_dtype": self.weight_dtype,
+                    "group_size": self.group_size,
                 },
             ),
         )
@@ -108,26 +118,33 @@ class SwiGLUMLPDataParallel(MLIROperator):
         silu_obj = KernelObjectArtifact(
             "silu.o", dependencies=[SourceArtifact(kdir / arch_dir / "silu.cc")]
         )
+        # One source and one flag set for both weight formats: mv_quant.cc exports
+        # matvec_vectorized_{int4,int8}_bf16 with mv.cc's exact signature except that `a_in` is
+        # int8, which is the only thing the WTILE_ty change alters. GROUP_SIZE is the extra flag.
+        _qsrc = kdir / "generic" / ("mv.cc" if self.weight_dtype == "bf16" else "mv_quant.cc")
+        _qtag = "" if self.weight_dtype == "bf16" else f"_{self.weight_dtype}g{self.group_size}"
+        _qflags = ([] if self.weight_dtype == "bf16"
+                   else [f"-DGROUP_SIZE={self.group_size}"])
         mv_gu_obj = KernelObjectArtifact(
-            f"gemv_{self.D}k_64vs.o",
-            dependencies=[SourceArtifact(kdir / "generic" / "mv.cc")],
-            extra_flags=[f"-DDIM_K={self.D}", "-DVEC_SIZE=64"],
+            f"gemv_{self.D}k_64vs{_qtag}.o",
+            dependencies=[SourceArtifact(_qsrc)],
+            extra_flags=[f"-DDIM_K={self.D}", "-DVEC_SIZE=64"] + _qflags,
         )
         # Same exported symbol as mv_gu_obj (DIM_K is baked in, not part of the name); this
         # object's own device-wide symbol table entry must be distinct, so it is compiled with a
         # prefix -- see design.py's mv_d_kernel comment and fuse/mlp-block's identical mechanism.
         mv_d_obj = KernelObjectArtifact(
-            f"down_gemv_{self.FF}k_64vs.o",
-            dependencies=[SourceArtifact(kdir / "generic" / "mv.cc")],
-            extra_flags=[f"-DDIM_K={self.FF}", "-DVEC_SIZE=64"],
+            f"down_gemv_{self.FF}k_64vs{_qtag}.o",
+            dependencies=[SourceArtifact(_qsrc)],
+            extra_flags=[f"-DDIM_K={self.FF}", "-DVEC_SIZE=64"] + _qflags,
             prefix_symbols="down_",
         )
         deps = [add_obj, mul_obj, rms_norm_obj, silu_obj, mv_gu_obj, mv_d_obj]
         if self.fuse_o:
             mv_o_obj = KernelObjectArtifact(
-                f"o_gemv_{self.QD}k_64vs.o",
-                dependencies=[SourceArtifact(kdir / "generic" / "mv.cc")],
-                extra_flags=[f"-DDIM_K={self.QD}", "-DVEC_SIZE=64"],
+                f"o_gemv_{self.QD}k_64vs{_qtag}.o",
+                dependencies=[SourceArtifact(_qsrc)],
+                extra_flags=[f"-DDIM_K={self.QD}", "-DVEC_SIZE=64"] + _qflags,
                 prefix_symbols="o_",
             )
             # copy_offset_bf16_vector (in add.cc) is generic (pointer + runtime size/offset, no
@@ -146,8 +163,24 @@ class SwiGLUMLPDataParallel(MLIROperator):
                 prefix_symbols="oa_",
             )
             deps += [mv_o_obj, cx_copy_obj, oa_copy_obj]
-        core_archive = KernelArchiveArtifact("swiglu_mlp_dp_core.a", dependencies=deps)
+        core_archive = KernelArchiveArtifact(
+            f"swiglu_mlp_dp_core{_qtag}.a", dependencies=deps)
         return [core_archive]
+
+    def _wrow(self, K):
+        """Wire units per weight ROW of width K: bf16 elements, or packed bytes when quantized."""
+        if self.weight_dtype == "bf16":
+            return K
+        from iron.operators.gemv.quant import row_stride_bytes
+        return row_stride_bytes(K, self.group_size, self.weight_dtype)
+
+    def _wspec(self, n_units, comment_unused=None):
+        """One weight argument, sized in wire units. dtype is OMITTED for bf16 rather than passed
+        as None -- AIERuntimeArgSpec's default is not None, and passing it explicitly sized the
+        arena at 8 bytes/element instead of 2 (caught by the sequence's own layout assert)."""
+        if self.weight_dtype == "bf16":
+            return AIERuntimeArgSpec("in", (n_units,))
+        return AIERuntimeArgSpec("in", (n_units,), dtype=np.int8)
 
     def get_arg_spec(self):
         if self.fuse_o:
@@ -155,10 +188,10 @@ class SwiGLUMLPDataParallel(MLIROperator):
                 AIERuntimeArgSpec("in", (self.D,)),                       # cur
                 AIERuntimeArgSpec("in", (self.QD,)),                      # cx
                 AIERuntimeArgSpec("in", (self.D,)),                       # n_pf
-                AIERuntimeArgSpec("in", (self._wo_rows_padded * self.QD,)),  # Wo, flat [D+pad,QD]
-                AIERuntimeArgSpec("in", (self.FF * self.D,)),             # Wg, flat [FF,D]
-                AIERuntimeArgSpec("in", (self.FF * self.D,)),             # Wu, flat [FF,D]
-                AIERuntimeArgSpec("in", (self.D * self.FF,)),             # Wd, flat [D,FF]
+                self._wspec(self._wo_rows_padded * self._wrow(self.QD)),   # Wo, flat [D+pad,QD]
+                self._wspec(self.FF * self._wrow(self.D)),        # Wg, flat [FF,D]
+                self._wspec(self.FF * self._wrow(self.D)),        # Wu, flat [FF,D]
+                self._wspec(self.D * self._wrow(self.FF)),        # Wd, flat [D,FF]
                 AIERuntimeArgSpec("inout", (self.FF,)),                   # gh_scratch
                 AIERuntimeArgSpec("inout", (self.D,)),                    # a_scratch
                 AIERuntimeArgSpec("out", (self.D,)),                      # nxt
@@ -167,9 +200,9 @@ class SwiGLUMLPDataParallel(MLIROperator):
             AIERuntimeArgSpec("in", (self.D,)),                 # cur
             AIERuntimeArgSpec("in", (self.D,)),                 # a
             AIERuntimeArgSpec("in", (self.D,)),                 # n_pf
-            AIERuntimeArgSpec("in", (self.FF * self.D,)),       # Wg, flat [FF,D]
-            AIERuntimeArgSpec("in", (self.FF * self.D,)),       # Wu, flat [FF,D]
-            AIERuntimeArgSpec("in", (self.D * self.FF,)),       # Wd, flat [D,FF]
+            self._wspec(self.FF * self._wrow(self.D)),  # Wg, flat [FF,D]
+            self._wspec(self.FF * self._wrow(self.D)),  # Wu, flat [FF,D]
+            self._wspec(self.D * self._wrow(self.FF)),  # Wd, flat [D,FF]
             AIERuntimeArgSpec("inout", (self.FF,)),             # gh_scratch (internal round-trip)
             AIERuntimeArgSpec("out", (self.D,)),                # nxt
         ]
