@@ -6,6 +6,7 @@
 Semantics:
   * explicit ``trace_size`` wins; otherwise fall back to ``IRON_TRACE_SIZE``
   * ``IRON_TRACE_NTILES`` (default 1) caps how many workers get traced; 0 traces none
+  * ``IRON_TRACE_EGRESS_COL`` (default 0) picks the shim column trace packets leave by
   * no-op when neither is set, so production paths are unaffected
 """
 
@@ -59,9 +60,16 @@ def maybe_enable_trace(prog, trace_size, workers, coretile_events=None):
     # meaningless (a negative slice index would silently drop the LAST worker).
     ntiles = max(0, int(os.environ.get("IRON_TRACE_NTILES", "1")))
 
+    # A design that already owns shim column 0 makes the default trace route collide:
+    # "'aie.masterset' op targets same destination South: 3 as another connect or masterset".
+    # That is a ROUTING conflict, not DMA exhaustion -- it reproduces unchanged at 4 columns as
+    # at 8 -- so the fix is to egress through a column the design does not use, not to shrink it.
+    egress = int(os.environ.get("IRON_TRACE_EGRESS_COL", "0"))
+
     prog.enable_trace(
         ts,
         workers=list(workers)[:ntiles],
+        egress_shim_col=egress,
         coretile_events=(
             coretile_events
             if coretile_events is not None

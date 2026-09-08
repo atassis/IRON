@@ -55,6 +55,8 @@ from aie.helpers.taplib import TensorAccessPattern
 from aie.iron import (Buffer, Kernel, ObjectFifo, Program, Runtime, ScratchpadParameter,
                       TaskGroup, Worker, sync_parameters)
 
+from iron.operators._trace import maybe_enable_trace
+
 BF16 = bfloat16
 
 
@@ -78,6 +80,7 @@ def qkv_head_dp(
     func_prefix="",
     n_aie_cols=8,
     kv_offset_parameter="kv_off",
+    trace_size=0,
 ):
     """`func_prefix` is not optional once this design is placed in an OperatorSequence -- see
     gemv/design.py's identical parameter. N = n_aie_cols, one core per column."""
@@ -272,4 +275,6 @@ def qkv_head_dp(
         ],
     )
 
-    return Program(dev, rt, workers=workers).resolve_program()
+    prog = Program(dev, rt, workers=workers)
+    maybe_enable_trace(prog, trace_size, workers)
+    return prog.resolve_program()

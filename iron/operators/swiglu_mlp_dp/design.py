@@ -124,6 +124,8 @@ from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, TaskGroup, Wo
 from aie.iron.controlflow import range_
 from aie.helpers.taplib.tap import TensorAccessPattern
 
+from iron.operators._trace import maybe_enable_trace
+
 # Shared weight-tile row counts (see module docstring, WEIGHT channel). Fixed, not searched: this
 # design is gated at Qwen3-0.6B's D=1024/FF=3072 (R=3) shape only, and 6/2 is verified below to
 # fit L1 at every N in {8, 16, 32} this file is built against.
@@ -163,7 +165,7 @@ def _split_run(total, lim=1023, gran=2):
 
 def my_swiglu_mlp_dp(
     dev, D, FF, epsilon=1e-5, stack_size=0x800, func_prefix="", n_aie_cols=8, n_aie_rows=1,
-    QD=None, fuse_o=False,
+    QD=None, fuse_o=False, trace_size=0,
 ):
     """`func_prefix` is required (not optional) by iron.common.sequence.FusedDispatch the moment
     this design is placed in an OperatorSequence -- see gemv/design.py's identical parameter for
@@ -661,4 +663,6 @@ def my_swiglu_mlp_dp(
         ]
     rt = Runtime(sequence, rt_args)
 
-    return Program(dev, rt, workers=workers).resolve_program()
+    prog = Program(dev, rt, workers=workers)
+    maybe_enable_trace(prog, trace_size, workers)
+    return prog.resolve_program()
