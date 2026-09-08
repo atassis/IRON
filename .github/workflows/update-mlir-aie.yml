@@ -36,6 +36,34 @@ jobs:
           echo "version=$version" >> $GITHUB_OUTPUT
           echo "raw_version=$raw_version" >> $GITHUB_OUTPUT
 
+      - name: Get current llvm-aie (Peano) version
+        id: current_peano
+        run: |
+          raw_version=$(grep 'llvm-aie==' requirements.txt | cut -d'=' -f3)
+          echo "Current llvm-aie version: $raw_version"
+          echo "raw_version=$raw_version" >> $GITHUB_OUTPUT
+
+      - name: Get latest llvm-aie nightly build
+        id: latest_peano
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Pin the "nightly" tag rather than releases/latest: that ranks by a release's own
+          # publish date, which does not advance when new assets land.
+          latest_wheel=$(gh api repos/Xilinx/llvm-aie/releases/tags/nightly --jq '.assets[].name' \
+            | grep -- '-manylinux_' | sort -V | tail -1)
+          if [ -z "$latest_wheel" ]; then
+            echo "Failed to find a linux llvm-aie nightly wheel."
+            exit 1
+          fi
+          raw_version=$(echo "$latest_wheel" | sed -E 's/^llvm_aie-(.*)-py3-none-.*/\1/')
+          if [ "$raw_version" = "$latest_wheel" ]; then
+            echo "Could not parse a version out of $latest_wheel."
+            exit 1
+          fi
+          echo "Latest llvm-aie version: $raw_version"
+          echo "raw_version=$raw_version" >> $GITHUB_OUTPUT
+
       - name: Get latest mlir-aie release
         id: latest_release
         env:
@@ -52,52 +80,71 @@ jobs:
           echo "tag=$latest_tag" >> $GITHUB_OUTPUT
 
       - name: Compare versions and create PR
-        if: steps.current_version.outputs.version != steps.latest_release.outputs.tag
+        if: steps.current_version.outputs.version != steps.latest_release.outputs.tag || steps.current_peano.outputs.raw_version != steps.latest_peano.outputs.raw_version
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "New version found: ${{ steps.latest_release.outputs.tag_with_v }}. Current version is v${{ steps.current_version.outputs.version }}."
-          
-          new_branch="update-mlir-aie-to-${{ steps.latest_release.outputs.tag_with_v }}"
-          
+          echo "mlir_aie: ${{ steps.current_version.outputs.raw_version }} -> ${{ steps.latest_release.outputs.tag_with_v }}"
+          echo "llvm-aie:  ${{ steps.current_peano.outputs.raw_version }} -> ${{ steps.latest_peano.outputs.raw_version }}"
+
+          # Fold both pins into the branch name. Keying it on mlir_aie's tag alone (the
+          # prior behavior) collides across consecutive daily runs whenever only llvm-aie
+          # moved -- which is the common case, since its nightlies land far more often than
+          # mlir-aie releases -- and a collision silently skips the Peano bump via the
+          # branch-exists check below.
+          peano_slug="$(echo "${{ steps.latest_peano.outputs.raw_version }}" | tr '+' '-')"
+          new_branch="update-mlir-aie-to-${{ steps.latest_release.outputs.tag_with_v }}--llvm-aie-to-${peano_slug}"
+
           # Check if branch already exists
           if git ls-remote --exit-code origin "refs/heads/$new_branch"; then
             echo "Branch $new_branch already exists. Skipping update."
             exit 0
           fi
-          
+
           # Configure git
           git config --global user.name 'github-actions[bot]'
           git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          
+
           # Create new branch
-          git checkout -b $new_branch
-          
+          git checkout -b "$new_branch"
+
           # Update requirements.txt
           sed -i "s|==${{ steps.current_version.outputs.raw_version }}|==${{ steps.latest_release.outputs.tag_with_v }}|" requirements.txt
           sed -i "s|mlir-aie/releases/expanded_assets/.*|mlir-aie/releases/expanded_assets/${{ steps.latest_release.outputs.tag_with_v }}|" requirements.txt
-          
+          sed -i "s|llvm-aie==${{ steps.current_peano.outputs.raw_version }}|llvm-aie==${{ steps.latest_peano.outputs.raw_version }}|" requirements.txt
+
+          # Name only the pins that actually moved; either one alone can trigger this job.
+          parts=""
+          if [ "${{ steps.current_version.outputs.version }}" != "${{ steps.latest_release.outputs.tag }}" ]; then
+            parts="mlir-aie to ${{ steps.latest_release.outputs.tag_with_v }}"
+          fi
+          if [ "${{ steps.current_peano.outputs.raw_version }}" != "${{ steps.latest_peano.outputs.raw_version }}" ]; then
+            [ -n "$parts" ] && parts="$parts and "
+            parts="${parts}llvm-aie to ${{ steps.latest_peano.outputs.raw_version }}"
+          fi
+          summary="Update $parts"
+
           # Commit changes
           git add requirements.txt
-          git commit -m "Update mlir-aie to version ${{ steps.latest_release.outputs.tag_with_v }}"
-          
+          git commit -m "$summary"
+
           # Push changes
-          git push --set-upstream origin $new_branch
-          
+          git push --set-upstream origin "$new_branch"
+
           # Create Pull Request
-          sed 's/Describe the intent of your PR here./This PR updates the mlir-aie version from v${{ steps.current_version.outputs.version }} to the latest release, ${{ steps.latest_release.outputs.tag_with_v }}./' .github/PULL_REQUEST_TEMPLATE.md | \
+          sed "s/Describe the intent of your PR here./This PR updates ${parts}./" .github/PULL_REQUEST_TEMPLATE.md | \
           gh pr create \
             --base devel \
-            --head $new_branch \
-            --title "Update mlir-aie from v${{ steps.current_version.outputs.version }} to ${{ steps.latest_release.outputs.tag_with_v }}" \
+            --head "$new_branch" \
+            --title "$summary" \
             --body-file -
 
           # Trigger CI workflows
           echo "Triggering CI workflows..."
-          gh workflow run ci-lint.yml --ref $new_branch
-          gh workflow run small.yml --ref $new_branch
-          gh workflow run test-examples.yml --ref $new_branch
-          
+          gh workflow run ci-lint.yml --ref "$new_branch"
+          gh workflow run small.yml --ref "$new_branch"
+          gh workflow run test-examples.yml --ref "$new_branch"
+
       - name: No new version found
-        if: steps.current_version.outputs.version == steps.latest_release.outputs.tag
-        run: echo "mlir-aie is already at the latest version (${{ steps.current_version.outputs.version }})."
+        if: steps.current_version.outputs.version == steps.latest_release.outputs.tag && steps.current_peano.outputs.raw_version == steps.latest_peano.outputs.raw_version
+        run: echo "mlir-aie (${{ steps.current_version.outputs.version }}) and llvm-aie (${{ steps.current_peano.outputs.raw_version }}) are already at the latest version."
