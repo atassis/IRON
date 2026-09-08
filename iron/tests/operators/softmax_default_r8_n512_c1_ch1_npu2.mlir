@@ -22,14 +22,12 @@ module {
         %c8 = arith.constant 8 : index
         %c1_3 = arith.constant 1 : index
         scf.for %arg1 = %c0_2 to %c8 step %c1_3 {
-          %3 = aie.objectfifo.acquire @in1_0_0(Consume, 1) : !aie.objectfifosubview<memref<512xbf16>>
-          %4 = aie.objectfifo.subview.access %3[0] : !aie.objectfifosubview<memref<512xbf16>> -> memref<512xbf16>
-          %5 = aie.objectfifo.acquire @out_0_0(Produce, 1) : !aie.objectfifosubview<memref<512xbf16>>
-          %6 = aie.objectfifo.subview.access %5[0] : !aie.objectfifosubview<memref<512xbf16>> -> memref<512xbf16>
+          %3 = aie.objectfifo.acquire @in1_0_0(Consume, 1) : memref<512xbf16>
+          %4 = aie.objectfifo.acquire @out_0_0(Produce, 1) : memref<512xbf16>
           %c512_i32 = arith.constant 512 : i32
-          func.call @mask_bf16(%4, %2, %c512_i32) : (memref<512xbf16>, i32, i32) -> ()
+          func.call @mask_bf16(%3, %2, %c512_i32) : (memref<512xbf16>, i32, i32) -> ()
           %c512_i32_4 = arith.constant 512 : i32
-          func.call @softmax_bf16(%4, %6, %c512_i32_4) : (memref<512xbf16>, memref<512xbf16>, i32) -> ()
+          func.call @softmax_bf16(%3, %4, %c512_i32_4) : (memref<512xbf16>, memref<512xbf16>, i32) -> ()
           aie.objectfifo.release @in1_0_0(Consume, 1)
           aie.objectfifo.release @out_0_0(Produce, 1)
         }
