@@ -41,6 +41,8 @@ class QKVHeadDataParallel(MLIROperator):
     tile_size_input: int = 4
     stack_size: int = 0xD00
     kv_offset_parameter: str | None = "kv_off"
+    # Weight ObjectFifo depth; the L1 budget check in design.py follows it.
+    weight_depth: int = field(default=2, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -51,6 +53,7 @@ class QKVHeadDataParallel(MLIROperator):
         "stack_size": "ss",
         "max_seq": "S",
         "kv_offset_parameter": "kvpar",
+        "weight_depth": "wd",
     }
 
     def __post_init__(self):
@@ -83,6 +86,7 @@ class QKVHeadDataParallel(MLIROperator):
                 {
                     "epsilon": self.epsilon,
                     "kv_offset_parameter": self.kv_offset_parameter,
+                    "weight_depth": self.weight_depth,
                     "tile_size_input": self.tile_size_input,
                     "stack_size": self.stack_size,
                     "n_aie_cols": self.num_aie_columns,

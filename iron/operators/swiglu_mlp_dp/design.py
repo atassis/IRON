@@ -166,6 +166,7 @@ def _split_run(total, lim=1023, gran=2):
 def my_swiglu_mlp_dp(
     dev, D, FF, epsilon=1e-5, stack_size=0x800, func_prefix="", n_aie_cols=8, n_aie_rows=1,
     QD=None, fuse_o=False, trace_size=0, weight_dtype="bf16", group_size=0,
+    weight_depth=2, tile_rows_gu=None,
 ):
     """`func_prefix` is required (not optional) by iron.common.sequence.FusedDispatch the moment
     this design is placed in an OperatorSequence -- see gemv/design.py's identical parameter for
@@ -177,6 +178,13 @@ def my_swiglu_mlp_dp(
     overlap/pad arithmetic below is derived for the plain per-core-direct-fill topology and has
     not been re-derived for the MemTile split/join one.
     """
+    # Local shadowing of the module defaults, so an arm can trade tile ROWS against fifo DEPTH at
+    # constant L1: depth * TSI_GU * D * 2 bytes is what the budget below actually sees.
+    TSI_GU = tile_rows_gu if tile_rows_gu else globals()["TSI_GU"]
+    TSI_D = TSI_GU // (FF // D)
+    assert TSI_D >= 1 and TSI_GU % (FF // D) == 0, (
+        f"tile_rows_gu={TSI_GU} must be a multiple of R=FF/D={FF // D}")
+
     N = n_aie_cols * n_aie_rows
     assert FF % D == 0, f"this design assumes FF ({FF}) is a whole multiple of D ({D})"
     R = FF // D  # =3 at Qwen3-0.6B's shape; also N_GH_CHUNKS (misc) and N_GH_ROUNDS (output)
@@ -246,7 +254,7 @@ def my_swiglu_mlp_dp(
     # buffer is. Computed, not guessed: this is exactly the "hanging numbers are bugs" rule.
     L1_BYTES = 65536
     misc_bytes = 2 * (D * 2)  # depth=2
-    weight_bytes = 2 * (WTILE_UNITS * WUNIT)  # depth=2
+    weight_bytes = weight_depth * (WTILE_UNITS * WUNIT)
     out_bytes = 2 * (D_PER_CORE * 2)  # depth=2
     persistent_bytes = 2 * (D * 2) + (FF * 2) + 2 * (FF_PER_CORE * 2) + (D_PER_CORE * 2)
     # x1_buf + hf_buf         gh_buf      g_buf + u_buf          d_buf
@@ -350,7 +358,7 @@ def my_swiglu_mlp_dp(
     out_ofs = [None] * N
     if n_aie_rows == 1:
         for c in range(N):
-            weight_ofs[c] = ObjectFifo(WTILE_ty, name=f"weight_{c}", depth=2)
+            weight_ofs[c] = ObjectFifo(WTILE_ty, name=f"weight_{c}", depth=weight_depth)
             out_ofs[c] = ObjectFifo(DPC_ty, name=f"out_{c}", depth=2)
         group_weight_ofs = weight_ofs  # sequence() fills/drains these directly, one per "group"
         group_out_ofs = out_ofs
@@ -361,7 +369,7 @@ def my_swiglu_mlp_dp(
         group_weight_ofs = []
         group_out_ofs = []
         for g in range(n_aie_cols):
-            gw = ObjectFifo(GROUP_WTILE_ty, name=f"weight_g{g}", depth=2)
+            gw = ObjectFifo(GROUP_WTILE_ty, name=f"weight_g{g}", depth=weight_depth)
             sub_w = gw.cons().split(
                 [r * WTILE_UNITS for r in range(n_aie_rows)],
                 obj_types=[WTILE_ty] * n_aie_rows,

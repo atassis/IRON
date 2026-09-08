@@ -45,6 +45,10 @@ class SwiGLUMLPDataParallel(MLIROperator):
     # byte-for-byte pre-existing path; see design.py's WEIGHT WIRE UNITS block.
     weight_dtype: str = field(default="bf16", repr=False)
     group_size: int = field(default=0, repr=False)
+    # Weight ObjectFifo depth. 2 is plain double-buffering; deeper hides more of the
+    # shim->L1 latency at the cost of L1 (the budget check above follows it).
+    weight_depth: int = field(default=2, repr=False)
+    tile_rows_gu: int = field(default=0, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -55,6 +59,8 @@ class SwiGLUMLPDataParallel(MLIROperator):
         "fuse_o": "fo",
         "weight_dtype": "wdt",
         "group_size": "g",
+        "weight_depth": "wd",
+        "tile_rows_gu": "tr",
     }
 
     def __post_init__(self):
@@ -96,6 +102,8 @@ class SwiGLUMLPDataParallel(MLIROperator):
                     "fuse_o": self.fuse_o,
                     "weight_dtype": self.weight_dtype,
                     "group_size": self.group_size,
+                    "weight_depth": self.weight_depth,
+                    "tile_rows_gu": self.tile_rows_gu or None,
                 },
             ),
         )

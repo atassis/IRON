@@ -81,6 +81,7 @@ def qkv_head_dp(
     n_aie_cols=8,
     kv_offset_parameter="kv_off",
     trace_size=0,
+    weight_depth=2,
 ):
     """`func_prefix` is not optional once this design is placed in an OperatorSequence -- see
     gemv/design.py's identical parameter. N = n_aie_cols, one core per column."""
@@ -102,7 +103,7 @@ def qkv_head_dp(
     # L1 budget (64 KB/core), computed rather than assumed -- the same check swiglu_mlp_dp carries.
     L1_BYTES = 65536
     misc_bytes = 3 * (HD * 2)               # depth 3: n_qn, n_kn and ang are held together
-    weight_bytes = 2 * (WTILE_ELEMS * 2)
+    weight_bytes = weight_depth * (WTILE_ELEMS * 2)
     out_bytes = 2 * (HD * 2)
     persistent_bytes = 3 * (D * 2) + 2 * (HD * 2)   # cur, n_in, hn + raw, normed
     total = misc_bytes + weight_bytes + out_bytes + persistent_bytes + stack_size
@@ -156,7 +157,8 @@ def qkv_head_dp(
     # D/HD chunks before them stream through one at a time. Broadcast to N cores via N `.cons()`
     # handles -- the fan-out is in the stream-switch fabric, not the producer's own DMA.
     misc_of = ObjectFifo(HD_ty, name="misc", depth=3)
-    weight_ofs = [ObjectFifo(WTILE_ty, name=f"weight_{c}", depth=2) for c in range(N)]
+    weight_ofs = [ObjectFifo(WTILE_ty, name=f"weight_{c}", depth=weight_depth)
+                  for c in range(N)]
     out_ofs = [ObjectFifo(HD_ty, name=f"out_{c}", depth=2) for c in range(N)]
 
     def core_fn(misc_c, weight_c, out_p, cur_buf, nin_buf, hn_buf, raw_buf, nrm_buf,
