@@ -56,6 +56,7 @@ from aie.iron import (Buffer, Kernel, ObjectFifo, Program, Runtime, ScratchpadPa
                       TaskGroup, Worker, sync_parameters)
 
 from iron.operators._trace import maybe_enable_trace
+from iron.common.kv_layout import KVLayout
 
 BF16 = bfloat16
 
@@ -82,6 +83,7 @@ def qkv_head_dp(
     kv_offset_parameter="kv_off",
     trace_size=0,
     weight_depth=2,
+    kv_block_size=None,
 ):
     """`func_prefix` is not optional once this design is placed in an OperatorSequence -- see
     gemv/design.py's identical parameter. N = n_aie_cols, one core per column."""
@@ -120,6 +122,12 @@ def qkv_head_dp(
     # layer, and the k/v DDR round trip with them.
     kv_off_param = (ScratchpadParameter(kv_offset_parameter, np.int32)
                     if kv_offset_parameter is not None else None)
+    # Single owner of the per-head append stride: iron.common.kv_layout.KVLayout. `kv_block_size
+    # is None` (default) is one block == `max_seq`, byte-identical to the pre-blocking
+    # `hh * max_seq * HD` this replaces -- see the module's docstring for why. The RUNTIME half of
+    # the address (the position term) is `kv_off_param`, written by the host per token; see
+    # KVLayout.kv_off's docstring for the exact split.
+    kv_layout = KVLayout(Hkv=Hkv, S=max_seq, HD=HD, T=max_seq if kv_block_size is None else kv_block_size)
 
     D_ty = np.ndarray[(D,), np.dtype[BF16]]
     HD_ty = np.ndarray[(HD,), np.dtype[BF16]]
@@ -257,14 +265,16 @@ def qkv_head_dp(
                     # q keeps a plain L3 buffer: the scores GEMV reads it whole, per token.
                     out_cs[c].drain(q, _flat_tap(QD, HD, g * HD), wait=True, group=tg)
                 else:
-                    # k/v land at [head][n_past][HD] of their cache. The head term is static; the
-                    # position term is `kv_off` (element units), patched into the BD base address
-                    # per dispatch -- the same mechanism the StridedCopy this replaces used, so
-                    # the cache layout and the host's parameter write are both unchanged.
+                    # k/v land at (head, n_past) of their cache -- KVLayout.head_base(hh) is the
+                    # BUILD-TIME head term (static per head, folded into this tap's own offset);
+                    # the position term is `kv_off` (element units, KVLayout.kv_off(n_past)),
+                    # patched into the BD base address per dispatch. Same mechanism the
+                    # StridedCopy this replaces uses (gen_llm_decode.py's `sc` dict), so the two
+                    # sites cannot silently disagree on the formula.
                     cache = kc if kind == "k" else vc
                     hh = g - Hq if kind == "k" else g - Hq - Hkv
                     out_cs[c].drain(
-                        cache, _flat_tap(Hkv * max_seq * HD, HD, hh * max_seq * HD),
+                        cache, _flat_tap(Hkv * max_seq * HD, HD, kv_layout.head_base(hh)),
                         wait=True, group=tg, offset_parameter=kv_off_param,
                     )
         tg.finish()

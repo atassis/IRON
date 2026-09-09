@@ -26,6 +26,101 @@ Calls into the mv.cc kernel code. That kernel computes `m_input` output rows per
 """
 
 
+# The largest batch_group whose grouped objectFIFO depths are known to place on a core tile.
+# MEASURED, not derived -- see the GROUP REUSE block in my_matvec for why the arithmetic cannot be
+# done from here, and raise this only by BUILDING the larger value rather than by re-deriving it.
+MAX_GROUP_REUSE = 4
+
+# The core's stack and locals, held back from the L1 budget below -- mirrors
+# tmatvec/design.py's L1_HEADROOM_BYTES for the same reason: this tree has twice paid for a
+# kernel frame that silently overwrote the objectFIFO buffers placed above it.
+L1_HEADROOM_BYTES = 4096
+
+
+def l1_budget_bytes(dev):
+    """This core's usable L1, in bytes -- DERIVED from the target model, not a literal.
+
+    tmatvec/design.py's AIE2P_L1_BYTES comment says getLocalMemorySize() is "C++ only" and the
+    Python bindings expose no accessor. That is stale for this checkout:
+    `aie.dialects.aie.get_target_model(int(dev.resolve())).get_local_memory_size()` IS bound
+    (verified 2026-09-09; returns 65536 for npu1, npu2 and every column-count variant of both --
+    core-tile local memory is uniform across the family). Deriving it here means a future core
+    tile with a different size does not silently inherit this chip's number.
+    """
+    from aie.dialects.aie import get_target_model
+
+    return get_target_model(int(dev.resolve())).get_local_memory_size()
+
+
+def l1_footprint_bytes(m_input, m_output, K, a_row_width, itemsize_in, n_vec):
+    """Bytes this design places in one core's L1, by term.
+
+    A, B and C ALL scale with n_vec -- unlike TMatVec's rows_per_chunk, which sizes only its A
+    term, GROUP REUSE (see the block below) holds n_vec vectors/tiles on-core at once, so every
+    FIFO's depth follows it: A at 2*n_vec, B at n_vec, C at 2*n_vec, matching the ObjectFifo()
+    calls below exactly. B and C are always bf16 (2 B/elem); A's itemsize follows weight_dtype --
+    a_row_width is already BYTES for a quantized (packed) row and ELEMENTS for bf16, so
+    itemsize_in (1 or 2, set where a_row_width itself is) makes both cases the same formula.
+    """
+    return (
+        2 * n_vec * m_input * a_row_width * itemsize_in  # A objectfifo
+        + n_vec * K * 2  # B objectfifo, always bf16
+        + 2 * n_vec * m_output * 2  # C objectfifo, always bf16
+    )
+
+
+def largest_fitting_n_vec(m_input, m_output, K, a_row_width, itemsize_in, l1_bytes):
+    """The largest n_vec in [1, MAX_GROUP_REUSE] that FITS, or 0 if even n_vec=1 does not."""
+    ok = [
+        n for n in range(1, MAX_GROUP_REUSE + 1)
+        if l1_footprint_bytes(m_input, m_output, K, a_row_width, itemsize_in, n)
+        + L1_HEADROOM_BYTES <= l1_bytes
+    ]
+    return max(ok) if ok else 0
+
+
+def check_l1_fits(dev, m_input, m_output, K, a_row_width, itemsize_in, n_vec, l1_bytes=None):
+    """Raise-worthy message if the tiling does not FIT, else None.
+
+    K008: the tiling must FIT, not merely divide -- nothing downstream checks it, and a miss
+    surfaces at aiecc as "'aie.tile' op Basic sequential allocation also failed", naming a tile
+    and not a size (ports tmatvec/design.py's check_l1_fits; see that file for the first
+    measurement of this failure mode). Called with the FINAL n_vec -- already declined to 1 by
+    the group_fits_bds gate above if it was going to be -- so unlike that gate's BD-count ceiling,
+    there is no further fallback here: a miss is unconditional and must raise.
+
+    Because A, B and C all scale with n_vec (see l1_footprint_bytes), n_vec=1 is always the best
+    this knob can do -- there is no "blocking term the knob cannot reach" case the way TMatVec's W
+    is independent of rows_per_chunk. So the advice is either the largest n_vec that fits, or,
+    once n_vec=1 itself does not fit, that m_input/m_output/K -- not batch_group -- has to shrink.
+    """
+    budget = l1_bytes if l1_bytes is not None else l1_budget_bytes(dev)
+    used = l1_footprint_bytes(m_input, m_output, K, a_row_width, itemsize_in, n_vec)
+    if used + L1_HEADROOM_BYTES <= budget:
+        return None
+    a = 2 * n_vec * m_input * a_row_width * itemsize_in
+    b = n_vec * K * 2
+    c = 2 * n_vec * m_output * 2
+    terms = f"A {a} + B {b} + C {c}"
+    fits = largest_fitting_n_vec(m_input, m_output, K, a_row_width, itemsize_in, budget)
+    if fits:
+        advice = (
+            f"largest n_vec (batch_group, capped at MAX_GROUP_REUSE={MAX_GROUP_REUSE}) that fits "
+            f"here is {fits}."
+        )
+    else:
+        floor = l1_footprint_bytes(m_input, m_output, K, a_row_width, itemsize_in, 1)
+        advice = (
+            f"NO n_vec fits, not even 1 (no reuse): A+B+C alone total {floor} B. batch_group "
+            f"cannot help, it is already at its floor -- shrink m_input, m_output or K instead."
+        )
+    return (
+        f"GEMV does not fit L1: {used} B ({terms}) + {L1_HEADROOM_BYTES} B headroom exceeds "
+        f"{budget} B at m_input={m_input} m_output={m_output} K={K} a_row_width={a_row_width} "
+        f"n_vec={n_vec}. " + advice
+    )
+
+
 def my_matvec(
     dev,
     cols,
@@ -43,6 +138,7 @@ def my_matvec(
     group_size=0,
     alloc_M=None,
     barrier_chunk=1,
+    block_size=None,
 ):
     if m_output is None:
         m_output = m_input
@@ -71,10 +167,14 @@ def my_matvec(
 
     assert M % cols == 0
 
+    # itemsize_in tracks dtype_in's byte width by hand: np.dtype[bfloat16]/np.dtype[np.int8] are
+    # typing GenericAliases at runtime (numpy's __class_getitem__), not real dtype instances, so
+    # neither has a usable .itemsize -- the L1 check below needs the width as a plain int.
     if weight_dtype == "bf16":
         dtype_in = np.dtype[bfloat16]
         dtype_in_str = "bf16"
         a_row_width = K  # elements/row, dtype_in-sized
+        itemsize_in = 2
     else:
         # Group-quantized A: see iron/operators/gemv/quant.py for the exact byte layout
         # (`[n_groups x f32 scale][payload]` per row) and aie_kernels/generic/mv_quant.cc for the
@@ -92,6 +192,7 @@ def my_matvec(
         dtype_in = np.dtype[np.int8]
         dtype_in_str = weight_dtype
         a_row_width = row_stride_bytes(K, group_size, weight_dtype)  # bytes/row, int8-sized
+        itemsize_in = 1
 
     L1_A_ty = np.ndarray[
         (
@@ -119,6 +220,20 @@ def my_matvec(
         f"alloc_M ({alloc_M}) must be >= M ({M}): it is the ALLOCATED row count, not a second window"
     )
     _AM = M if alloc_M is None else alloc_M
+    # BLOCKED matrix storage: instead of each matrix's `_AM` rows sitting contiguous (per-matrix
+    # stride `_AM*a_row_width`, which SCALES WITH `_AM` and is what overflows a narrow hardware
+    # stride field at a wide allocation -- see kv-cache-layout-for-full-context), the `_AM` rows are
+    # stored in `_AM//block_size` BLOCKS of `block_size` rows, `n_matrices` interleaved every block:
+    # block-major, matrix-minor, row innermost. `block_size is None` (default) is ONE block == the
+    # whole allocation -- byte-identical to the pre-blocking layout; every existing caller is
+    # unaffected. This is a GENERIC access-pattern capability (not KV-cache-specific -- the KV
+    # cache's own addressing, T-derivation and runtime offset live in iron.common.kv_layout, which
+    # gen_llm_decode.py asks to compute the `alloc_M`/`block_size` this design is handed).
+    assert block_size is None or (block_size > 0 and _AM % block_size == 0), (
+        f"block_size ({block_size}) must be a positive divisor of alloc_M ({_AM})"
+    )
+    _BLK = _AM if block_size is None else block_size
+    blocked = _BLK != _AM
     L3_A_ty = np.ndarray[
         (n_matrices * _AM * a_row_width,),
         dtype_in,
@@ -184,9 +299,23 @@ def my_matvec(
                 return (run // lo, lo)
         return None
 
-    A_run, A_bstride = (M // cols) * a_row_width, _AM * a_row_width
+    # Under blocking the per-matrix run is no longer one `_AM`-row slab -- A is read as
+    # `num_col_blocks` separate `_BLK`-row chunks per column, so A_run/A_split (the flat-run wrap
+    # split) do not apply to A at all; only C keeps the flat run/split below. A_bstride here is the
+    # LARGEST stride A's blocked tap will actually carry -- block-to-block (`n_matrices*_BLK*
+    # a_row_width`), which bounds head-to-head (`_BLK*a_row_width`) too since n_matrices >= 1 -- so
+    # the same coalesce/MAX_STRIDE gate below still means "does this tap's widest stride fit the
+    # hardware field", just against the blocked stride instead of the flat `_AM*a_row_width` one
+    # (which is exactly the quantity blocking exists to avoid bounding by).
+    A_run = (M // cols) * a_row_width
+    A_bstride = (n_matrices * _BLK * a_row_width) if blocked else (_AM * a_row_width)
     C_run, C_bstride = (M // cols), M
-    A_split, C_split = split_run(A_run), split_run(C_run)
+    A_split, C_split = (None if blocked else split_run(A_run)), split_run(C_run)
+    if blocked:
+        assert (M // cols) % _BLK == 0, (
+            f"blocked GEMV needs each column's share of M ({M // cols}) to be a whole number of "
+            f"blocks (block_size={_BLK}) -- got M={M} cols={cols} block_size={_BLK}"
+        )
     coalesce = (
         num_batches > 1
         and num_batches % batch_group == 0
@@ -194,7 +323,7 @@ def my_matvec(
         and C_bstride <= MAX_STRIDE
         and A_bstride % GRAN_ELEMS == 0
         and C_bstride % GRAN_ELEMS == 0
-        and A_split is not None
+        and (blocked or A_split is not None)
         and C_split is not None
     )
 
@@ -218,8 +347,73 @@ def my_matvec(
     # would need its own restructuring for A and C to iterate different counts. That combination
     # keeps the old repeat, which is correct and slower, and shows up as unchanged DDR bytes in
     # `decode_ddr_bytes.py` rather than as silence.
-    group_reuse = batch_group > 1 and coalesce
+    #
+    # AND gated on a MEASURED batch_group ceiling, because the three FIFO depths below all follow
+    # n_vec (A at 2*n_vec, B at n_vec, C at 2*n_vec) and they share ONE budget: the objectFIFO
+    # lowering places one MemOp per core tile and every endpoint targeting that tile appends BD
+    # blocks into the same region, which HasValidBDs then counts cumulatively.
+    #
+    # The budget is the CORE tile's, and say so, because the number is ambiguous on this chip:
+    # `AIE2TargetModel::getNumBDs` returns `MemTile ? 48 : 16`, so a core tile and a shim NOC tile
+    # both have 16 and a MemTile has 48. A shim-side bound of 16 elsewhere in this file is a
+    # DIFFERENT resource that happens to share the number, not the same pool.
+    #
+    # The ceiling is MEASURED, not derived, and that distinction is the point. The obvious model --
+    # 5*batch_group BDs against 16 -- is REFUTED: it predicts batch_group 4 needs 20 and fails, and
+    # batch_group 4 builds. Counting `^bb` blocks per `aie.mem` in a lowered design shows why the
+    # arithmetic cannot be done this way from here: at n_vec 1 a core tile already carries 8-9
+    # blocks, so there is baseline traffic this operator does not know about, and an objectFIFO's
+    # depth is not one BD per unit of depth either. Deriving the real bound means asking the target
+    # model what the tile has and what else is already placed on it -- which is exactly what this
+    # file's own FIXME asks for ("pull these shim BD bounds from the MLIR-AIE target model rather
+    # than hard-coding them") and what the sibling MAX_STRIDE constant was just fixed for getting
+    # wrong (6f48e87: the bound was in elements where the field counts address granules).
+    #
+    # So this records the measurements and nothing more. Measured 2026-09-09 on the aie2p decode
+    # rail: batch_group 4 (gemma3-270m, 4 q heads over 1 kv head) BUILDS with reuse on; batch_group
+    # 16 (gemma4-12b's global layers, 16 over 1) does NOT -- aiecc dies with "'aie.mem' op has more
+    # than 16 blocks" naming `B_L3L1_0` at depth 16, a diagnostic that never mentions batch_group.
+    # 5 through 15 are UNTESTED; there is no shipped geometry in that range to test with, so the
+    # ceiling sits at the largest value known to work rather than at a guess about where it breaks.
+    #
+    # Capping the depths instead is not available: the core body does `acquire(n_vec)` on B and C,
+    # so depth >= n_vec is a precondition of the loop, and a narrower group means sub-tiling the
+    # group loop rather than turning a knob.
+    group_fits_bds = batch_group <= MAX_GROUP_REUSE
+    group_reuse = batch_group > 1 and coalesce and group_fits_bds
     n_vec = batch_group if group_reuse else 1
+    # Say so when the reuse is declined. A silent downgrade here is a per-token DDR regression that
+    # nobody can attribute later without re-deriving this by hand.
+    #
+    # Print-and-continue rather than raise, which is the OPPOSITE of what the sibling TMatVec
+    # operator does on its analogous L1 check (`tmatvec/op.py` raises ValueError; it has no
+    # fallback and prints nothing). The two differ because the outcomes differ: declining the reuse
+    # is safe -- the ungrouped path is the pre-existing mechanism and was verified byte-identical on
+    # device -- whereas TMatVec's check guards a shape that would not fit at all.
+    if batch_group > 1 and coalesce and not group_fits_bds:
+        print(f"[gemv] group_reuse DECLINED: batch_group={batch_group} > the measured-good "
+              f"ceiling {MAX_GROUP_REUSE}; falling back to the ungrouped read (M={M} K={K})")
+
+    # K008, the sibling gap this operator had until now: nothing checked that the tiling FITS L1,
+    # only that shapes divide evenly (the asserts at the top of this function). n_vec is FINAL
+    # here -- already declined to 1 above if the BD ceiling was going to decline it -- so raise
+    # rather than print: unlike that decline, an L1 miss has nothing smaller left to fall back to.
+    _msg = check_l1_fits(dev, m_input, m_output, K, a_row_width, itemsize_in, n_vec)
+    if _msg is not None:
+        raise ValueError(_msg)
+
+    if blocked and not group_reuse:
+        # Scope boundary, not a hardware limit: the blocked tap below reuses d3 (the iteration
+        # dim), which group_reuse's A already leaves as a dead [outer=1] placeholder -- see
+        # coalesced_tap's call for A. The non-group_reuse coalesced path uses d3 for a REAL
+        # batch_group repeat (stride 0, only ever read on A's old defect path) and the per-batch
+        # fallback (coalesce=False) has no iterated BD to extend at all; both would need their own
+        # dimension budget worked out, unexercised by the shipped decode graph, so this refuses
+        # loud instead of silently addressing A wrong.
+        raise NotImplementedError(
+            "blocked GEMV (block_size != alloc_M) is only implemented for the group_reuse path "
+            f"(batch_group={batch_group} > 1 and coalesce=True); got group_reuse={group_reuse}"
+        )
 
     # A's depth follows n_vec too, and it is NOT cosmetic. Reusing the tile means the core spends
     # n_vec matvec calls on each one, so a depth-2 fifo lets the DMA run only one tile ahead of a
@@ -416,11 +610,42 @@ def my_matvec(
         ), "coalesced GEMV wants A/C ObjectFifo depth>=2 for fill/compute overlap"
         # With the group reused there is no repeat and no permutation: A walks its matrices and C
         # walks its batches, both plain and both with a dead outer dim.
-        A_taps_coalesced = [
-            coalesced_tap(L3_A_ty, col * (M // cols) * K, A_split, 0, A_bstride,
-                          *((1, n_matrices) if group_reuse else (None, None)))
-            for col in range(cols)
-        ]
+        if blocked:
+            # BLOCKED A: the [outer=1, inner=n_matrices] shape above repurposes its dead outer dim
+            # (group_reuse's A never uses it -- see coalesced_tap's call: outer_stride is always 0
+            # for A) to carry MATRIX instead, freeing the inner dim for BLOCK. Per column, this
+            # column's (M//cols) rows are `blocks_per_col` CONSECUTIVE blocks starting at
+            # `block_start`; for a fixed matrix the run within one block (`_BLK*a_row_width`
+            # elements) still needs the same hi/lo wrap split A_run did before blocking.
+            #   sizes   = [n_matrices,        blocks_per_col,         run_hi, run_lo]
+            #   strides = [_BLK*a_row_width,  n_matrices*_BLK*a_row_width, run_lo, 1]
+            # matches iron.common.kv_layout.KVLayout's head_stride/block_stride one-to-one, with
+            # `n_matrices` standing in for that module's `Hkv` -- this design stays KV-agnostic,
+            # the caller (gen_llm_decode.py) is what knows this A happens to be a KV cache.
+            blocks_per_col = (M // cols) // _BLK
+            blk_run_split = split_run(_BLK * a_row_width)
+            assert blk_run_split is not None, (
+                f"blocked GEMV: no wrap-legal split for one block's run "
+                f"({_BLK * a_row_width} elements, block_size={_BLK})"
+            )
+            blk_run_hi, blk_run_lo = blk_run_split
+            head_stride = _BLK * a_row_width
+            block_stride = n_matrices * _BLK * a_row_width
+            A_taps_coalesced = [
+                TensorAccessPattern(
+                    tensor_dims=L3_A_ty.__args__[0],
+                    offset=(col * blocks_per_col) * block_stride,
+                    sizes=[n_matrices, blocks_per_col, blk_run_hi, blk_run_lo],
+                    strides=[head_stride, block_stride, blk_run_lo, 1],
+                )
+                for col in range(cols)
+            ]
+        else:
+            A_taps_coalesced = [
+                coalesced_tap(L3_A_ty, col * (M // cols) * K, A_split, 0, A_bstride,
+                              *((1, n_matrices) if group_reuse else (None, None)))
+                for col in range(cols)
+            ]
         C_taps_coalesced = [
             coalesced_tap(L3_C_ty, col * (M // cols), C_split,
                           0 if group_reuse else C_bstride,

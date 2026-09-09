@@ -35,6 +35,10 @@ class TMatVec(MLIROperator):
     # Rows ALLOCATED per matrix when that differs from the rows REDUCED -- gemv's alloc_M one axis
     # over. The window is a row PREFIX here, so only the per-matrix stride moves.
     alloc_K: int | None = field(default=None, repr=False)
+    # Store A's `alloc_K` rows in BLOCKS of `block_size` rows (`cols` heads interleaved every
+    # block) instead of one `alloc_K`-row-per-matrix slab. None (default) is one block --
+    # byte-identical to the pre-blocking layout. See design.py's block_size docstring.
+    block_size: int | None = field(default=None, repr=False)
     kwargs: dict = field(default_factory=dict, repr=False)
     context: object = field(default=None, repr=False)
 
@@ -67,6 +71,11 @@ class TMatVec(MLIROperator):
                 f"alloc_K ({self.alloc_K}) must be >= K ({self.K}): it is the ALLOCATED row "
                 f"count per matrix, not a second window"
             )
+        _ak = self.K if self.alloc_K is None else self.alloc_K
+        if self.block_size is not None and (self.block_size <= 0 or _ak % self.block_size != 0):
+            raise ValueError(
+                f"block_size ({self.block_size}) must be a positive divisor of alloc_K ({_ak})"
+            )
         # K008 -- the tiling must FIT, not merely divide. Checked HERE, at construction, because
         # the only other thing that notices is aiecc, which reports it as a placement failure
         # naming a tile and not a size. Arithmetic lives once, in design.py.
@@ -85,6 +94,8 @@ class TMatVec(MLIROperator):
         base = super().name
         if self.alloc_K is not None and self.alloc_K != self.K:
             base = f"{base}_ak{self.alloc_K}"
+        if self.block_size is not None and self.block_size != (self.alloc_K or self.K):
+            base = f"{base}_blk{self.block_size}"
         return base
 
     @property
@@ -110,6 +121,7 @@ class TMatVec(MLIROperator):
                     **self.kwargs,
                     "kernel_object": self._kernel_object,
                     "alloc_K": self.alloc_K,
+                    "block_size": self.block_size,
                 },
             ),
         )

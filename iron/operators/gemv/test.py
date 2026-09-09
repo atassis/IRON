@@ -5,6 +5,7 @@
 import pytest
 import aie.utils as aie_utils
 
+from iron.operators.gemv.design import MAX_GROUP_REUSE, my_matvec
 from iron.operators.gemv.op import GEMV
 from iron.operators.gemv.quant import quantize_weight, dequantize_weight
 from iron.operators.gemv.reference import (
@@ -355,3 +356,87 @@ def test_gemv_narrow_window_reads_only_its_window(
         operator, input_buffers, output_buffers, rel_tol=0.04, abs_tol=1e-3
     )
     assert not errors, f"windowed GEMV failed: {errors}"
+
+
+def test_group_reuse_declines_above_the_measured_ceiling(capsys):
+    """K008: grouped FIFO depths must FIT the core tile's BDs, not merely divide.
+
+    A, B and C all follow n_vec and share ONE budget -- the objectFIFO lowering puts every endpoint
+    targeting a tile into that tile's single MemOp, and HasValidBDs counts the blocks cumulatively
+    against getNumBDs(CoreTile) = 16. Above the ceiling the only thing that notices is aiecc, which
+    says "'aie.mem' op has more than 16 blocks" and names an objectFIFO, never batch_group.
+
+    Measured 2026-09-09 on the aie2p decode rail: batch_group 4 (Gemma-3-270M, 4 q heads over 1 kv
+    head) builds with the reuse ON and gates 8/8 on device; batch_group 16 (Gemma-4-12B's global
+    layers) does not build at all. 5 through 15 have no shipped geometry to test with, so the
+    ceiling is the largest MEASURED-good value and not a guess about where it breaks.
+
+    The decline must be VISIBLE: it costs per-token DDR bytes, and a silent downgrade is
+    unattributable later without re-deriving the arithmetic by hand.
+    """
+    dev = aie_utils.get_current_device()
+
+    # m_input=4: what gemv_tile_output actually picks for head_dim 256/512 (see
+    # test_gemv_shipped_decode_scores_shapes_fit_l1). The BD ceiling this test targets does not
+    # depend on m_input, but the L1 check added since (K008 -- l1_footprint_bytes) does: the old
+    # literal 64 here never fit L1 at n_vec=4 (A alone is 262144 B against a 65536 B core), so it
+    # was only ever exercising the BD-block count, never a shape aiecc could actually place.
+    my_matvec(dev, 8, 2048, 256, 4, num_batches=4, batch_group=4)
+    assert "DECLINED" not in capsys.readouterr().out
+
+    # Gemma-4-12B's global geometry: 16 q heads over a single kv head.
+    my_matvec(dev, 8, 2048, 512, 4, num_batches=16, batch_group=16)
+    out = capsys.readouterr().out
+    assert "group_reuse DECLINED" in out, "a silent downgrade is a per-token regression nobody can attribute"
+    assert "batch_group=16" in out and str(MAX_GROUP_REUSE) in out, "the message must name both numbers"
+
+
+# K008: nothing checked that GEMV's tiling FITS L1, only that shapes divide (test.py's other
+# asserts). Unlike TMatVec's rows_per_chunk, which sizes only its A term, n_vec (== batch_group
+# under group_reuse) scales A, B AND C at once -- see l1_footprint_bytes -- so a wide K at the
+# batch_group ceiling can bust L1 even though every divisibility assert above passes.
+def test_gemv_group_reuse_must_fit_l1_not_just_divide():
+    dev = aie_utils.get_current_device()
+    # Fits: m_input=4 is what gemv_tile_output actually picks at K=512 (see the shipped-shape test
+    # below), so n_vec=4 (batch_group=4, at the reuse ceiling) still leaves headroom.
+    my_matvec(dev, 8, 2048, 512, 4, num_batches=8, batch_group=4)
+    # m_input=8 alone doubles A's depth-2*n_vec=8 buffer to 65536 B -- the WHOLE core L1 before B
+    # or C get a byte, at the SAME K, batch_group and num_batches.
+    with pytest.raises(ValueError, match="does not fit L1"):
+        my_matvec(dev, 8, 2048, 512, 8, num_batches=8, batch_group=4)
+
+
+def test_gemv_fit_error_names_the_blocking_term():
+    """Unlike TMatVec's W, no GEMV term is independent of n_vec -- A, B and C all scale with it
+    (l1_footprint_bytes), so n_vec=1 (no reuse) is always the floor: there is no "shrinking the
+    knob cannot help, blame term X" case. The message still has to name what WOULD fit.
+    """
+    from iron.operators.gemv.design import check_l1_fits
+
+    # Even n_vec=1 (no reuse at all) does not fit: A+B+C alone already exceed L1 at this m_input/K.
+    msg = check_l1_fits(aie_utils.get_current_device(), 8, 8, 2048, 2048, 2, 1)
+    assert msg and "NO n_vec fits" in msg, msg
+    assert "batch_group cannot help" in msg, msg
+    # A shape where SOME smaller n_vec fits: the message must name the value that works.
+    msg = check_l1_fits(aie_utils.get_current_device(), 8, 8, 512, 512, 2, 4)
+    assert msg and "largest n_vec" in msg and "fits here is 3" in msg, msg
+
+
+# The decode's own op_scores geometry (M=S=max_seq, K=head_dim, batch_group=gqa_group), tiled the
+# way gen_llm_decode.py's gemv() wrapper actually tiles it (gemv_tile_output picks m_input=4 at
+# every one of these head_dims). This is the check the task record cannot regress: a shape that
+# already ships must keep passing. Dims from designs/decode_fused/llm_decode_spec.py.
+@pytest.mark.parametrize(
+    "name,K,num_batches,batch_group",
+    [
+        ("qwen3-0.6b", 128, 16, 2),  # Hq=16, Hkv=8, head_dim=128 -> gqa=2
+        ("gemma3-270m", 256, 4, 4),  # Hq=4, Hkv=1, head_dim=256 -> gqa=4, at the reuse ceiling
+        ("gemma4-12b [global]", 512, 16, 16),  # Hq=16, global Hkv=1 -> gqa=16, reuse declines
+        ("gemma4-12b [sliding]", 256, 16, 2),  # Hq=16, Hkv=8, head_dim=256 -> gqa=2
+    ],
+)
+def test_gemv_shipped_decode_scores_shapes_fit_l1(name, K, num_batches, batch_group):
+    my_matvec(
+        aie_utils.get_current_device(), 8, 2048, K, 4, 256,
+        num_batches=num_batches, batch_group=batch_group,
+    )

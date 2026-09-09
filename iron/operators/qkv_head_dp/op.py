@@ -43,6 +43,14 @@ class QKVHeadDataParallel(MLIROperator):
     kv_offset_parameter: str | None = "kv_off"
     # Weight ObjectFifo depth; the L1 budget check in design.py follows it.
     weight_depth: int = field(default=2, repr=False)
+    # KV-cache block size (iron.common.kv_layout.KVLayout's T). None (default) is one block ==
+    # max_seq, byte-identical to the pre-blocking append. See design.py. repr=True (the dataclass
+    # default) DELIBERATELY, unlike its siblings on this line -- the base `name` property includes
+    # every repr=True non-None field automatically, and this is a graph-changing knob (a different
+    # T addresses the cache differently), so it must never share an artifact name with the
+    # unblocked design the way an un-named flag has before (see sequence_name()'s FUSE_QKV_DP
+    # history in gen_llm_decode.py).
+    kv_block_size: int | None = None
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -54,6 +62,7 @@ class QKVHeadDataParallel(MLIROperator):
         "max_seq": "S",
         "kv_offset_parameter": "kvpar",
         "weight_depth": "wd",
+        "kv_block_size": "kvblk",
     }
 
     def __post_init__(self):
@@ -90,6 +99,7 @@ class QKVHeadDataParallel(MLIROperator):
                     "tile_size_input": self.tile_size_input,
                     "stack_size": self.stack_size,
                     "n_aie_cols": self.num_aie_columns,
+                    "kv_block_size": self.kv_block_size,
                 },
             ),
         )
