@@ -17,15 +17,27 @@ class SwiGLUPrefill(OperatorSequence):
     tokens. Runtime buffers (via ``get_callable().get_buffer(name)``): input
     ``in``; persistent weight scratch ``w_gate`` / ``w_up`` / ``w_down``;
     output ``out``.
+
+    ``b_col_maj`` selects the layout all three weights are stored in, ``(K, N)``
+    when False and ``(N, K)`` when True. It is the layout the decode-side GEMV
+    reads, so a rail sharing one weight arena between prefill and decode sets it
+    rather than keeping a transposed second copy.
     """
 
     def __init__(
-        self, seq_len, embedding_dim, hidden_dim, prio_accuracy=False, context=None
+        self,
+        seq_len,
+        embedding_dim,
+        hidden_dim,
+        prio_accuracy=False,
+        b_col_maj=False,
+        context=None,
     ):
         self.seq_len = seq_len
         self.hidden_dim = hidden_dim
         self.embedding_dim = embedding_dim
         self.prio_accuracy = prio_accuracy
+        self.b_col_maj = b_col_maj
 
         # All operators (GEMM, SiLU, ElementwiseMul) apply their own padding
         # to meet hardware alignment requirements. We store the padded dimensions
@@ -46,6 +58,7 @@ class SwiGLUPrefill(OperatorSequence):
             K=self.embedding_dim,
             N=self.hidden_dim,
             num_aie_columns=n_cols,
+            b_col_maj=self.b_col_maj,
             **accuracy_flags,
         )
         self.seq_len_padded = gemm_1.M
@@ -67,6 +80,7 @@ class SwiGLUPrefill(OperatorSequence):
             K=self.hidden_dim,
             N=self.embedding_dim,
             num_aie_columns=n_cols,
+            b_col_maj=self.b_col_maj,
             **accuracy_flags,
         )
 
@@ -81,7 +95,10 @@ class SwiGLUPrefill(OperatorSequence):
         ]
 
         super().__init__(
-            name=f"swiglu_prefill_s{seq_len}_e{embedding_dim}_h{hidden_dim}",
+            name=(
+                f"swiglu_prefill_s{seq_len}_e{embedding_dim}_h{hidden_dim}"
+                + ("_bc" if b_col_maj else "")
+            ),
             runlist=runlist,
             input_args=["in"],
             output_args=["out"],
