@@ -26,6 +26,11 @@ Calls into the mv.cc kernel code. That kernel computes `m_input` output rows per
 """
 
 
+# The largest batch_group whose grouped objectFIFO depths are known to place on a core tile.
+# MEASURED, not derived -- see the GROUP REUSE block in my_matvec for why the arithmetic cannot be
+# done from here, and raise this only by BUILDING the larger value rather than by re-deriving it.
+MAX_GROUP_REUSE = 4
+
 def my_matvec(
     dev,
     cols,
@@ -218,8 +223,52 @@ def my_matvec(
     # would need its own restructuring for A and C to iterate different counts. That combination
     # keeps the old repeat, which is correct and slower, and shows up as unchanged DDR bytes in
     # `decode_ddr_bytes.py` rather than as silence.
-    group_reuse = batch_group > 1 and coalesce
+    #
+    # AND gated on a MEASURED batch_group ceiling, because the three FIFO depths below all follow
+    # n_vec (A at 2*n_vec, B at n_vec, C at 2*n_vec) and they share ONE budget: the objectFIFO
+    # lowering places one MemOp per core tile and every endpoint targeting that tile appends BD
+    # blocks into the same region, which HasValidBDs then counts cumulatively.
+    #
+    # The budget is the CORE tile's, and say so, because the number is ambiguous on this chip:
+    # `AIE2TargetModel::getNumBDs` returns `MemTile ? 48 : 16`, so a core tile and a shim NOC tile
+    # both have 16 and a MemTile has 48. A shim-side bound of 16 elsewhere in this file is a
+    # DIFFERENT resource that happens to share the number, not the same pool.
+    #
+    # The ceiling is MEASURED, not derived, and that distinction is the point. The obvious model --
+    # 5*batch_group BDs against 16 -- is REFUTED: it predicts batch_group 4 needs 20 and fails, and
+    # batch_group 4 builds. Counting `^bb` blocks per `aie.mem` in a lowered design shows why the
+    # arithmetic cannot be done this way from here: at n_vec 1 a core tile already carries 8-9
+    # blocks, so there is baseline traffic this operator does not know about, and an objectFIFO's
+    # depth is not one BD per unit of depth either. Deriving the real bound means asking the target
+    # model what the tile has and what else is already placed on it -- which is exactly what this
+    # file's own FIXME asks for ("pull these shim BD bounds from the MLIR-AIE target model rather
+    # than hard-coding them") and what the sibling MAX_STRIDE constant was just fixed for getting
+    # wrong (6f48e87: the bound was in elements where the field counts address granules).
+    #
+    # So this records the measurements and nothing more. Measured 2026-09-09 on the aie2p decode
+    # rail: batch_group 4 (gemma3-270m, 4 q heads over 1 kv head) BUILDS with reuse on; batch_group
+    # 16 (gemma4-12b's global layers, 16 over 1) does NOT -- aiecc dies with "'aie.mem' op has more
+    # than 16 blocks" naming `B_L3L1_0` at depth 16, a diagnostic that never mentions batch_group.
+    # 5 through 15 are UNTESTED; there is no shipped geometry in that range to test with, so the
+    # ceiling sits at the largest value known to work rather than at a guess about where it breaks.
+    #
+    # Capping the depths instead is not available: the core body does `acquire(n_vec)` on B and C,
+    # so depth >= n_vec is a precondition of the loop, and a narrower group means sub-tiling the
+    # group loop rather than turning a knob.
+    group_fits_bds = batch_group <= MAX_GROUP_REUSE
+    group_reuse = batch_group > 1 and coalesce and group_fits_bds
     n_vec = batch_group if group_reuse else 1
+    # Say so when the reuse is declined. A silent downgrade here is a per-token DDR regression that
+    # nobody can attribute later without re-deriving this by hand.
+    #
+    # Print-and-continue rather than raise, which is the OPPOSITE of what the sibling TMatVec
+    # operator does on its analogous L1 check (`tmatvec/op.py` raises ValueError; it has no
+    # fallback and prints nothing). The two differ because the outcomes differ: declining the reuse
+    # is safe -- the ungrouped path is the pre-existing mechanism and was verified byte-identical on
+    # device -- whereas TMatVec's check guards a shape that would not fit at all.
+    if batch_group > 1 and coalesce and not group_fits_bds:
+        print(f"[gemv] group_reuse DECLINED: batch_group={batch_group} > the measured-good "
+              f"ceiling {MAX_GROUP_REUSE}; falling back to the ungrouped read (M={M} K={K})")
 
     # A's depth follows n_vec too, and it is NOT cosmetic. Reusing the tile means the core spends
     # n_vec matvec calls on each one, so a depth-2 fifo lets the DMA run only one tile ahead of a

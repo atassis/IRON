@@ -5,6 +5,7 @@
 import pytest
 import aie.utils as aie_utils
 
+from iron.operators.gemv.design import MAX_GROUP_REUSE, my_matvec
 from iron.operators.gemv.op import GEMV
 from iron.operators.gemv.quant import quantize_weight, dequantize_weight
 from iron.operators.gemv.reference import (
@@ -355,3 +356,32 @@ def test_gemv_narrow_window_reads_only_its_window(
         operator, input_buffers, output_buffers, rel_tol=0.04, abs_tol=1e-3
     )
     assert not errors, f"windowed GEMV failed: {errors}"
+
+
+def test_group_reuse_declines_above_the_measured_ceiling(capsys):
+    """K008: grouped FIFO depths must FIT the core tile's BDs, not merely divide.
+
+    A, B and C all follow n_vec and share ONE budget -- the objectFIFO lowering puts every endpoint
+    targeting a tile into that tile's single MemOp, and HasValidBDs counts the blocks cumulatively
+    against getNumBDs(CoreTile) = 16. Above the ceiling the only thing that notices is aiecc, which
+    says "'aie.mem' op has more than 16 blocks" and names an objectFIFO, never batch_group.
+
+    Measured 2026-09-09 on the aie2p decode rail: batch_group 4 (Gemma-3-270M, 4 q heads over 1 kv
+    head) builds with the reuse ON and gates 8/8 on device; batch_group 16 (Gemma-4-12B's global
+    layers) does not build at all. 5 through 15 have no shipped geometry to test with, so the
+    ceiling is the largest MEASURED-good value and not a guess about where it breaks.
+
+    The decline must be VISIBLE: it costs per-token DDR bytes, and a silent downgrade is
+    unattributable later without re-deriving the arithmetic by hand.
+    """
+    dev = aie_utils.get_current_device()
+
+    # Gemma-3-270M's shape: at the ceiling, so the reuse stays on and nothing is printed.
+    my_matvec(dev, 8, 2048, 256, 64, num_batches=4, batch_group=4)
+    assert "DECLINED" not in capsys.readouterr().out
+
+    # Gemma-4-12B's global geometry: 16 q heads over a single kv head.
+    my_matvec(dev, 8, 2048, 512, 64, num_batches=16, batch_group=16)
+    out = capsys.readouterr().out
+    assert "group_reuse DECLINED" in out, "a silent downgrade is a per-token regression nobody can attribute"
+    assert "batch_group=16" in out and str(MAX_GROUP_REUSE) in out, "the message must name both numbers"
