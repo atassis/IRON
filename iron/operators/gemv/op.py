@@ -39,6 +39,13 @@ class GEMV(MLIROperator):
     # buffer size and the batch stride move; the run, the C tile and the core loop all follow M.
     # repr=False + the `name` override below, matching the epilogue/weight_dtype convention.
     alloc_M: int | None = field(default=None, repr=False)
+    # How many batches share one TaskGroup, i.e. one device-side drain wait, on the per-batch
+    # fallback path. 1 is the historical behaviour. Measured on the scores shape at a wide
+    # allocation: 16 barriers -> 4 is -20.7% at an IDENTICAL descriptor count, so the fallback's
+    # cost is the waits and not the BDs. Bounded above by the shim's 16-BD budget -- chunk 8 and 16
+    # do not build. A FIELD rather than an env read, because it changes the emitted design and
+    # anything that changes the design must reach the artifact name (see `name` below).
+    barrier_chunk: int = field(default=1, repr=False)
     kernel_vector_size: int = field(default=64, repr=False)
     # Optional fused activation applied to each output tile in the producing core.
     # "none" (default) leaves the output unchanged; "gelu" applies GELU(tanh approx); "silu" applies
@@ -147,6 +154,8 @@ class GEMV(MLIROperator):
         # the same design as alloc_M=None, so it keeps the stable name.
         if self.alloc_M is not None and self.alloc_M != self.M:
             base = f"{base}_am{self.alloc_M}"
+        if self.barrier_chunk != 1:
+            base = f"{base}_bc{self.barrier_chunk}"
         return base
 
     def design_key(self):
@@ -163,7 +172,7 @@ class GEMV(MLIROperator):
             self.tile_size_input, self.tile_size_output,
             self.num_batches, self.batch_group,
             self.epilogue, self.weight_dtype, self.group_size,
-            self.alloc_M, self.kernel_vector_size,
+            self.alloc_M, self.kernel_vector_size, self.barrier_chunk,
             self._kernel_link_file,
         ))
 
@@ -202,6 +211,7 @@ class GEMV(MLIROperator):
                     "weight_dtype": self.weight_dtype,
                     "group_size": self.group_size,
                     "alloc_M": self.alloc_M,
+                    "barrier_chunk": self.barrier_chunk,
                 },
             ),
         )

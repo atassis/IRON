@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import numpy as np
 from ml_dtypes import bfloat16
 
@@ -41,6 +42,7 @@ def my_matvec(
     weight_dtype="bf16",
     group_size=0,
     alloc_M=None,
+    barrier_chunk=1,
 ):
     if m_output is None:
         m_output = m_input
@@ -322,7 +324,18 @@ def my_matvec(
     # like a run: op_ctx is gemv(M=head_dim, K=S), and at S=2048 an unsplit K trips
     # "Size 0 exceeds the [0:1023] range". op_scores (K=head_dim=128) never would, which is why the
     # k-only arm built and this one did not.
-    if batch_group == 1 or group_reuse:
+    # The permutation exists ONLY to satisfy the coalesced tap, whose [group, matrix] dim order is
+    # forced (only the outermost dim may carry a zero stride). The per-batch FALLBACK has no such
+    # constraint: its A taps address matrix `w // batch_group` in plain batch order, so a permuted B
+    # hands delivery i the vector of head `member + batch_group*matrix` while A is on matrix
+    # `i // batch_group` -- 14 of 16 deliveries pair the wrong operands.
+    #
+    # This combination was UNREACHABLE until a wide allocation made `coalesce` false at
+    # batch_group>1: every shipped multi-batch GEMV coalesces. It is a defect this file's own
+    # comment predicts one paragraph down ("that mismatch is silent -- every head simply gets the
+    # wrong query vector -- and it reads as 0/8 parity, not as a near miss") and it went unexercised
+    # because nothing could reach the path.
+    if batch_group == 1 or group_reuse or not coalesce:
         # Flat, and for group_reuse that is the POINT: the core now consumes vectors in plain batch
         # order (matrix-major, member-inner), which is the order they already sit in, so the
         # permuted 4-D tap below -- and its wrap cap on K -- is not needed.
@@ -426,19 +439,34 @@ def my_matvec(
         # stock per-batch unroll (num_waits==num_batches, one wait per batch). The fills
         # and drains are otherwise identical; only the TAP and the wait count differ.
         num_waits = 1 if coalesce else num_batches
-        for w in range(num_waits):
+        # BARRIER CHUNK -- how many batches share one TaskGroup, i.e. one device-side drain wait.
+        #
+        # The fallback issues num_batches fills+drains per column AND num_batches barriers. Those
+        # are two different costs and the wait count is the one nothing forced: the coalesced path
+        # already argues, in this file, that dropping the per-batch wait is safe because ObjectFifo
+        # lock backpressure blocks a runaway producer rather than corrupting it ("worst case a
+        # stall, never a corrupting overrun"). The same fifos and the same locks are in play here.
+        #
+        # What DOES bound it is the shim's BD budget: batches in flight per column cannot exceed it,
+        # and an earlier attempt to hold one fill per object across a whole design exceeded 16 BDs
+        # and deadlocked (see tmatvec/design.py's KNOWN DEFECT note). So this is a chunk, not a
+        # hoist -- 1 reproduces today's behaviour exactly, and the useful range is bounded above by
+        # the BD budget rather than by taste.
+        chunk = max(1, min(barrier_chunk, num_waits))
+        for w0 in range(0, num_waits, chunk):
             tg_ac = TaskGroup()
-            for col in range(cols):
-                a_tap = A_taps_coalesced[col] if coalesce else A_taps[col][w]
-                A_L3L1_fifos_prods[col].fill(A, a_tap, group=tg_ac)
-            for col in range(cols):
-                c_tap = C_taps_coalesced[col] if coalesce else C_taps[col][w]
-                C_L1L3_fifos_conss[col].drain(
-                    C,
-                    c_tap,
-                    group=tg_ac,
-                    wait=True,
-                )
+            for w in range(w0, min(w0 + chunk, num_waits)):
+                for col in range(cols):
+                    a_tap = A_taps_coalesced[col] if coalesce else A_taps[col][w]
+                    A_L3L1_fifos_prods[col].fill(A, a_tap, group=tg_ac)
+                for col in range(cols):
+                    c_tap = C_taps_coalesced[col] if coalesce else C_taps[col][w]
+                    C_L1L3_fifos_conss[col].drain(
+                        C,
+                        c_tap,
+                        group=tg_ac,
+                        wait=True,
+                    )
             tg_ac.finish()
         tg_b.finish()
 
