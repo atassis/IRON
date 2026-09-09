@@ -355,3 +355,87 @@ def test_gemv_narrow_window_reads_only_its_window(
         operator, input_buffers, output_buffers, rel_tol=0.04, abs_tol=1e-3
     )
     assert not errors, f"windowed GEMV failed: {errors}"
+
+
+# The WRITE-side mirror of alloc_M: a wide-strided C. `M` is what gets computed, `alloc_M_out` is
+# what is allocated per output batch -- decode attention writes n_past scores into a scores buffer
+# sized at max_seq. Only the buffer size and the per-batch stride follow alloc_M_out; the run and
+# the core loop stay on M.
+@pytest.mark.parametrize(
+    "M,K,alloc_M_out,num_batches", [(64, 128, 512, 8), (128, 256, 2048, 4)]
+)
+def test_alloc_M_out_sizes_the_operand_not_the_window(M, K, alloc_M_out, num_batches):
+    g = GEMV(M=M, K=K, alloc_M_out=alloc_M_out, num_batches=num_batches)
+    spec = g.get_arg_spec()
+    assert spec[0].shape == (num_batches, M, K), "matrix stays sized by M (alloc_M unset)"
+    assert spec[2].shape == (num_batches, alloc_M_out), (
+        f"output operand must be sized by the ALLOCATION {alloc_M_out}, got {spec[2].shape}"
+    )
+
+
+def test_alloc_M_out_none_is_the_old_operand_shape():
+    """The default must not move: alloc_M_out=None leaves the operand sized by M."""
+    a = GEMV(M=256, K=128, num_batches=4).get_arg_spec()[2].shape
+    b = GEMV(M=256, K=128, num_batches=4, alloc_M_out=None).get_arg_spec()[2].shape
+    c = GEMV(M=256, K=128, num_batches=4, alloc_M_out=256).get_arg_spec()[2].shape
+    assert a == b == c == (4, 256), a
+
+
+def test_alloc_M_out_windowed_does_not_share_a_name_with_the_plain_gemv():
+    """A cached plain build must not be able to satisfy a windowed op (see GEMV.name)."""
+    plain = GEMV(M=128, K=128, num_batches=4).name
+    windowed = GEMV(M=128, K=128, num_batches=4, alloc_M_out=1024).name
+    assert windowed != plain, f"windowed GEMV shares an artifact name with the plain one: {plain}"
+    assert "amo1024" in windowed, windowed
+    # alloc_M_out == M is the same design as None, so it must NOT perturb the stable name.
+    assert GEMV(M=128, K=128, num_batches=4, alloc_M_out=128).name == plain
+
+
+def test_alloc_M_out_below_M_is_refused():
+    with pytest.raises(ValueError, match="alloc_M_out"):
+        GEMV(M=256, K=128, alloc_M_out=128)
+
+
+@pytest.mark.parametrize(
+    "M,K,alloc_M_out,num_batches", [(1024, 128, 1088, 4), (128, 128, 192, 4)]
+)
+def test_gemv_write_lands_at_the_allocated_stride(
+    M, K, alloc_M_out, num_batches, aie_context
+):
+    """A wrong per-batch stride (batch*M instead of batch*alloc_M_out) overlaps every batch after
+    the first.
+
+    Unlike alloc_M's read-side poison test, the gap between M and alloc_M_out is not
+    host-controlled here: run_test allocates the output buffer fresh (see
+    iron/common/test_utils.py's `run_test`, the "out" branch), so its initial content is whatever
+    the backend hands back, not something this test can poison. Comparing against the ALLOCATED
+    shape (num_batches, alloc_M_out) with `max_error_rate` covering only that gap sidesteps the
+    assumption either way: a correct write can only ever mismatch in the padding -- at most
+    (alloc_M_out-M)/alloc_M_out of the elements, whatever they hold -- while a wrong stride shifts
+    every batch after the first to the wrong offset, which corrupts a much larger fraction and
+    still fails the tolerance.
+    """
+    golden = generate_golden_reference_batched(M=M, K=K, num_batches=num_batches)
+    operator = GEMV(
+        M=M,
+        K=K,
+        alloc_M_out=alloc_M_out,
+        num_aie_columns=aie_utils.get_current_device().cols,
+        tile_size_input=4,
+        num_batches=num_batches,
+        context=aie_context,
+    )
+    padded = torch.zeros(num_batches, alloc_M_out, dtype=golden["C"].dtype)
+    padded[:, :M] = golden["C"]
+    input_buffers = {"matrix": golden["A"].flatten(), "vector": golden["B"].flatten()}
+    output_buffers = {"output": padded.flatten()}
+    pad_fraction = (alloc_M_out - M) / alloc_M_out
+    errors, latency_us, bandwidth_gbps = run_test(
+        operator,
+        input_buffers,
+        output_buffers,
+        rel_tol=0.04,
+        abs_tol=1e-3,
+        max_error_rate=pad_fraction + 0.02,
+    )
+    assert not errors, f"windowed GEMV output failed: {errors}"

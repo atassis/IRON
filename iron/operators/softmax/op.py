@@ -28,6 +28,12 @@ class Softmax(MLIROperator):
     num_channels: int = 1
     rtp_vector_size: int | None = None
     vector_size_parameter: str | None = None
+    # Elements ALLOCATED per row in the in/out buffers, when that differs from the elements
+    # COMPUTED (`cols`). None means they are equal -- the old behaviour, byte for byte. Mirrors
+    # gemv's alloc_M: decode's masked softmax runs over a scores row allocated at max_seq while
+    # only n_past columns are live, so cols=n_past while the per-row stride must stay max_seq. Only
+    # the buffer size and the per-row stride move; the computed row length stays `cols`.
+    alloc_cols: int | None = field(default=None, repr=False)
     context: object = field(default=None, repr=False)
 
     @property
@@ -56,7 +62,23 @@ class Softmax(MLIROperator):
             raise ValueError(
                 f"rows ({self.rows}) must be a multiple of num_aie_columns ({self.num_aie_columns})"
             )
+        if self.alloc_cols is not None and self.alloc_cols < self.cols:
+            raise ValueError(
+                f"alloc_cols ({self.alloc_cols}) must be >= cols ({self.cols}): it is the "
+                f"ALLOCATED per-row stride, not a second window"
+            )
         MLIROperator.__init__(self, context=self.context)
+
+    @property
+    def name(self) -> str:
+        # A wide-strided row is a different design from the plain one at the same cols: same
+        # compute extent, different buffer size and per-row stride. Without this they collide in
+        # the build dir and a cached plain build silently satisfies the windowed op. alloc_cols ==
+        # cols is the same design as alloc_cols=None, so it keeps the stable name.
+        base = super().name
+        if self.alloc_cols is not None and self.alloc_cols != self.cols:
+            base = f"{base}_ac{self.alloc_cols}"
+        return base
 
     @property
     def _kernel_link_file(self):
@@ -82,6 +104,7 @@ class Softmax(MLIROperator):
                     "rtp_vector_size": self.rtp_vector_size,
                     "vector_size_parameter": self.vector_size_parameter,
                     "kernel_obj_file": self._kernel_link_file,
+                    "alloc_cols": self.alloc_cols,
                 },
             ),
         )
@@ -107,9 +130,19 @@ class Softmax(MLIROperator):
         return [softmax_obj]
 
     def get_arg_spec(self):
+        # alloc_cols in (None, cols) is the same design/layout as the old behaviour, so it keeps
+        # the flat shape byte for byte. A wide-strided row is sized by the ALLOCATION: a narrow
+        # computed row still addresses a buffer whose per-row stride is alloc_cols, so the host
+        # operand must be that big or every row after the first lands inside the previous row's
+        # tail.
+        if self.alloc_cols is None or self.alloc_cols == self.cols:
+            return [
+                AIERuntimeArgSpec("in", (self.size,)),
+                AIERuntimeArgSpec("out", (self.size,)),
+            ]
         return [
-            AIERuntimeArgSpec("in", (self.size,)),
-            AIERuntimeArgSpec("out", (self.size,)),
+            AIERuntimeArgSpec("in", (self.rows, self.alloc_cols)),
+            AIERuntimeArgSpec("out", (self.rows, self.alloc_cols)),
         ]
 
     def reference(self, x):

@@ -3,7 +3,7 @@
 
 
 def generate_golden_reference_tmatvec(
-    M=128, K=2048, num_batches=16, batch_group=2, alloc_K=None, seed=42
+    M=128, K=2048, num_batches=16, batch_group=2, alloc_K=None, alloc_K_w=None, seed=42
 ):
     """Golden for the transposed-A contraction: C[b][j] = sum_p W[b][p] * A[b//batch_group][p][j].
 
@@ -13,20 +13,26 @@ def generate_golden_reference_tmatvec(
     With alloc_K set, A is allocated with alloc_K rows per matrix and only the first K are reduced.
     Rows past K are POISONED: unlike gemv's window, these DO reach every output if the reduction
     extent is wrong, so here the poison catches both a wrong extent AND a wrong per-matrix stride.
+
+    alloc_K_w is the same idea on W (the vector operand): allocated at alloc_K_w elements per
+    batch, only the first K reduced, columns past K poisoned to catch a wrong per-batch stride.
     """
     import torch
 
     assert num_batches % batch_group == 0
     _AK = K if alloc_K is None else alloc_K
     assert _AK >= K
+    _AKW = K if alloc_K_w is None else alloc_K_w
+    assert _AKW >= K
     torch.manual_seed(seed)
     n_matrices = num_batches // batch_group
     A = torch.randn(n_matrices, _AK, M, dtype=torch.bfloat16)
     A[:, K:, :] = 1000.0
-    W = torch.randn(num_batches, K, dtype=torch.bfloat16)
+    W = torch.randn(num_batches, _AKW, dtype=torch.bfloat16)
+    W[:, K:] = 1000.0
     C = torch.empty(num_batches, M, dtype=torch.bfloat16)
     for b in range(num_batches):
         # f32 accumulation, matching the kernel's accum<accfloat> -- a bf16 accumulation here
         # would make the golden itself the least accurate thing in the comparison.
-        C[b] = (W[b].float() @ A[b // batch_group, :K].float()).to(torch.bfloat16)
+        C[b] = (W[b, :K].float() @ A[b // batch_group, :K].float()).to(torch.bfloat16)
     return {"A": A, "W": W, "C": C}

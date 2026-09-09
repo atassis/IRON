@@ -39,6 +39,12 @@ class GEMV(MLIROperator):
     # buffer size and the batch stride move; the run, the C tile and the core loop all follow M.
     # repr=False + the `name` override below, matching the epilogue/weight_dtype convention.
     alloc_M: int | None = field(default=None, repr=False)
+    # Rows ALLOCATED per batch in C (the output), when that differs from the rows COMPUTED (`M`).
+    # None means they are equal -- the old behaviour, byte for byte. The write-side mirror of
+    # alloc_M: decode attention writes n_past scores into a scores buffer allocated at max_seq, so
+    # M=n_past while the per-batch stride C is written at must stay max_seq. Only the buffer size
+    # and the per-batch stride move; the run and the core loop still follow M.
+    alloc_M_out: int | None = field(default=None, repr=False)
     # How many batches share one TaskGroup, i.e. one device-side drain wait, on the per-batch
     # fallback path. 1 is the historical behaviour. Measured on the scores shape at a wide
     # allocation: 16 barriers -> 4 is -20.7% at an IDENTICAL descriptor count, so the fallback's
@@ -78,6 +84,11 @@ class GEMV(MLIROperator):
             raise ValueError(
                 f"alloc_M ({self.alloc_M}) must be >= M ({self.M}): it is the ALLOCATED row "
                 f"count per matrix, not a second window"
+            )
+        if self.alloc_M_out is not None and self.alloc_M_out < self.M:
+            raise ValueError(
+                f"alloc_M_out ({self.alloc_M_out}) must be >= M ({self.M}): it is the ALLOCATED "
+                f"row count per output batch, not a second window"
             )
         if self.tile_size_output is None:
             self.tile_size_output = self.tile_size_input
@@ -154,6 +165,10 @@ class GEMV(MLIROperator):
         # the same design as alloc_M=None, so it keeps the stable name.
         if self.alloc_M is not None and self.alloc_M != self.M:
             base = f"{base}_am{self.alloc_M}"
+        # Same reasoning, write side: a wide-strided C is a different design from the plain one at
+        # the same M, and alloc_M_out == M is the same design as None.
+        if self.alloc_M_out is not None and self.alloc_M_out != self.M:
+            base = f"{base}_amo{self.alloc_M_out}"
         if self.barrier_chunk != 1:
             base = f"{base}_bc{self.barrier_chunk}"
         return base
@@ -172,7 +187,7 @@ class GEMV(MLIROperator):
             self.tile_size_input, self.tile_size_output,
             self.num_batches, self.batch_group,
             self.epilogue, self.weight_dtype, self.group_size,
-            self.alloc_M, self.kernel_vector_size, self.barrier_chunk,
+            self.alloc_M, self.alloc_M_out, self.kernel_vector_size, self.barrier_chunk,
             self._kernel_link_file,
         ))
 
@@ -211,6 +226,7 @@ class GEMV(MLIROperator):
                     "weight_dtype": self.weight_dtype,
                     "group_size": self.group_size,
                     "alloc_M": self.alloc_M,
+                    "alloc_M_out": self.alloc_M_out,
                     "barrier_chunk": self.barrier_chunk,
                 },
             ),
@@ -292,10 +308,14 @@ class GEMV(MLIROperator):
             # decode_ddr_bytes.py's parser): M rows of `stride` packed bytes each, row layout in
             # quant.py. num_batches is asserted ==1 for a non-bf16 weight_dtype in __post_init__.
             matrix_spec = AIERuntimeArgSpec("in", a_batch_dim + (self.M * stride,), dtype=np.int8)
+        # Sized by the ALLOCATION, mirroring A: a wide-strided write still lands each batch at
+        # `batch * alloc_M_out`, so the host operand must be that big or batches after the first
+        # overlap the next one's region.
+        c_rows = self.M if self.alloc_M_out is None else self.alloc_M_out
         return [
             matrix_spec,  # matrix (A)
             AIERuntimeArgSpec("in", batch_dim + (self.K,)),  # vector (B, always bf16)
-            AIERuntimeArgSpec("out", batch_dim + (self.M,)),  # output (C, always bf16)
+            AIERuntimeArgSpec("out", batch_dim + (c_rows,)),  # output (C, always bf16)
         ]
 
     def reference(self, A, B):

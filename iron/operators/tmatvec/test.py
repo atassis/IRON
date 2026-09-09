@@ -35,6 +35,45 @@ def test_alloc_K_windowed_does_not_share_a_name_with_the_plain_op():
     assert win != plain and "ak2048" in win, win
 
 
+# The VECTOR-operand mirror of alloc_K: W is the reduction vector (`# vector (W)` in
+# get_arg_spec), and its own allocation can differ from K exactly like A's.
+def test_alloc_K_w_sizes_the_vector_operand_not_the_reduction():
+    op = TMatVec(M=128, K=256, num_aie_columns=8, num_batches=16, batch_group=2, alloc_K_w=2048)
+    spec = op.get_arg_spec()
+    assert spec[0].shape == (8, 256, 128), "A stays sized by K (alloc_K unset)"
+    assert spec[1].shape == (16, 2048), (
+        f"W must be sized by the ALLOCATION 2048, got {spec[1].shape}"
+    )
+    assert spec[2].shape == (16, 128), "output is the row width"
+
+
+def test_alloc_K_w_none_is_the_old_operand_shape():
+    a = TMatVec(M=128, K=256, num_aie_columns=8, num_batches=16, batch_group=2).get_arg_spec()[1].shape
+    b = TMatVec(
+        M=128, K=256, num_aie_columns=8, num_batches=16, batch_group=2, alloc_K_w=None
+    ).get_arg_spec()[1].shape
+    c = TMatVec(
+        M=128, K=256, num_aie_columns=8, num_batches=16, batch_group=2, alloc_K_w=256
+    ).get_arg_spec()[1].shape
+    assert a == b == c == (16, 256), a
+
+
+def test_alloc_K_w_windowed_does_not_share_a_name_with_the_plain_op():
+    plain = TMatVec(M=128, K=256, num_aie_columns=8, num_batches=16, batch_group=2).name
+    win = TMatVec(
+        M=128, K=256, num_aie_columns=8, num_batches=16, batch_group=2, alloc_K_w=2048
+    ).name
+    assert win != plain and "akw2048" in win, win
+    assert TMatVec(
+        M=128, K=256, num_aie_columns=8, num_batches=16, batch_group=2, alloc_K_w=256
+    ).name == plain
+
+
+def test_alloc_K_w_below_K_is_refused():
+    with pytest.raises(ValueError, match="alloc_K_w"):
+        TMatVec(M=128, K=256, num_aie_columns=1, num_batches=1, alloc_K_w=128)
+
+
 def test_rows_per_chunk_must_fit_l1_not_just_divide():
     """K008: the default rows_per_chunk fits at head_dim 128 and does NOT at 256.
 
@@ -74,6 +113,38 @@ def test_the_fit_error_names_the_value_that_works():
 
     assert largest_fitting_rows_per_chunk(M=256, K=2048, batch_group=4) == 32
     assert largest_fitting_rows_per_chunk(M=128, K=2048, batch_group=2) == 64
+
+
+@pytest.mark.parametrize(
+    "M,K,alloc_K_w,num_batches,batch_group", [(128, 256, 2048, 16, 2), (128, 128, 1024, 8, 1)]
+)
+def test_tmatvec_narrow_window_reads_only_its_w_window(
+    M, K, alloc_K_w, num_batches, batch_group, aie_context
+):
+    """Poisoned W columns past the window catch a wrong PER-BATCH STRIDE.
+
+    Same technique as alloc_K's device test, on the other operand: W past K IS summed into every
+    output if the reduction extent is wrong, so the poison catches both a wrong extent and a wrong
+    per-batch stride.
+    """
+    golden = generate_golden_reference_tmatvec(
+        M=M, K=K, num_batches=num_batches, batch_group=batch_group, alloc_K_w=alloc_K_w
+    )
+    op = TMatVec(
+        M=M,
+        K=K,
+        alloc_K_w=alloc_K_w,
+        num_aie_columns=num_batches // batch_group,
+        num_batches=num_batches,
+        batch_group=batch_group,
+        context=aie_context,
+    )
+    input_buffers = {"matrix": golden["A"].flatten(), "vector": golden["W"].flatten()}
+    output_buffers = {"output": golden["C"].flatten()}
+    errors, latency_us, bandwidth_gbps = run_test(
+        op, input_buffers, output_buffers, rel_tol=0.04, abs_tol=1e-2
+    )
+    assert not errors, f"windowed TMatVec W failed: {errors}"
 
 
 # The decode's own shape (Hq=16 query heads over Hkv=8 kv heads at head_dim 128), plus a small one.

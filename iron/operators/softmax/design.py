@@ -34,6 +34,7 @@ def softmax(
     vector_size_parameter=None,
     func_prefix="",
     kernel_obj_file="softmax.o",
+    alloc_cols=None,
 ):
     per_tile_elements = tile_size
     if rtp_vector_size is None:
@@ -48,8 +49,21 @@ def softmax(
     chunk = num_elements // num_aie_columns // num_channels  # For offset calculation
     dtype = bfloat16
 
+    # Elements ALLOCATED per row in the in/out buffers, when that differs from the elements
+    # COMPUTED (`tile_size`, i.e. one tile == one row). Mirrors gemv's alloc_M: `tile_size` stays
+    # the compute extent (every core still walks N_div_n tiles of that width); alloc_cols sizes the
+    # buffer and the per-row stride, so a narrow row lands inside a buffer allocated for a wider one
+    # instead of overlapping the next row. num_elements // tile_size is exact because one tile is
+    # exactly one row by construction (per_tile_elements == tile_size above).
+    assert alloc_cols is None or alloc_cols >= tile_size, (
+        f"alloc_cols ({alloc_cols}) must be >= cols ({tile_size}): it is the ALLOCATED per-row "
+        f"stride, not a second window"
+    )
+    total_rows = num_elements // tile_size
+    _alloc_cols = tile_size if alloc_cols is None else alloc_cols
+
     # Define tensor types
-    tensor_ty = np.ndarray[(num_elements,), np.dtype[dtype]]
+    tensor_ty = np.ndarray[(total_rows * _alloc_cols,), np.dtype[dtype]]
     tile_ty = np.ndarray[(per_tile_elements,), np.dtype[dtype]]
 
     # AIE-array data movement with object fifos
@@ -146,16 +160,34 @@ def softmax(
     # The pattern chops the data in equal chunks
     # and moves them in parallel across the columns
     # and channels.
-    taps = [
-        TensorAccessPattern(
-            (1, num_elements),
-            chunk * i * num_channels + chunk * j,
-            [1, 1, 1, chunk],
-            [0, 0, 0, 1],
-        )
-        for i in range(num_aie_columns)
-        for j in range(num_channels)
-    ]
+    #
+    # At alloc_cols == tile_size (the default) every core's rows sit back to back, so this stays
+    # the original flat 1-D run byte for byte. A wider per-row allocation breaks that contiguity --
+    # per_core_elements no longer equals a contiguous span in the buffer -- so each core instead
+    # walks its N_div_n rows at stride alloc_cols, reading/writing tile_size elements of each.
+    if alloc_cols is None or alloc_cols == tile_size:
+        taps = [
+            TensorAccessPattern(
+                (1, total_rows * _alloc_cols),
+                chunk * i * num_channels + chunk * j,
+                [1, 1, 1, chunk],
+                [0, 0, 0, 1],
+            )
+            for i in range(num_aie_columns)
+            for j in range(num_channels)
+        ]
+    else:
+        rows_per_core = N_div_n
+        taps = [
+            TensorAccessPattern(
+                (1, total_rows * _alloc_cols),
+                (i * num_channels + j) * rows_per_core * _alloc_cols,
+                [1, 1, rows_per_core, tile_size],
+                [0, 0, _alloc_cols, 1],
+            )
+            for i in range(num_aie_columns)
+            for j in range(num_channels)
+        ]
 
     # Runtime operations to move data to/from the AIE-array
     def sequence(A, C, in1_prods, out_conses):

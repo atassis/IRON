@@ -42,6 +42,7 @@ def my_matvec(
     weight_dtype="bf16",
     group_size=0,
     alloc_M=None,
+    alloc_M_out=None,
     barrier_chunk=1,
 ):
     if m_output is None:
@@ -119,12 +120,21 @@ def my_matvec(
         f"alloc_M ({alloc_M}) must be >= M ({M}): it is the ALLOCATED row count, not a second window"
     )
     _AM = M if alloc_M is None else alloc_M
+    # Rows ALLOCATED per output batch in C, when that differs from the rows COMPUTED (`M`) -- the
+    # write-side mirror of alloc_M/_AM above. `M` stays the compute extent (it sizes the run and the
+    # core loop); `alloc_M_out` sizes the C buffer and the per-batch stride, so a narrow write lands
+    # inside a buffer allocated for a wider one instead of overlapping the next batch.
+    assert alloc_M_out is None or alloc_M_out >= M, (
+        f"alloc_M_out ({alloc_M_out}) must be >= M ({M}): it is the ALLOCATED row count per "
+        f"output batch, not a second window"
+    )
+    _AMO = M if alloc_M_out is None else alloc_M_out
     L3_A_ty = np.ndarray[
         (n_matrices * _AM * a_row_width,),
         dtype_in,
     ]
     L3_B_ty = np.ndarray[(num_batches * K,), dtype_b]
-    L3_C_ty = np.ndarray[(num_batches * M,), dtype_out]
+    L3_C_ty = np.ndarray[(num_batches * _AMO,), dtype_out]
 
     func_type = "vectorized" if vectorized else "scalar"
     matvec = Kernel(
@@ -185,7 +195,7 @@ def my_matvec(
         return None
 
     A_run, A_bstride = (M // cols) * a_row_width, _AM * a_row_width
-    C_run, C_bstride = (M // cols), M
+    C_run, C_bstride = (M // cols), _AMO
     A_split, C_split = split_run(A_run), split_run(C_run)
     coalesce = (
         num_batches > 1
@@ -360,7 +370,8 @@ def my_matvec(
         [
             TensorAccessPattern(
                 tensor_dims=L3_C_ty.__args__[0],
-                offset=col * (M // cols) + batch * M,
+                # Per-batch stride is the ALLOCATION (_AMO), not M -- see A_taps above.
+                offset=col * (M // cols) + batch * _AMO,
                 sizes=[1, 1, 1, (M // cols)],
                 strides=[0, 0, 0, 1],
             )

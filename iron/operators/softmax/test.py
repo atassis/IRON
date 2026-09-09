@@ -6,7 +6,10 @@ import pytest
 import aie.utils as aie_utils
 
 from iron.operators.softmax.op import Softmax
-from iron.operators.softmax.reference import generate_golden_reference
+from iron.operators.softmax.reference import (
+    generate_golden_reference,
+    generate_golden_reference_windowed,
+)
 from iron.common.test_utils import run_test
 
 
@@ -85,3 +88,85 @@ def test_softmax(input_length, num_aie_columns, num_channels, tile_size, aie_con
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
 
     assert not errors, f"Test failed with errors: {errors}"
+
+
+# A WIDE-STRIDED row: `cols` is what gets computed, `alloc_cols` is what is allocated per row --
+# decode's masked softmax runs over a scores row allocated at max_seq while only n_past columns
+# are live. Only the buffer size and the per-row stride follow alloc_cols; the computed row length
+# stays `cols`. Mirrors gemv's alloc_M tests.
+@pytest.mark.parametrize(
+    "rows,cols,alloc_cols", [(32, 128, 2048), (16, 64, 512)]
+)
+def test_alloc_cols_sizes_the_operand_not_the_window(rows, cols, alloc_cols):
+    op = Softmax(rows=rows, cols=cols, alloc_cols=alloc_cols)
+    spec = op.get_arg_spec()
+    assert spec[0].shape == (rows, alloc_cols), (
+        f"in operand must be sized by the ALLOCATION {alloc_cols}, got {spec[0].shape}"
+    )
+    assert spec[1].shape == (rows, alloc_cols), (
+        f"out operand must be sized by the ALLOCATION {alloc_cols}, got {spec[1].shape}"
+    )
+
+
+def test_alloc_cols_none_is_the_old_operand_shape():
+    """The default must not move: alloc_cols=None leaves the operand sized by cols, flat."""
+    a = Softmax(rows=32, cols=128).get_arg_spec()[0].shape
+    b = Softmax(rows=32, cols=128, alloc_cols=None).get_arg_spec()[0].shape
+    c = Softmax(rows=32, cols=128, alloc_cols=128).get_arg_spec()[0].shape
+    assert a == b == c == (32 * 128,), a
+
+
+def test_alloc_cols_windowed_does_not_share_a_name_with_the_plain_op():
+    """A cached plain build must not be able to satisfy a windowed op (see Softmax.name)."""
+    plain = Softmax(rows=32, cols=128).name
+    windowed = Softmax(rows=32, cols=128, alloc_cols=2048).name
+    assert windowed != plain, f"windowed softmax shares an artifact name with the plain one: {plain}"
+    assert "ac2048" in windowed, windowed
+    # alloc_cols == cols is the same design as None, so it must NOT perturb the stable name.
+    assert Softmax(rows=32, cols=128, alloc_cols=128).name == plain
+
+
+def test_alloc_cols_below_cols_is_refused():
+    with pytest.raises(ValueError, match="alloc_cols"):
+        Softmax(rows=32, cols=128, alloc_cols=64)
+
+
+@pytest.mark.parametrize(
+    "rows,cols,alloc_cols,num_aie_columns,num_channels",
+    [(32, 128, 2048, 2, 2), (16, 64, 512, 1, 2)],
+)
+def test_softmax_narrow_window_reads_only_its_window(
+    rows, cols, alloc_cols, num_aie_columns, num_channels, aie_context
+):
+    """Poisoned columns past the window catch a wrong PER-ROW STRIDE on the READ side.
+
+    Softmax mixes every element of a row into that row's max/sum, so reading past `cols` (a wrong
+    stride) blows up the WHOLE row, not just the tail -- same technique as gemv's alloc_M poison
+    test. The comparison itself uses max_error_rate for the padding fraction of the OUTPUT: unlike
+    the input, this test cannot poison what the device backend leaves in the output buffer's
+    unwritten columns (see generate_golden_reference_windowed's docstring and
+    test_gemv_write_lands_at_the_allocated_stride for the same reasoning on gemv's alloc_M_out), so
+    it tolerates only that fraction. A wrong stride corrupts every element of every row, which is
+    far more than the padding fraction and still fails.
+    """
+    golden = generate_golden_reference_windowed(rows=rows, cols=cols, alloc_cols=alloc_cols)
+    operator = Softmax(
+        rows=rows,
+        cols=cols,
+        alloc_cols=alloc_cols,
+        num_aie_columns=num_aie_columns,
+        num_channels=num_channels,
+        context=aie_context,
+    )
+    input_buffers = {"in": golden["input"].flatten()}
+    output_buffers = {"output": golden["output"].flatten()}
+    pad_fraction = (alloc_cols - cols) / alloc_cols
+    errors, latency_us, bandwidth_gbps = run_test(
+        operator,
+        input_buffers,
+        output_buffers,
+        rel_tol=0.04,
+        abs_tol=1e-6,
+        max_error_rate=pad_fraction + 0.02,
+    )
+    assert not errors, f"windowed softmax failed: {errors}"

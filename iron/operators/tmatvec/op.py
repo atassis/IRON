@@ -35,6 +35,11 @@ class TMatVec(MLIROperator):
     # Rows ALLOCATED per matrix when that differs from the rows REDUCED -- gemv's alloc_M one axis
     # over. The window is a row PREFIX here, so only the per-matrix stride moves.
     alloc_K: int | None = field(default=None, repr=False)
+    # Elements ALLOCATED per batch in W (the vector operand), when that differs from the elements
+    # REDUCED (`K`). W's own axis, mirroring alloc_K on A: attention's context step reads W out of a
+    # scores buffer allocated at max_seq, so K=n_past while the per-batch stride W is read at must
+    # stay max_seq. Only the buffer size and the per-batch stride move.
+    alloc_K_w: int | None = field(default=None, repr=False)
     kwargs: dict = field(default_factory=dict, repr=False)
     context: object = field(default=None, repr=False)
 
@@ -67,6 +72,11 @@ class TMatVec(MLIROperator):
                 f"alloc_K ({self.alloc_K}) must be >= K ({self.K}): it is the ALLOCATED row "
                 f"count per matrix, not a second window"
             )
+        if self.alloc_K_w is not None and self.alloc_K_w < self.K:
+            raise ValueError(
+                f"alloc_K_w ({self.alloc_K_w}) must be >= K ({self.K}): it is the ALLOCATED "
+                f"element count per W batch, not a second window"
+            )
         # K008 -- the tiling must FIT, not merely divide. Checked HERE, at construction, because
         # the only other thing that notices is aiecc, which reports it as a placement failure
         # naming a tile and not a size. Arithmetic lives once, in design.py.
@@ -85,6 +95,8 @@ class TMatVec(MLIROperator):
         base = super().name
         if self.alloc_K is not None and self.alloc_K != self.K:
             base = f"{base}_ak{self.alloc_K}"
+        if self.alloc_K_w is not None and self.alloc_K_w != self.K:
+            base = f"{base}_akw{self.alloc_K_w}"
         return base
 
     @property
@@ -110,6 +122,7 @@ class TMatVec(MLIROperator):
                     **self.kwargs,
                     "kernel_object": self._kernel_object,
                     "alloc_K": self.alloc_K,
+                    "alloc_K_w": self.alloc_K_w,
                 },
             ),
         )
@@ -133,8 +146,12 @@ class TMatVec(MLIROperator):
     def get_arg_spec(self):
         n_matrices = self.num_batches // self.batch_group
         a_rows = self.K if self.alloc_K is None else self.alloc_K
+        # Sized by the ALLOCATION, mirroring A: a wide-strided read still lands batch b at
+        # `b * alloc_K_w`, so the host operand must be that big or every batch after the first
+        # reads past its own region.
+        w_cols = self.K if self.alloc_K_w is None else self.alloc_K_w
         return [
             AIERuntimeArgSpec("in", (n_matrices, a_rows, self.M)),  # matrix (A)
-            AIERuntimeArgSpec("in", (self.num_batches, self.K)),  # vector (W)
+            AIERuntimeArgSpec("in", (self.num_batches, w_cols)),  # vector (W)
             AIERuntimeArgSpec("out", (self.num_batches, self.M)),  # output (C)
         ]

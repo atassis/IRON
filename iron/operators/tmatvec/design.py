@@ -117,6 +117,7 @@ def transposed_matvec(
     func_prefix="",
     verbose=False,
     alloc_K=None,
+    alloc_K_w=None,
     l1_bytes=None,
 ):
     assert num_batches % batch_group == 0, (
@@ -137,6 +138,15 @@ def transposed_matvec(
     )
     _AK = K if alloc_K is None else alloc_K
 
+    # Elements ALLOCATED per batch in W, when that differs from the elements REDUCED (`K`). W's
+    # own axis, mirroring alloc_K/_AK on A above: `K` stays the reduction extent; `alloc_K_w` sizes
+    # the W buffer and the per-batch stride, so a narrow read lands inside a buffer allocated for a
+    # wider one instead of reading into the next batch.
+    assert alloc_K_w is None or alloc_K_w >= K, (
+        f"alloc_K_w ({alloc_K_w}) must be >= K ({K})"
+    )
+    _AKW = K if alloc_K_w is None else alloc_K_w
+
     n_chunks = K // rows_per_chunk
 
     # K008: the tiling must FIT, not merely divide. op.py raises this at construction; the
@@ -150,7 +160,7 @@ def transposed_matvec(
     ACC_ty = np.ndarray[(batch_group * M,), np.dtype[np.float32]]
 
     L3_A_ty = np.ndarray[(n_matrices * _AK * M,), np.dtype[bfloat16]]
-    L3_W_ty = np.ndarray[(num_batches * K,), np.dtype[bfloat16]]
+    L3_W_ty = np.ndarray[(num_batches * _AKW,), np.dtype[bfloat16]]
     L3_C_ty = np.ndarray[(num_batches * M,), np.dtype[bfloat16]]
 
     # The fused dispatch prefixes BOTH the symbol and the object FILENAME with op{idx}_, so the
@@ -206,16 +216,30 @@ def transposed_matvec(
         for c in range(cols)
     ]
     # W: column c takes its group's batches, which are contiguous because batches sharing a matrix
-    # are consecutive by construction (batch b reads matrix b // batch_group).
-    W_taps = [
-        TensorAccessPattern(
-            tensor_dims=L3_W_ty.__args__[0],
-            offset=c * batch_group * K,
-            sizes=[1, 1, 1, batch_group * K],
-            strides=[0, 0, 0, 1],
-        )
-        for c in range(cols)
-    ]
+    # are consecutive by construction (batch b reads matrix b // batch_group). At alloc_K_w == K
+    # (the default) that run is CONTIGUOUS, so it stays the original flat 1-D tap byte for byte;
+    # a wider per-batch allocation breaks contiguity, so each batch needs its own K-wide run at
+    # stride _AKW instead of one batch_group*K run.
+    if alloc_K_w is None or alloc_K_w == K:
+        W_taps = [
+            TensorAccessPattern(
+                tensor_dims=L3_W_ty.__args__[0],
+                offset=c * batch_group * _AKW,
+                sizes=[1, 1, 1, batch_group * K],
+                strides=[0, 0, 0, 1],
+            )
+            for c in range(cols)
+        ]
+    else:
+        W_taps = [
+            TensorAccessPattern(
+                tensor_dims=L3_W_ty.__args__[0],
+                offset=c * batch_group * _AKW,
+                sizes=[1, 1, batch_group, K],
+                strides=[0, 0, _AKW, 1],
+            )
+            for c in range(cols)
+        ]
     C_taps = [
         TensorAccessPattern(
             tensor_dims=L3_C_ty.__args__[0],
