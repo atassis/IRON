@@ -18,6 +18,23 @@ from iron.common.device_utils import get_kernel_dir
 from iron.common.operator_bases import lut_based_ops_artifacts
 
 
+def _mlp_l1_footprint_bytes(D, FF, mlp_cols, QD, tile_rows_gu, weight_depth, stack_size):
+    """The MLP half's per-core L1 use, bf16 + fuse_o=True (decode_layer_dp's only call shape).
+    Mirrors swiglu_mlp_dp/design.py's L1 budget block and this file's own get_arg_spec overlap
+    arithmetic -- duplicated, not imported, because both are computed inline there rather than
+    exported; the same trade SwiGLUMLPDataParallel._wo_rows_padded already makes. No term here
+    depends on max_seq."""
+    d_per_core, ff_per_core = D // mlp_cols, FF // mlp_cols
+    wtile_units = (tile_rows_gu or 6) * D
+    o_window = -(-(D // mlp_cols) // (wtile_units // QD)) * (wtile_units // QD)
+    misc = 2 * (D * 2)
+    weight = weight_depth * (wtile_units * 2)
+    out = 2 * (d_per_core * 2)
+    persistent = 2 * (D * 2) + (FF * 2) + 2 * (ff_per_core * 2) + (d_per_core * 2)
+    persistent += (QD * 2) + (o_window * 2)   # fuse_o: cx_buf + a_slice_buf
+    return misc + weight + out + persistent + stack_size
+
+
 @dataclass
 class DecodeLayerDataParallel(MLIROperator):
     """A whole decoder layer as ONE `aie.device`: attention on 8 cores, the MLP on 4 others.
@@ -67,9 +84,41 @@ class DecodeLayerDataParallel(MLIROperator):
                 f"attention places one KV head per core: Hkv ({self.Hkv}) must equal attn_cols "
                 f"({self.attn_cols})"
             )
+        # L1 IS THE EXCEPTION TO "delegate to the half" above: attn_block_dp's guard lives inside
+        # its design.py FUNCTION (an assert), and this file calls that function directly rather
+        # than through AttnBlockDataParallel -- so it fires at MLIR generation, not here, unless
+        # repeated. sc/sw are the only terms max_seq drives (attn_block_dp/design.py's
+        # l1_footprint_bytes); derive the per-token rate from the function itself rather than
+        # re-deriving its algebra, so this stays correct if that formula grows a term.
+        from iron.operators.attn_block_dp.design import l1_footprint_bytes, L1_BYTES
+
+        gqa = self.Hq // self.Hkv
+        tile_elems = self.tile_size_input * self.D
+        attn_args = (self.D, self.HD, gqa, self.max_seq, tile_elems, self.weight_depth,
+                     self.attn_stack_size)
+        attn_used = l1_footprint_bytes(*attn_args)
+        if attn_used > L1_BYTES:
+            fixed = l1_footprint_bytes(*(attn_args[:3] + (0,) + attn_args[4:]))
+            per_seq = l1_footprint_bytes(*(attn_args[:3] + (1,) + attn_args[4:])) - fixed
+            raise ValueError(
+                f"attention L1 use {attn_used} B exceeds {L1_BYTES} B at max_seq={self.max_seq}: "
+                f"sc+sw cost {per_seq} B per unit of max_seq and are the only terms it drives; "
+                f"largest max_seq that fits is {(L1_BYTES - fixed) // per_seq}"
+            )
+
         if self.D % self.mlp_cols or self.FF % self.mlp_cols:
             raise ValueError(
                 f"D ({self.D}) and FF ({self.FF}) must both divide mlp_cols ({self.mlp_cols})"
+            )
+        # The MLP half does not depend on max_seq at all (every term in its L1 block is D/FF/
+        # mlp_cols/QD) -- checked anyway because it was exactly as unguarded as attention was.
+        mlp_used = _mlp_l1_footprint_bytes(self.D, self.FF, self.mlp_cols, self.Hq * self.HD,
+                                           self.tile_rows_gu, self.weight_depth,
+                                           self.mlp_stack_size)
+        if mlp_used > L1_BYTES:
+            raise ValueError(
+                f"MLP L1 use {mlp_used} B exceeds {L1_BYTES} B at mlp_cols={self.mlp_cols} -- "
+                "independent of max_seq, so raising max_seq will not fix this"
             )
         # SHIM CHANNELS. The halves sit on different cores, so they do NOT share their misc /
         # weight / output fifos and the budget is the SUM: attention misc(1)+stream(attn_cols),
