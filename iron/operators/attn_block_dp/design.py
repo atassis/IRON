@@ -154,6 +154,8 @@ def attn_block_dp(
     trace_size=0,
     weight_depth=2,
     wqkv_head_major=False,
+    kv_alloc=None,
+    kv_block_size=None,
     fifo_prefix="",
     parts_only=False,
     norms_packed=False,
@@ -169,7 +171,13 @@ def attn_block_dp(
     awaits per layer against this design's 77 stock and 61 head-major. The permutation is a
     build-time numpy reorder of a blob this generator already writes, so it costs nothing at
     runtime -- but it makes the artifact incompatible with a loader expecting the stock order,
-    which is why it is a parameter and not the only behaviour."""
+    which is why it is a parameter and not the only behaviour.
+
+    `kv_alloc` (None default) separates the cache CAPACITY from `max_seq`, which stays the WINDOW:
+    sc/sw, the KV-chunk loop and the mask are all unchanged, still S=max_seq wide. `kv_alloc` only
+    sizes the KV_L3 buffer and the per-head stride, so a resident ladder of these designs at
+    different windows can share one wide cache. `kv_block_size` (also None) blocks that cache the
+    way gemv/tmatvec's `block_size` blocks theirs, one axis over. See the KV_ALLOC block below."""
     N = n_aie_cols
     tsi = tile_size_input
     S = max_seq
@@ -210,6 +218,56 @@ def attn_block_dp(
         f"tile_size_input frees {weight_depth * TILE_ELEMS} B per step and cannot reach a large S."
     )
 
+    # KV CAPACITY, separate from the WINDOW (S=max_seq, above -- unchanged, still what sizes sc/sw
+    # and N_KV_CHUNKS). `kv_alloc` is None by default, which keeps capacity == window, byte for
+    # byte. `kv_block_size` blocks that capacity the way gemv/tmatvec's `block_size` blocks theirs.
+    # iron.common.kv_layout.KVLayout is the single owner of the offset/stride arithmetic this needs
+    # -- gemv/tmatvec's own block_size branches predate that module and restate the formula by
+    # hand; this is the first caller that asks it instead.
+    from iron.common.kv_layout import KVLayout, split_run, validate_block_size
+
+    assert kv_alloc is None or kv_alloc >= S, (
+        f"kv_alloc ({kv_alloc}) must be >= max_seq ({S}): it is the cache CAPACITY, not a second "
+        f"window"
+    )
+    KV_ALLOC = S if kv_alloc is None else kv_alloc
+    _KVT = KV_ALLOC if kv_block_size is None else kv_block_size
+    kv_layout = KVLayout(Hkv=Hkv, S=KV_ALLOC, HD=HD, T=_KVT)  # validates KV_ALLOC % _KVT == 0
+    kv_blocked = _KVT != KV_ALLOC
+    if kv_blocked:
+        # Stride-field bound: the same check gemv's MAX_STRIDE / tmatvec's hand-rolled assert make,
+        # now checked once by the module both of those predate.
+        validate_block_size(_KVT, HD, Hkv)
+        # The WINDOW (not the allocation) is what tg3 streams, block by block starting at block 0
+        # -- so it is the window that must be a whole number of blocks here.
+        assert S % _KVT == 0, (
+            f"blocked KV cache needs the attention window ({S}) to be a whole number of blocks "
+            f"(kv_block_size={_KVT})"
+        )
+        _kv_num_blocks_window = S // _KVT
+        _kv_blk_split = split_run(_KVT * HD)
+        assert _kv_blk_split is not None, (
+            f"blocked KV cache: no wrap-legal split for one block's run ({_KVT * HD} elements, "
+            f"kv_block_size={_KVT})"
+        )
+        _kv_blk_hi, _kv_blk_lo = _kv_blk_split
+
+    def _kv_read_tap(head_base):
+        """This head's WINDOW (S positions) out of a cache allocated at KV_ALLOC. Unblocked: one
+        contiguous S*HD run at head_base -- byte-identical to the pre-capacity flat tap when
+        KV_ALLOC==S. Blocked: the window's S//kv_block_size blocks, block_stride apart, positions
+        still delivered in order (block b holds positions [b*T,(b+1)*T) by KVLayout's own
+        definition) so the core's chunked consumption is unaffected by where a block boundary
+        falls relative to a stream tile."""
+        if not kv_blocked:
+            return _flat_tap(kv_layout.total_elems, S * HD, head_base)
+        return TensorAccessPattern(
+            tensor_dims=(kv_layout.total_elems,),
+            offset=head_base,
+            sizes=[1, _kv_num_blocks_window, _kv_blk_hi, _kv_blk_lo],
+            strides=[0, kv_layout.block_stride, _kv_blk_lo, 1],
+        )
+
     kv_off_param = (ScratchpadParameter(kv_offset_parameter, np.int32)
                     if kv_offset_parameter is not None else None)
     mask_param = ScratchpadParameter(mask_parameter, np.int32)
@@ -227,7 +285,7 @@ def attn_block_dp(
     # (kMaxHostBOs, tools/aiecc/SidecarFiles.h), which a whole fused LAYER reaches at 17.
     NORMS = D + 2 * HD
     NORMS_L3_ty = np.ndarray[(NORMS,), np.dtype[BF16]]
-    KV_L3_ty = np.ndarray[(Hkv * S * HD,), np.dtype[BF16]]
+    KV_L3_ty = np.ndarray[(kv_layout.total_elems,), np.dtype[BF16]]
     CX_L3_ty = np.ndarray[(QD,), np.dtype[BF16]]
 
     # ---- kernels: one archive, every core plays every role ----
@@ -440,7 +498,7 @@ def attn_block_dp(
             # write are both untouched.
             for cache in (kc, vc):
                 out_cs[c].drain(
-                    cache, _flat_tap(Hkv * S * HD, HD, c * S * HD),
+                    cache, _flat_tap(kv_layout.total_elems, HD, kv_layout.head_base(c)),
                     wait=True, group=tg2, offset_parameter=kv_off_param,
                 )
         tg2.finish()
@@ -449,7 +507,7 @@ def attn_block_dp(
         for c in range(N):
             for cache in (kc, vc):
                 stream_ps[c].fill(
-                    cache, _flat_tap(Hkv * S * HD, S * HD, c * S * HD), wait=True, group=tg3
+                    cache, _kv_read_tap(kv_layout.head_base(c)), wait=True, group=tg3
                 )
         for c in range(N):
             for g in range(gqa):
