@@ -182,7 +182,8 @@ def my_matvec(
         # forced by the 2-input-DMA-channel budget: A and B already spend both.
         from iron.operators.gemv.quant import row_stride_bytes
 
-        assert weight_dtype in ("int4", "int8"), f"unknown weight_dtype {weight_dtype!r}"
+        assert weight_dtype in ("int4", "int8", "int4a", "int8a"), \
+            f"unknown weight_dtype {weight_dtype!r}"
         assert num_batches == 1, (
             "GEMV weight_dtype != 'bf16' does not support num_batches>1 yet -- the per-column "
             "A layout assumes a single contiguous [row_stride-byte rows] slab per column "
@@ -463,6 +464,18 @@ def my_matvec(
                 C_L1L3_fifo.release(n_vec)
             B_L3L1_fifo.release(n_vec)
 
+    # STACK. The bf16 and symmetric paths take the device default (1024 B) and are left alone --
+    # raising it would move every existing build's L1 layout. The AFFINE kernels keep one float
+    # per quant group on the stack (mv_quant.cc's `float bsum[n_groups]`, the per-group sums of
+    # B), so they need the default plus that array. Sized here rather than guessed: aiecc measures
+    # each core's real requirement and fails the build when stack_size is short, and it DID --
+    # K=1024 g=32 needs 1088 against the 1024 default, which is bsum's 128 B minus the slack the
+    # frame already had. The rounding to 64 B keeps the L1 allocator's granule.
+    _stack_kw = {}
+    if weight_dtype in ("int4a", "int8a"):
+        _bsum = 4 * (K // group_size)
+        _stack_kw["stack_size"] = 1024 + -(-_bsum // 64) * 64
+
     workers = [
         Worker(
             core_body,
@@ -473,6 +486,7 @@ def my_matvec(
                 matvec,
             ]
             + ([gelu_kernel] if epilogue != "none" else []),
+            **_stack_kw,
         )
         for i in range(cols)
     ]

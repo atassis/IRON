@@ -61,7 +61,9 @@ class GEMV(MLIROperator):
     # repr=False keeps operator/artifact names stable for the default path.
     epilogue: str = field(default="none", repr=False)
     # Weight-stream format axis for A (the MxK matrix): "bf16" (default, unchanged), or
-    # "int4"/"int8" group-quantized with a per-row f32 scale per `group_size` columns,
+    # "int4"/"int8" group-quantized with a per-row f32 scale per `group_size` columns, or the
+    # AFFINE "int4a"/"int8a" (w = q*s + m, a bf16 scale and a bf16 min per group -- same row
+    # stride as the symmetric f32-scale form at every K and group; see gemv/quant.py),
     # dequantized on-core right before the same bf16 MAC (see design.py / mv_quant.cc / quant.py).
     # This is a byte-stream lever on the WEIGHT only -- B and C stay bf16 regardless.
     # repr=False + the name/kernel-file overrides below keep the default path's artifact names
@@ -117,9 +119,10 @@ class GEMV(MLIROperator):
                 f"{self.epilogue} epilogue needs tile_size_output % 32 == 0 "
                 f"(got {self.tile_size_output})"
             )
-        if self.weight_dtype not in ("bf16", "int4", "int8"):
+        if self.weight_dtype not in ("bf16", "int4", "int8", "int4a", "int8a"):
             raise ValueError(
-                f"unknown weight_dtype {self.weight_dtype!r} (expected 'bf16', 'int4' or 'int8')"
+                f"unknown weight_dtype {self.weight_dtype!r} (expected 'bf16', 'int4', 'int8', "
+                f"'int4a' or 'int8a')"
             )
         if self.weight_dtype != "bf16":
             if self.epilogue != "none":
