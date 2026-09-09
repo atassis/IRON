@@ -1,0 +1,476 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Decode attention block as ONE `aie.device`: norm, QKV, qk-norm, RoPE, KV-append, scores,
+softmax and context, data-parallel with **one KV HEAD per core**.
+
+    hn      = weighted_RMSNorm(cur, n_in)                     D-wide, replicated on every core
+    q[g]    = RoPE(weighted_RMSNorm(Wq[head gqa*c+g] @ hn, n_qn), ang)     core c's gqa query heads
+    k       = RoPE(weighted_RMSNorm(Wk[head c] @ hn, n_kn), ang)           core c's one kv head
+    v       = Wv[head c] @ hn
+    -- append k, v at kv_off --
+    sc[g]   = kc[head c] @ q[g]                                S-wide row, core c's own kv head
+    sw[g]   = softmax(mask(sc[g], n_past+1))
+    cx[g]   = sum_p sw[g][p] * vc[head c][p][:]                transposed-A reduction
+
+replacing FOUR consecutive designs in the decode runlist (QKVHeadDataParallel, the scores GEMV,
+Softmax, TMatVec) with one, so the group costs one `aiex.configure` per layer instead of four.
+
+WHY THE HEAD MAPPING IS THE WHOLE DESIGN. The four operators this replaces cannot be fused as
+they stand -- not "with difficulty", not at all. Their per-column-direct-fill style spends one
+shim DMA channel per column per operand, and the device has 16 of each direction TOTAL
+(`iron/common/utils.py::get_shim_dma_limit`, 8 ShimNOCTiles x 2). Counted on this graph's own
+shapes:
+
+    operator                       shim in   shim out
+    QKVHeadDataParallel            misc 1 + weight 8 = 9        out 8
+    GEMV scores                    A 8 + B 8         = 16       C 8
+    Softmax                        in 8              = 8        out 8
+    TMatVec ctx                    A 8 + W 8         = 16       C 8
+    naive union                                       49          32     against 16 / 16
+
+`fuse/attn-core` (worktree wt-fuse-attn, commit 36153b0) built exactly that union for a
+7-operator version and aiecc rejected it: "no ShimNOCTile on the device has 0 input/1 output DMA
+channel(s) free: all 8 ShimNOCTile(s) are at 9/16 input, 16/16 output channels used" -- with
+op_sck+op_scv+op_scores ALONE, 3 of its 7 operators, already over. That file also names the fix it
+did not build, and this design is it: give every stage ONE consistent column meaning so the
+intermediates never take a channel at all.
+
+The meaning is **kv head**. TMatVec already places one kv head per column and Softmax already
+partitions by head, so those two agree; the scores GEMV was the odd one out (it slices its OUTPUT
+by SEQUENCE POSITION, every column holding a slice of every head, which is what made sc/softmax a
+genuine 8-source/8-destination crossbar that `aie.objectfifo_link` refuses outright). Read as a
+BATCH-per-column matvec instead -- column c reads only kv head c's cache and computes the FULL
+S-wide row for its own gqa query heads -- and the crossbar disappears, because producer and
+consumer are the same core. `q`, `sc` and `sw` then never leave L1, so they never reach DDR and
+never take a shim channel.
+
+The QKV head has to be re-mapped to match. `qkv_head_dp` assigns heads to cores by contiguous ROWS
+of the concatenated Wqkv, which at Hq=16/Hkv=8 puts all sixteen q heads on cores 0-3 and nothing
+else there -- a 4-source/8-destination exchange against the mapping above. Here core c owns query
+heads [gqa*c, gqa*c+gqa), kv head c of K and kv head c of V: the same FOUR heads per core and the
+same per-core weight BYTES, just a different four. They are not contiguous in Wqkv's stock
+[Wq | Wk | Wv] row order, so the weight arrives as THREE fills on the one weight channel rather
+than one -- the "same fifo, several fill() calls" idiom swiglu_mlp_dp uses for Wg/Wu/Wd. Three
+BDs per core for 1 MB instead of one; the weight LAYOUT in DDR is untouched, which is what keeps
+this a drop-in for the existing artifact.
+
+Channels, after all that:
+
+  MISC (1 input, BROADCAST to all N cores). HD-wide. Carries `cur` and `n_in` as D/HD chunks
+  reassembled by an explicit-offset copy, then n_qn, n_kn and ang, acquired together and held.
+  Verbatim qkv_head_dp's misc channel, including why it is HD-wide and not D-wide.
+
+  STREAM (1 input, per core). ONE fifo carrying, in order: this core's three Wqkv runs, then its
+  kv head's whole K cache, then its whole V cache. One tile shape serves all three because
+  `tile_size_input * D == rows_per_chunk * HD` by construction -- the same shared-tile invariant
+  swiglu_mlp_dp asserts for Wg/Wu (row width D) and Wd (row width FF).
+
+  OUTPUT (1 of the 2 available). HD-wide, four rounds: k, v, then one per query head's context.
+
+Two in, one out per compute tile against the hard 2-in/2-out of an AIE2P tile; **9 input and 8
+output shim channels device-wide, of 16 each** -- identical to what QKVHeadDataParallel alone
+spends today, with the other three operators absorbed for free.
+
+WHAT THE DDR CENSUS DOES. Per layer at Qwen3-0.6B's shape this deletes `q`'s drain (4 KB), the
+scores GEMV's re-read of `q` (8 columns x 4 KB = 32 KB), and both round trips of `sc` and `sw`
+(4 x 64 KB) -- 299,008 B/layer, 8.372 MB/token over 28 layers. Nothing else moves: the K and V
+cache reads are the same bytes in the same contiguous per-head runs, and Wqkv is the same bytes in
+three runs instead of one. A fusion that moved MORE bytes would have lost whatever its configure
+count.
+
+NOT AN L2 RESIDENCY CLAIM. Nothing is staged through a MemTile here and nothing needs to be: the
+intermediates are deleted, not relayed. Two decode-side attempts that merely relayed through L2
+measured +0.150 ms and +4.54 ms ([[the-unit-that-costs-is-the-wait-not-the-issue]]) -- L2 pays for
+REUSE, not for relay.
+
+WHAT THIS TIES TO L1, AND IT IS NEW. `sc` and `sw` are now core-local, so the attention window S
+costs `2 * gqa * S * 2` bytes of L1 that it did not cost before. At gqa=2 that is 16 KB at S=2048
+and 32 KB at S=4096, and the budget below is what says which fits. S was previously bounded only
+by DDR. State it as a constraint of this design, not of the hardware.
+
+INHERITED, NOT INTRODUCED: the K/V cache fills are single BDs against a fifo whose object is one
+chunk, which is the shape `tmatvec/design.py` records as a KNOWN DEFECT (correct standalone, racy
+across repeated invocations in one runtime sequence). The shipped graph already runs TMatVec that
+way once per layer; this does not make it worse and does not fix it.
+"""
+
+import aie.dialects.index as index
+from aie.dialects.aie import T
+from ml_dtypes import bfloat16
+import numpy as np
+
+from aie.helpers.dialects.scf import _for as range_
+from aie.helpers.taplib import TensorAccessPattern
+from aie.iron import (Buffer, Kernel, ObjectFifo, Program, Runtime, ScratchpadParameter,
+                      TaskGroup, Worker, WorkerRuntimeBarrier, sync_parameters)
+
+from iron.operators._trace import maybe_enable_trace
+
+BF16 = bfloat16
+
+# AIE2P core-tile local memory. Stated, not derived: the Python bindings expose no accessor
+# (AIETargetModel::getLocalMemorySize() is C++ only).
+L1_BYTES = 65536
+
+
+def _flat_tap(total, size, offset=0):
+    """A contiguous [offset:offset+size) window of an L3 buffer of `total` elements. `total` is the
+    FULL declared size -- TensorAccessPattern validates offset+extent against it, so a bare
+    (size,) is correct only at offset 0."""
+    return TensorAccessPattern((1, total), offset, [1, 1, 1, size], [0, 0, 0, 1])
+
+
+def l1_footprint_bytes(D, HD, gqa, S, tile_elems, weight_depth, stack_size):
+    """Bytes this design places in one core's L1, by term. Computed rather than assumed -- the
+    same check qkv_head_dp and swiglu_mlp_dp carry, and the term that grows with S is new here."""
+    misc = 3 * (HD * 2)                 # depth 3: n_qn, n_kn and ang are held together
+    stream = weight_depth * (tile_elems * 2)
+    out = 2 * (HD * 2)
+    persistent = (
+        3 * (D * 2)                     # cur, n_in, hn
+        + 2 * (HD * 2)                  # raw, nrm
+        + gqa * (HD * 2)                # the RoPE'd query heads, which never leave L1
+        + 2 * gqa * (S * 2)             # sc and sw -- the terms S drives
+        + gqa * (HD * 4)                # the f32 context accumulators
+    )
+    return misc + stream + out + persistent + stack_size
+
+
+def attn_block_dp(
+    dev,
+    D,
+    HD,
+    Hq,
+    Hkv,
+    max_seq,
+    epsilon=1e-6,
+    tile_size_input=4,
+    stack_size=0xD00,
+    func_prefix="",
+    n_aie_cols=8,
+    kv_offset_parameter="kv_off",
+    mask_parameter="sm_mask",
+    trace_size=0,
+    weight_depth=2,
+    wqkv_head_major=False,
+    fifo_prefix="",
+    parts_only=False,
+    norms_packed=False,
+):
+    """`func_prefix` is not optional once this design is placed in an OperatorSequence -- see
+    gemv/design.py's identical parameter. N = n_aie_cols, one core per KV HEAD.
+
+    `wqkv_head_major` picks the WEIGHT LAYOUT, and it is a real trade, not a tidy-up. False is the
+    stock [Wq | Wk | Wv] blob, which costs THREE fills per core because this core's four heads are
+    not adjacent in it -- 24 `dma_await_task` where the shipped op0 spends 8. True expects the blob
+    pre-permuted to [core0's q,q,k,v | core1's ... ], one contiguous run per core, ONE fill. Same
+    bytes either way; what moves is the await count, and the shipped graph's four designs spend 69
+    awaits per layer against this design's 77 stock and 61 head-major. The permutation is a
+    build-time numpy reorder of a blob this generator already writes, so it costs nothing at
+    runtime -- but it makes the artifact incompatible with a loader expecting the stock order,
+    which is why it is a parameter and not the only behaviour."""
+    N = n_aie_cols
+    tsi = tile_size_input
+    S = max_seq
+    QD, KVD = Hq * HD, Hkv * HD
+    TOT = QD + 2 * KVD                      # rows of the concatenated Wqkv
+    assert Hkv == N, (
+        f"this design places one KV HEAD per core: Hkv ({Hkv}) must equal n_aie_cols ({N}). "
+        f"It is TMatVec's own 'one matrix per column' rule, now binding on every stage."
+    )
+    assert Hq % Hkv == 0, f"Hq ({Hq}) must be a multiple of Hkv ({Hkv})"
+    gqa = Hq // Hkv
+    assert D % HD == 0, f"this design carries `cur`/`n_in` as D/HD chunks; D={D} HD={HD}"
+    assert HD % tsi == 0, f"HD ({HD}) must divide by tile_size_input ({tsi})"
+
+    N_MISC_CHUNKS = D // HD
+    N_W_TILES = HD // tsi                   # weight tiles per head row-block
+    TILE_ELEMS = tsi * D
+
+    # THE SHARED-TILE INVARIANT. One ObjectFifo carries Wqkv row-tiles (tsi rows of D) AND cache
+    # row-chunks (rpc rows of HD); it works only because the two are the same number of elements.
+    # Asserted rather than commented: it is what collapses two input channels into one, and a
+    # shape where it fails needs a different tiling, not a partial fill.
+    assert TILE_ELEMS % HD == 0, (
+        f"the shared stream tile ({TILE_ELEMS} elements) must be a whole number of cache rows "
+        f"(HD={HD})"
+    )
+    rpc = TILE_ELEMS // HD                  # cache rows per stream tile
+    assert S % rpc == 0, (
+        f"max_seq ({S}) must divide by the cache rows per stream tile ({rpc}), which "
+        f"tile_size_input={tsi} and head_dim={HD} fix at tsi*D/HD"
+    )
+    N_KV_CHUNKS = S // rpc
+
+    used = l1_footprint_bytes(D, HD, gqa, S, TILE_ELEMS, weight_depth, stack_size)
+    assert used <= L1_BYTES, (
+        f"estimated L1 use {used} B exceeds {L1_BYTES} B at tsi={tsi} max_seq={S} gqa={gqa}. "
+        f"sc+sw alone are {2 * gqa * S * 2} B and are the terms max_seq drives -- shrinking "
+        f"tile_size_input frees {weight_depth * TILE_ELEMS} B per step and cannot reach a large S."
+    )
+
+    kv_off_param = (ScratchpadParameter(kv_offset_parameter, np.int32)
+                    if kv_offset_parameter is not None else None)
+    mask_param = ScratchpadParameter(mask_parameter, np.int32)
+
+    D_ty = np.ndarray[(D,), np.dtype[BF16]]
+    HD_ty = np.ndarray[(HD,), np.dtype[BF16]]
+    TILE_ty = np.ndarray[(TILE_ELEMS,), np.dtype[BF16]]
+    SROW_ty = np.ndarray[(S,), np.dtype[BF16]]
+    ACC_ty = np.ndarray[(HD,), np.dtype[np.float32]]
+    W_L3_ty = np.ndarray[(TOT * D,), np.dtype[BF16]]
+    # PACKED NORM GAINS. n_in, n_qn and n_kn are three STATIC weight vectors; `ang` is not (the
+    # host writes the RoPE angle row per token), so it stays its own argument. Packing the three
+    # is a build-time concat of blobs the generator already emits, exactly as Wqkv is a concat of
+    # Wq/Wk/Wv -- and it exists because aiecc caps a device at 16 host buffer arguments
+    # (kMaxHostBOs, tools/aiecc/SidecarFiles.h), which a whole fused LAYER reaches at 17.
+    NORMS = D + 2 * HD
+    NORMS_L3_ty = np.ndarray[(NORMS,), np.dtype[BF16]]
+    KV_L3_ty = np.ndarray[(Hkv * S * HD,), np.dtype[BF16]]
+    CX_L3_ty = np.ndarray[(QD,), np.dtype[BF16]]
+
+    # ---- kernels: one archive, every core plays every role ----
+    CORE_ARCHIVE = f"{func_prefix}attn_block_dp_core.a"
+    copy_kernel = Kernel(
+        f"{func_prefix}copy_offset_bf16_vector", CORE_ARCHIVE, [D_ty, HD_ty, np.int32, np.int32]
+    )
+    wnorm_d_kernel = Kernel(
+        f"{func_prefix}weighted_rms_norm_fixed", CORE_ARCHIVE, [D_ty, D_ty, D_ty, np.float32]
+    )
+    wnorm_hd_kernel = Kernel(
+        f"{func_prefix}hd_weighted_rms_norm_fixed", CORE_ARCHIVE,
+        [HD_ty, HD_ty, HD_ty, np.float32]
+    )
+    # Two matvec bindings at two DIM_Ks. mv.cc bakes DIM_K in at compile time and a func.func
+    # symbol is keyed by NAME, so the projection (K=D) and the scores (K=head_dim) need separate
+    # prefixed objects -- swiglu_mlp_dp's mv_gu/down_/o_ mechanism exactly.
+    mv_kernel = Kernel(
+        f"{func_prefix}matvec_vectorized_bf16_bf16", CORE_ARCHIVE,
+        [np.int32, np.int32, TILE_ty, D_ty, HD_ty],
+    )
+    sc_mv_kernel = Kernel(
+        f"{func_prefix}sc_matvec_vectorized_bf16_bf16", CORE_ARCHIVE,
+        [np.int32, np.int32, TILE_ty, HD_ty, SROW_ty],
+    )
+    rope_kernel = Kernel(f"{func_prefix}rope", CORE_ARCHIVE, [HD_ty, HD_ty, HD_ty, np.int32])
+    mask_kernel = Kernel(
+        f"{func_prefix}mask_bf16", CORE_ARCHIVE, [SROW_ty, np.int32, np.int32]
+    )
+    softmax_kernel = Kernel(
+        f"{func_prefix}softmax_bf16", CORE_ARCHIVE, [SROW_ty, SROW_ty, np.int32]
+    )
+    # groups=1 on all three: this core runs the context reduction once PER QUERY HEAD against its
+    # own accumulator, rather than once for the pair against a [gqa, HD] one. Same MACs, same A
+    # tile read once from L1 for both -- and it drops the [gqa*S] softmax buffer and the [gqa*HD]
+    # context buffer the grouped form would need, because each head's result is finished straight
+    # into the drain tile.
+    tz_kernel = Kernel(f"{func_prefix}taccum_zero_f32", CORE_ARCHIVE, [np.int32, ACC_ty])
+    tr_kernel = Kernel(
+        f"{func_prefix}taccum_rows_bf16_f32", CORE_ARCHIVE,
+        [np.int32, np.int32, np.int32, np.int32, TILE_ty, SROW_ty, ACC_ty],
+    )
+    tf_kernel = Kernel(
+        f"{func_prefix}taccum_finish_bf16", CORE_ARCHIVE, [np.int32, ACC_ty, HD_ty]
+    )
+
+    misc_of = ObjectFifo(HD_ty, name=f"{fifo_prefix}misc", depth=3)
+    stream_ofs = [ObjectFifo(TILE_ty, name=f"{fifo_prefix}stream_{c}", depth=weight_depth) for c in range(N)]
+    out_ofs = [ObjectFifo(HD_ty, name=f"{fifo_prefix}out_{c}", depth=2) for c in range(N)]
+
+    barriers = [WorkerRuntimeBarrier() for _ in range(N)]
+
+    def core_fn(misc_c, stream_c, out_p, mask_src, barrier,
+                cur_buf, nin_buf, hn_buf, raw_buf, nrm_buf, qh_bufs, sc_bufs, sw_bufs, acc_bufs,
+                copy_k, wnorm_d_k, wnorm_hd_k, mv_k, rope_k,
+                sc_mv_k, mask_k, softmax_k, tz_k, tr_k, tf_k):
+        barrier.wait_for_value(1)
+        mask_len = mask_src.read()
+
+        # step 1: rebuild cur and n_in from D/HD chunks, then hn = weighted_RMSNorm(cur, n_in).
+        for i in range(N_MISC_CHUNKS):
+            ch = misc_c.acquire(1)
+            copy_k(cur_buf, ch, HD, i * HD)
+            misc_c.release(1)
+        for i in range(N_MISC_CHUNKS):
+            ch = misc_c.acquire(1)
+            copy_k(nin_buf, ch, HD, i * HD)
+            misc_c.release(1)
+        wnorm_d_k(cur_buf, nin_buf, hn_buf, epsilon)
+
+        # step 2: n_qn, n_kn, ang -- read once per head, so acquired once and held.
+        w3 = misc_c.acquire(3)
+        nqn_t, nkn_t, ang_t = w3[0], w3[1], w3[2]
+
+        # step 3: this core's gqa query heads. They stay in L1 -- this is the whole point; today
+        # `q` is drained to DDR and read back by the scores GEMV eight times over.
+        for g in range(gqa):
+            for j in range_(N_W_TILES):
+                row_off = index.casts(T.i32(), j) * tsi
+                wt = stream_c.acquire(1)
+                mv_k(tsi, row_off, wt, hn_buf, raw_buf)
+                stream_c.release(1)
+            wnorm_hd_k(raw_buf, nqn_t, nrm_buf, epsilon)
+            rope_k(nrm_buf, ang_t, qh_bufs[g], HD)
+
+        # step 4: this core's k head, RoPE'd straight into the drain tile that appends it.
+        kt = out_p.acquire(1)
+        for j in range_(N_W_TILES):
+            row_off = index.casts(T.i32(), j) * tsi
+            wt = stream_c.acquire(1)
+            mv_k(tsi, row_off, wt, hn_buf, raw_buf)
+            stream_c.release(1)
+        wnorm_hd_k(raw_buf, nkn_t, nrm_buf, epsilon)
+        rope_k(nrm_buf, ang_t, kt, HD)
+        out_p.release(1)
+
+        # step 5: this core's v head -- no norm, no RoPE, so the matvec writes the drain tile.
+        vt = out_p.acquire(1)
+        for j in range_(N_W_TILES):
+            row_off = index.casts(T.i32(), j) * tsi
+            wt = stream_c.acquire(1)
+            mv_k(tsi, row_off, wt, hn_buf, vt)
+            stream_c.release(1)
+        out_p.release(1)
+        misc_c.release(3)
+
+        # step 6: scores. One A tile serves BOTH query heads out of L1 -- the group reuse that
+        # gemv's batch_group buys with an access pattern is free here, because the two heads that
+        # share this kv head are on the same core.
+        for i in range_(N_KV_CHUNKS):
+            row_off = index.casts(T.i32(), i) * rpc
+            at = stream_c.acquire(1)
+            for g in range(gqa):
+                sc_mv_k(rpc, row_off, at, qh_bufs[g], sc_bufs[g])
+            stream_c.release(1)
+
+        # step 7: softmax over a row this core produced. No exchange: the crossbar that forced
+        # sc/sw through DDR existed only because scores and softmax disagreed about columns.
+        for g in range(gqa):
+            mask_k(sc_bufs[g], mask_len, S)
+            softmax_k(sc_bufs[g], sw_bufs[g], S)
+
+        # step 8: context, transposed-A over this core's V head.
+        for g in range(gqa):
+            tz_k(1, acc_bufs[g])
+        for i in range_(N_KV_CHUNKS):
+            w_off = index.casts(T.i32(), i) * rpc
+            at = stream_c.acquire(1)
+            for g in range(gqa):
+                tr_k(rpc, 1, S, w_off, at, sw_bufs[g], acc_bufs[g])
+            stream_c.release(1)
+        for g in range(gqa):
+            ct = out_p.acquire(1)
+            tf_k(1, acc_bufs[g], ct)
+            out_p.release(1)
+
+    workers = []
+    for c in range(N):
+        workers.append(
+            Worker(
+                core_fn,
+                [
+                    misc_of.cons(), stream_ofs[c].cons(), out_ofs[c].prod(),
+                    mask_param, barriers[c],
+                    Buffer(D_ty, name=f"{fifo_prefix}cur_{c}"), Buffer(D_ty, name=f"{fifo_prefix}nin_{c}"),
+                    Buffer(D_ty, name=f"{fifo_prefix}hn_{c}"),
+                    Buffer(HD_ty, name=f"{fifo_prefix}raw_{c}"), Buffer(HD_ty, name=f"{fifo_prefix}nrm_{c}"),
+                    [Buffer(HD_ty, name=f"{fifo_prefix}qh_{c}_{g}") for g in range(gqa)],
+                    [Buffer(SROW_ty, name=f"{fifo_prefix}sc_{c}_{g}") for g in range(gqa)],
+                    [Buffer(SROW_ty, name=f"{fifo_prefix}sw_{c}_{g}") for g in range(gqa)],
+                    [Buffer(ACC_ty, name=f"{fifo_prefix}acc_{c}_{g}") for g in range(gqa)],
+                    copy_kernel, wnorm_d_kernel, wnorm_hd_kernel, mv_kernel, rope_kernel,
+                    sc_mv_kernel, mask_kernel, softmax_kernel, tz_kernel, tr_kernel, tf_kernel,
+                ],
+                stack_size=stack_size,
+            )
+        )
+
+    def sequence(*seq_args):
+        if norms_packed:
+            (cur, norms, wqkv, ang, kc, vc, cx, misc_p, stream_ps, out_cs) = seq_args
+            nin_src, nqn_src, nkn_src = (norms, NORMS, 0), (norms, NORMS, D), (norms, NORMS, D + HD)
+        else:
+            (cur, nin, wqkv, nqn, nkn, ang, kc, vc, cx,
+             misc_p, stream_ps, out_cs) = seq_args
+            nin_src, nqn_src, nkn_src = (nin, D, 0), (nqn, HD, 0), (nkn, HD, 0)
+        # THREE task groups, and the split is forced rather than chosen. A group boundary is a hard
+        # barrier (Runtime.finish_task_group awaits at group CLOSE), and the invariant is
+        # swiglu_mlp_dp's, stated one-directionally in time: every task in group k must be
+        # reachable by the core using only groups <= k.
+        #   tg1  the core's inputs up to the point it produces anything.
+        #   tg2  the K/V append. It MUST close before tg3: the scores read this token's own row
+        #        back out of the cache, so a merged group would read a stale one.
+        #   tg3  the cache streams and the context drains. Fills precede drains inside ONE group,
+        #        which is qkv_head_dp's own load-bearing shape -- splitting them deadlocks a core
+        #        that interleaves input tiles with output rounds.
+        # `wait=True` everywhere: a bare finish() with no waited task lowers to dma_free_task,
+        # which recycles BD IDs at COMPILE time and emits no hardware wait. BD pools are per shim
+        # TILE and shared across every objectFIFO mapped to it, so a later fill can reprogram a
+        # descriptor whose transfer is still in flight and desync a lock count.
+        sync_parameters()
+        for c in range(N):
+            barriers[c].set(1)
+
+        tg1 = TaskGroup()
+        misc_p.fill(cur, _flat_tap(D, D), wait=True, group=tg1)
+        for buf, total, off, n in ((*nin_src, D), (*nqn_src, HD), (*nkn_src, HD)):
+            misc_p.fill(buf, _flat_tap(total, n, off), wait=True, group=tg1)
+        misc_p.fill(ang, _flat_tap(HD, HD), wait=True, group=tg1)
+        for c in range(N):
+            # The core consumes its heads in ONE order -- gqa query heads, then K, then V -- and
+            # the layout decides whether that is one run or three. See `wqkv_head_major`.
+            if wqkv_head_major:
+                runs = [(c * (gqa + 2) * HD, (gqa + 2) * HD)]
+            else:
+                runs = [(gqa * c * HD, gqa * HD),                # q heads gqa*c .. gqa*c+gqa
+                        ((Hq + c) * HD, HD),                     # k head c
+                        ((Hq + Hkv + c) * HD, HD)]               # v head c
+            for off, rows in runs:
+                stream_ps[c].fill(
+                    wqkv, _flat_tap(TOT * D, rows * D, off * D), wait=True, group=tg1
+                )
+        tg1.finish()
+
+        tg2 = TaskGroup()
+        for c in range(N):
+            # [head][n_past][HD]: the head term is static, the position term is `kv_off` (element
+            # units) patched into the BD base address per dispatch -- unchanged from the
+            # StridedCopy this ultimately replaces, so the cache layout and the host's parameter
+            # write are both untouched.
+            for cache in (kc, vc):
+                out_cs[c].drain(
+                    cache, _flat_tap(Hkv * S * HD, HD, c * S * HD),
+                    wait=True, group=tg2, offset_parameter=kv_off_param,
+                )
+        tg2.finish()
+
+        tg3 = TaskGroup()
+        for c in range(N):
+            for cache in (kc, vc):
+                stream_ps[c].fill(
+                    cache, _flat_tap(Hkv * S * HD, S * HD, c * S * HD), wait=True, group=tg3
+                )
+        for c in range(N):
+            for g in range(gqa):
+                out_cs[c].drain(
+                    cx, _flat_tap(QD, HD, (gqa * c + g) * HD), wait=True, group=tg3
+                )
+        tg3.finish()
+
+    l3_types = ([D_ty, NORMS_L3_ty, W_L3_ty, HD_ty, KV_L3_ty, KV_L3_ty, CX_L3_ty] if norms_packed
+                else [D_ty, D_ty, W_L3_ty, HD_ty, HD_ty, HD_ty, KV_L3_ty, KV_L3_ty, CX_L3_ty])
+    handles = [misc_of.prod(),
+               [of.prod() for of in stream_ofs], [of.cons() for of in out_ofs]]
+    # `parts_only` hands the pieces to a caller that is building a LARGER aie.device out of this
+    # half and another -- see decode_layer_dp. Nothing about the half changes; the caller supplies
+    # `fifo_prefix` and `func_prefix` so the two halves' fifo names and kernel symbols stay
+    # disjoint in the one device-wide symbol table, and concatenates the sequences.
+    if parts_only:
+        return dict(workers=workers, seq=sequence, l3_types=l3_types, handles=handles)
+
+    rt = Runtime(sequence, l3_types + handles)
+
+    prog = Program(dev, rt, workers=workers)
+    maybe_enable_trace(prog, trace_size, workers)
+    return prog.resolve_program()
