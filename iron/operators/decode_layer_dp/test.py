@@ -18,10 +18,70 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from iron.common import AIEContext
 from iron.operators.decode_layer_dp.op import DecodeLayerDataParallel
 
 PROGRAM_MEM_BYTES = 0x4000
+
+# Qwen3-0.6B decode shapes, shared by every device-free test below.
+_D, _FF, _HD, _HQ, _HKV = 1024, 3072, 128, 16, 8
+
+
+def _op(max_seq=2048, **kw):
+    return DecodeLayerDataParallel(D=_D, FF=_FF, HD=_HD, Hq=_HQ, Hkv=_HKV, max_seq=max_seq,
+                                   attn_cols=8, mlp_cols=4, **kw)
+
+
+# kv_alloc SIZES THE CACHE, not the window: max_seq stays what the attention math iterates (sc/sw,
+# the KV-chunk loop, the mask), kv_alloc only sizes kc/vc and the per-head stride -- same split as
+# gemv's alloc_M/tmatvec's alloc_K, one level up.
+def test_kv_alloc_sizes_the_cache_not_the_window():
+    spec = _op(max_seq=256, kv_alloc=4096).get_arg_spec()
+    assert spec[4].shape == (_HKV * 4096 * _HD,), f"kc must follow kv_alloc, got {spec[4].shape}"
+    assert spec[5].shape == (_HKV * 4096 * _HD,), f"vc must follow kv_alloc, got {spec[5].shape}"
+
+
+def test_kv_alloc_none_is_the_old_cache_shape():
+    """The default must not move: kv_alloc=None and kv_alloc==max_seq both leave kc/vc sized by
+    max_seq, exactly as before this field existed."""
+    a = _op(kv_alloc=None).get_arg_spec()[4].shape
+    b = _op().get_arg_spec()[4].shape
+    c = _op(kv_alloc=2048).get_arg_spec()[4].shape
+    assert a == b == c == (_HKV * 2048 * _HD,), a
+
+
+def test_kv_alloc_below_max_seq_is_refused():
+    with pytest.raises(ValueError, match="kv_alloc"):
+        _op(kv_alloc=1024)  # < max_seq=2048
+
+
+def test_kv_block_size_must_divide_kv_alloc():
+    with pytest.raises(ValueError, match="kv_block_size"):
+        _op(kv_alloc=4096, kv_block_size=300)
+
+
+def test_kv_alloc_windowed_does_not_share_a_name_with_the_plain_design():
+    """A cached plain build must not be able to satisfy a wide-cache/blocked op (see the `name`
+    override on DecodeLayerDataParallel)."""
+    plain = _op().name
+    wide = _op(kv_alloc=4096).name
+    assert wide != plain, f"wide-cache design shares an artifact name with the plain one: {plain}"
+    assert "kva4096" in wide, wide
+    # kv_alloc == max_seq is the same design as None, so it must NOT perturb the stable name.
+    assert _op(kv_alloc=2048).name == plain
+
+    blocked = _op(max_seq=256, kv_alloc=16384, kv_block_size=128).name
+    assert "kvblk128" in blocked, blocked
+
+
+def test_default_mlir_is_byte_identical():
+    """kv_alloc/kv_block_size unset (or set to their own default value) must not perturb one byte
+    of the emitted MLIR -- the whole point of repr=False plus the None-default convention."""
+    plain = _op().get_mlir_artifact().generator()
+    explicit = _op(kv_alloc=2048, kv_block_size=2048).get_mlir_artifact().generator()
+    assert plain == explicit
 
 
 def main():

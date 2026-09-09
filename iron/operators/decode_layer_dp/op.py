@@ -65,6 +65,18 @@ class DecodeLayerDataParallel(MLIROperator):
     weight_depth: int = field(default=2, repr=False)
     tile_rows_gu: int | None = field(default=None, repr=False)
     wqkv_head_major: bool = False
+    # Cache CAPACITY, when it differs from the attention WINDOW (`max_seq`). None (default) keeps
+    # them equal -- today's behaviour, byte for byte. `max_seq` stays what sizes the compute (sc/sw,
+    # the KV-chunk loop, the mask); `kv_alloc` sizes the KV cache buffers and the per-head stride,
+    # so a wide RESIDENT cache can be read through a narrow window -- one level up from gemv's
+    # alloc_M / tmatvec's alloc_K. repr=False + the `name` override below, matching that convention.
+    kv_alloc: int | None = field(default=None, repr=False)
+    # BLOCKED KV-cache storage: `kv_alloc` positions stored as `kv_alloc // kv_block_size` BLOCKS of
+    # `kv_block_size` positions, Hkv heads interleaved every block, instead of one `kv_alloc`-
+    # position slab per head. None (default) is one block -- byte-identical to the flat layout.
+    # Same meaning as gemv/tmatvec's `block_size`, one level up. See attn_block_dp/design.py and
+    # iron.common.kv_layout (KVLayout), the single owner of the offset/stride formulas this uses.
+    kv_block_size: int | None = field(default=None, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -83,6 +95,24 @@ class DecodeLayerDataParallel(MLIROperator):
             raise ValueError(
                 f"attention places one KV head per core: Hkv ({self.Hkv}) must equal attn_cols "
                 f"({self.attn_cols})"
+            )
+        # kv_alloc/kv_block_size are the two fields this class does NOT delegate to a half's own
+        # operator (attn_block_dp is called as a bare function here, not through
+        # AttnBlockDataParallel), so -- like GEMV's alloc_M/block_size -- they are checked at
+        # construction AND, redundantly, inside attn_block_dp/design.py for a caller that drives
+        # the generator directly.
+        if self.kv_alloc is not None and self.kv_alloc < self.max_seq:
+            raise ValueError(
+                f"kv_alloc ({self.kv_alloc}) must be >= max_seq ({self.max_seq}): it is the cache "
+                f"CAPACITY, not a second window"
+            )
+        _kva = self.max_seq if self.kv_alloc is None else self.kv_alloc
+        if self.kv_block_size is not None and (
+            self.kv_block_size <= 0 or _kva % self.kv_block_size != 0
+        ):
+            raise ValueError(
+                f"kv_block_size ({self.kv_block_size}) must be a positive divisor of kv_alloc "
+                f"({_kva})"
             )
         # L1 IS THE EXCEPTION TO "delegate to the half" above: attn_block_dp's guard lives inside
         # its design.py FUNCTION (an assert), and this file calls that function directly rather
@@ -140,6 +170,20 @@ class DecodeLayerDataParallel(MLIROperator):
             raise ValueError(f"{cores} workers exceeds NPU2's 32 core tiles (4 rows x 8 columns)")
         MLIROperator.__init__(self, context=self.context)
 
+    @property
+    def name(self) -> str:
+        # kv_alloc/kv_block_size are repr=False so the default path's name is unchanged, but a
+        # wide-cache or blocked design must not share an artifact name with the plain one at the
+        # same max_seq: both would emit the same .mlir/.xclbin, and in a shared build dir a cached
+        # plain build could then silently satisfy the windowed/blocked op. Mirrors gemv/op.py's
+        # alloc_M/block_size suffixes.
+        base = super().name
+        if self.kv_alloc is not None and self.kv_alloc != self.max_seq:
+            base = f"{base}_kva{self.kv_alloc}"
+        if self.kv_block_size is not None and self.kv_block_size != (self.kv_alloc or self.max_seq):
+            base = f"{base}_kvblk{self.kv_block_size}"
+        return base
+
     def get_mlir_artifact(self):
         return PythonGeneratedMLIRArtifact(
             f"{self.name}.mlir",
@@ -157,6 +201,8 @@ class DecodeLayerDataParallel(MLIROperator):
                     "weight_depth": self.weight_depth,
                     "tile_rows_gu": self.tile_rows_gu,
                     "wqkv_head_major": self.wqkv_head_major,
+                    "kv_alloc": self.kv_alloc,
+                    "kv_block_size": self.kv_block_size,
                 },
             ),
         )
@@ -215,7 +261,10 @@ class DecodeLayerDataParallel(MLIROperator):
     def get_arg_spec(self):
         D, FF, HD, Hq, Hkv, S = self.D, self.FF, self.HD, self.Hq, self.Hkv, self.max_seq
         QD, KVD = Hq * HD, Hkv * HD
-        cache = Hkv * S * HD
+        # kc/vc are sized by the cache CAPACITY, not the attention window: None (default) keeps
+        # them equal, byte for byte -- see attn_block_dp/design.py's KV_ALLOC.
+        KV_ALLOC = S if self.kv_alloc is None else self.kv_alloc
+        cache = Hkv * KV_ALLOC * HD
         # Wo carries the fused-o overlap padding: swiglu_mlp_dp reads ceil(D_PER_CORE/TSI_O) full
         # TSI_O-row tiles per core, so its last core's window runs past Wo's D real rows.
         tsi_gu = self.tile_rows_gu or 6
