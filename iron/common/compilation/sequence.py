@@ -14,6 +14,8 @@ from pathlib import Path
 from aie import ir
 from aie.dialects import aie, aiex, arith, memref
 from aie.extras.context import mlir_mod_ctx
+from aie.utils.trace import get_trace_slices
+import ml_dtypes
 
 from typing import Any
 
@@ -67,6 +69,17 @@ def element_size_bytes(ty: ir.Type) -> int:
 # ##########################################################################
 
 
+def trace_buffer_size(mlir_text: str) -> int:
+    """Bytes of the fused trace buffer the dispatched sequence takes.
+
+    `-aie-fuse-trace-buffers` gives the sequence one buffer covering every design
+    it configures, and records the split on the sequence. Returns 0 for an
+    untraced build.
+    """
+    slices = get_trace_slices(mlir_text)
+    return max((s["offset"] + s["size"] for s in slices), default=0)
+
+
 class SequenceMLIRArtifact(MLIRArtifact):
     def __init__(
         self,
@@ -76,6 +89,7 @@ class SequenceMLIRArtifact(MLIRArtifact):
         subbuffer_layout: dict[str, tuple[str, int, int]],
         buffer_sizes: tuple[int, int, int],
         slice_info: dict[str, tuple[str, int, int]] | None = None,
+        trace_size: int = 0,
     ) -> None:
         dependencies = list(operator_mlir_map.values())
         super().__init__(filename, dependencies)
@@ -84,6 +98,8 @@ class SequenceMLIRArtifact(MLIRArtifact):
         self.subbuffer_layout = subbuffer_layout
         self.buffer_sizes = buffer_sizes
         self.slice_info = slice_info or {}
+        # Bytes of trace buffer per runlist step, 0 for an untraced build.
+        self.trace_size = trace_size
 
 
 # Helper Functions
