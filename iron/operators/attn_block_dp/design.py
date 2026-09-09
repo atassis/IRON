@@ -154,6 +154,9 @@ def attn_block_dp(
     trace_size=0,
     weight_depth=2,
     wqkv_head_major=False,
+    fifo_prefix="",
+    parts_only=False,
+    norms_packed=False,
 ):
     """`func_prefix` is not optional once this design is placed in an OperatorSequence -- see
     gemv/design.py's identical parameter. N = n_aie_cols, one core per KV HEAD.
@@ -217,6 +220,13 @@ def attn_block_dp(
     SROW_ty = np.ndarray[(S,), np.dtype[BF16]]
     ACC_ty = np.ndarray[(HD,), np.dtype[np.float32]]
     W_L3_ty = np.ndarray[(TOT * D,), np.dtype[BF16]]
+    # PACKED NORM GAINS. n_in, n_qn and n_kn are three STATIC weight vectors; `ang` is not (the
+    # host writes the RoPE angle row per token), so it stays its own argument. Packing the three
+    # is a build-time concat of blobs the generator already emits, exactly as Wqkv is a concat of
+    # Wq/Wk/Wv -- and it exists because aiecc caps a device at 16 host buffer arguments
+    # (kMaxHostBOs, tools/aiecc/SidecarFiles.h), which a whole fused LAYER reaches at 17.
+    NORMS = D + 2 * HD
+    NORMS_L3_ty = np.ndarray[(NORMS,), np.dtype[BF16]]
     KV_L3_ty = np.ndarray[(Hkv * S * HD,), np.dtype[BF16]]
     CX_L3_ty = np.ndarray[(QD,), np.dtype[BF16]]
 
@@ -264,9 +274,9 @@ def attn_block_dp(
         f"{func_prefix}taccum_finish_bf16", CORE_ARCHIVE, [np.int32, ACC_ty, HD_ty]
     )
 
-    misc_of = ObjectFifo(HD_ty, name="misc", depth=3)
-    stream_ofs = [ObjectFifo(TILE_ty, name=f"stream_{c}", depth=weight_depth) for c in range(N)]
-    out_ofs = [ObjectFifo(HD_ty, name=f"out_{c}", depth=2) for c in range(N)]
+    misc_of = ObjectFifo(HD_ty, name=f"{fifo_prefix}misc", depth=3)
+    stream_ofs = [ObjectFifo(TILE_ty, name=f"{fifo_prefix}stream_{c}", depth=weight_depth) for c in range(N)]
+    out_ofs = [ObjectFifo(HD_ty, name=f"{fifo_prefix}out_{c}", depth=2) for c in range(N)]
 
     barriers = [WorkerRuntimeBarrier() for _ in range(N)]
 
@@ -362,13 +372,13 @@ def attn_block_dp(
                 [
                     misc_of.cons(), stream_ofs[c].cons(), out_ofs[c].prod(),
                     mask_param, barriers[c],
-                    Buffer(D_ty, name=f"cur_{c}"), Buffer(D_ty, name=f"nin_{c}"),
-                    Buffer(D_ty, name=f"hn_{c}"),
-                    Buffer(HD_ty, name=f"raw_{c}"), Buffer(HD_ty, name=f"nrm_{c}"),
-                    [Buffer(HD_ty, name=f"qh_{c}_{g}") for g in range(gqa)],
-                    [Buffer(SROW_ty, name=f"sc_{c}_{g}") for g in range(gqa)],
-                    [Buffer(SROW_ty, name=f"sw_{c}_{g}") for g in range(gqa)],
-                    [Buffer(ACC_ty, name=f"acc_{c}_{g}") for g in range(gqa)],
+                    Buffer(D_ty, name=f"{fifo_prefix}cur_{c}"), Buffer(D_ty, name=f"{fifo_prefix}nin_{c}"),
+                    Buffer(D_ty, name=f"{fifo_prefix}hn_{c}"),
+                    Buffer(HD_ty, name=f"{fifo_prefix}raw_{c}"), Buffer(HD_ty, name=f"{fifo_prefix}nrm_{c}"),
+                    [Buffer(HD_ty, name=f"{fifo_prefix}qh_{c}_{g}") for g in range(gqa)],
+                    [Buffer(SROW_ty, name=f"{fifo_prefix}sc_{c}_{g}") for g in range(gqa)],
+                    [Buffer(SROW_ty, name=f"{fifo_prefix}sw_{c}_{g}") for g in range(gqa)],
+                    [Buffer(ACC_ty, name=f"{fifo_prefix}acc_{c}_{g}") for g in range(gqa)],
                     copy_kernel, wnorm_d_kernel, wnorm_hd_kernel, mv_kernel, rope_kernel,
                     sc_mv_kernel, mask_kernel, softmax_kernel, tz_kernel, tr_kernel, tf_kernel,
                 ],
@@ -376,7 +386,14 @@ def attn_block_dp(
             )
         )
 
-    def sequence(cur, nin, wqkv, nqn, nkn, ang, kc, vc, cx, misc_p, stream_ps, out_cs):
+    def sequence(*seq_args):
+        if norms_packed:
+            (cur, norms, wqkv, ang, kc, vc, cx, misc_p, stream_ps, out_cs) = seq_args
+            nin_src, nqn_src, nkn_src = (norms, NORMS, 0), (norms, NORMS, D), (norms, NORMS, D + HD)
+        else:
+            (cur, nin, wqkv, nqn, nkn, ang, kc, vc, cx,
+             misc_p, stream_ps, out_cs) = seq_args
+            nin_src, nqn_src, nkn_src = (nin, D, 0), (nqn, HD, 0), (nkn, HD, 0)
         # THREE task groups, and the split is forced rather than chosen. A group boundary is a hard
         # barrier (Runtime.finish_task_group awaits at group CLOSE), and the invariant is
         # swiglu_mlp_dp's, stated one-directionally in time: every task in group k must be
@@ -397,9 +414,8 @@ def attn_block_dp(
 
         tg1 = TaskGroup()
         misc_p.fill(cur, _flat_tap(D, D), wait=True, group=tg1)
-        misc_p.fill(nin, _flat_tap(D, D), wait=True, group=tg1)
-        misc_p.fill(nqn, _flat_tap(HD, HD), wait=True, group=tg1)
-        misc_p.fill(nkn, _flat_tap(HD, HD), wait=True, group=tg1)
+        for buf, total, off, n in ((*nin_src, D), (*nqn_src, HD), (*nkn_src, HD)):
+            misc_p.fill(buf, _flat_tap(total, n, off), wait=True, group=tg1)
         misc_p.fill(ang, _flat_tap(HD, HD), wait=True, group=tg1)
         for c in range(N):
             # The core consumes its heads in ONE order -- gqa query heads, then K, then V -- and
@@ -442,14 +458,18 @@ def attn_block_dp(
                 )
         tg3.finish()
 
-    rt = Runtime(
-        sequence,
-        [
-            D_ty, D_ty, W_L3_ty, HD_ty, HD_ty, HD_ty, KV_L3_ty, KV_L3_ty, CX_L3_ty,
-            misc_of.prod(),
-            [of.prod() for of in stream_ofs], [of.cons() for of in out_ofs],
-        ],
-    )
+    l3_types = ([D_ty, NORMS_L3_ty, W_L3_ty, HD_ty, KV_L3_ty, KV_L3_ty, CX_L3_ty] if norms_packed
+                else [D_ty, D_ty, W_L3_ty, HD_ty, HD_ty, HD_ty, KV_L3_ty, KV_L3_ty, CX_L3_ty])
+    handles = [misc_of.prod(),
+               [of.prod() for of in stream_ofs], [of.cons() for of in out_ofs]]
+    # `parts_only` hands the pieces to a caller that is building a LARGER aie.device out of this
+    # half and another -- see decode_layer_dp. Nothing about the half changes; the caller supplies
+    # `fifo_prefix` and `func_prefix` so the two halves' fifo names and kernel symbols stay
+    # disjoint in the one device-wide symbol table, and concatenates the sequences.
+    if parts_only:
+        return dict(workers=workers, seq=sequence, l3_types=l3_types, handles=handles)
+
+    rt = Runtime(sequence, l3_types + handles)
 
     prog = Program(dev, rt, workers=workers)
     maybe_enable_trace(prog, trace_size, workers)

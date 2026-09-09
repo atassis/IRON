@@ -166,7 +166,7 @@ def _split_run(total, lim=1023, gran=2):
 def my_swiglu_mlp_dp(
     dev, D, FF, epsilon=1e-5, stack_size=0x800, func_prefix="", n_aie_cols=8, n_aie_rows=1,
     QD=None, fuse_o=False, trace_size=0, weight_dtype="bf16", group_size=0,
-    weight_depth=2, tile_rows_gu=None,
+    weight_depth=2, tile_rows_gu=None, fifo_prefix="", parts_only=False,
 ):
     """`func_prefix` is required (not optional) by iron.common.sequence.FusedDispatch the moment
     this design is placed in an OperatorSequence -- see gemv/design.py's identical parameter for
@@ -353,13 +353,13 @@ def my_swiglu_mlp_dp(
     # does not know or care which path built them. fuse_o adds no new shim-facing ObjectFifo: Wo
     # rides the SAME weight_ofs/gweight_ps channel as Wg/Wu/Wd, and `a`'s all-gather rides the
     # SAME out_ofs/gout_cs channel gh's all-gather already uses (see module docstring). ----
-    misc_of = ObjectFifo(D_ty, name="misc", depth=2)
+    misc_of = ObjectFifo(D_ty, name=f"{fifo_prefix}misc", depth=2)
     weight_ofs = [None] * N
     out_ofs = [None] * N
     if n_aie_rows == 1:
         for c in range(N):
-            weight_ofs[c] = ObjectFifo(WTILE_ty, name=f"weight_{c}", depth=weight_depth)
-            out_ofs[c] = ObjectFifo(DPC_ty, name=f"out_{c}", depth=2)
+            weight_ofs[c] = ObjectFifo(WTILE_ty, name=f"{fifo_prefix}weight_{c}", depth=weight_depth)
+            out_ofs[c] = ObjectFifo(DPC_ty, name=f"{fifo_prefix}out_{c}", depth=2)
         group_weight_ofs = weight_ofs  # sequence() fills/drains these directly, one per "group"
         group_out_ofs = out_ofs
     else:
@@ -369,18 +369,18 @@ def my_swiglu_mlp_dp(
         group_weight_ofs = []
         group_out_ofs = []
         for g in range(n_aie_cols):
-            gw = ObjectFifo(GROUP_WTILE_ty, name=f"weight_g{g}", depth=weight_depth)
+            gw = ObjectFifo(GROUP_WTILE_ty, name=f"{fifo_prefix}weight_g{g}", depth=weight_depth)
             sub_w = gw.cons().split(
                 [r * WTILE_UNITS for r in range(n_aie_rows)],
                 obj_types=[WTILE_ty] * n_aie_rows,
-                names=[f"weight_{g}_{r}" for r in range(n_aie_rows)],
+                names=[f"{fifo_prefix}weight_{g}_{r}" for r in range(n_aie_rows)],
                 depths=[2] * n_aie_rows,
             )
-            go = ObjectFifo(GROUP_OTILE_ty, name=f"out_g{g}", depth=2)
+            go = ObjectFifo(GROUP_OTILE_ty, name=f"{fifo_prefix}out_g{g}", depth=2)
             sub_o = go.prod().join(
                 [r * D_PER_CORE for r in range(n_aie_rows)],
                 obj_types=[DPC_ty] * n_aie_rows,
-                names=[f"out_{g}_{r}" for r in range(n_aie_rows)],
+                names=[f"{fifo_prefix}out_{g}_{r}" for r in range(n_aie_rows)],
                 depths=[2] * n_aie_rows,
             )
             for r in range(n_aie_rows):
@@ -485,12 +485,12 @@ def my_swiglu_mlp_dp(
 
     workers = []
     for c in range(N):
-        x1_buf = Buffer(D_ty, name=f"x1_{c}")
-        hf_buf = Buffer(D_ty, name=f"hf_{c}")
-        gh_buf = Buffer(FF_ty, name=f"gh_{c}")
-        g_buf = Buffer(FFPC_ty, name=f"g_{c}")
-        u_buf = Buffer(FFPC_ty, name=f"u_{c}")
-        d_buf = Buffer(DPC_ty, name=f"d_{c}")
+        x1_buf = Buffer(D_ty, name=f"{fifo_prefix}x1_{c}")
+        hf_buf = Buffer(D_ty, name=f"{fifo_prefix}hf_{c}")
+        gh_buf = Buffer(FF_ty, name=f"{fifo_prefix}gh_{c}")
+        g_buf = Buffer(FFPC_ty, name=f"{fifo_prefix}g_{c}")
+        u_buf = Buffer(FFPC_ty, name=f"{fifo_prefix}u_{c}")
+        d_buf = Buffer(DPC_ty, name=f"{fifo_prefix}d_{c}")
         core_args = [
             misc_of.cons(), weight_ofs[c].cons(), out_ofs[c].prod(),
             x1_buf, hf_buf, gh_buf, g_buf, u_buf, d_buf,
@@ -499,8 +499,8 @@ def my_swiglu_mlp_dp(
             c,
         ]
         if fuse_o:
-            cx_buf = Buffer(QD_ty, name=f"cx_{c}")
-            a_slice_buf = Buffer(OWIN_ty, name=f"aslice_{c}")
+            cx_buf = Buffer(QD_ty, name=f"{fifo_prefix}cx_{c}")
+            a_slice_buf = Buffer(OWIN_ty, name=f"{fifo_prefix}aslice_{c}")
             core_args += [cx_buf, a_slice_buf, mv_o_kernel, copy_off_cx_kernel, copy_off_a_kernel]
         workers.append(Worker(core_fn, core_args, stack_size=stack_size))
 
@@ -705,6 +705,13 @@ def my_swiglu_mlp_dp(
             misc_of.prod(),
             [of.prod() for of in group_weight_ofs], [of.cons() for of in group_out_ofs],
         ]
+    if parts_only:
+        # See attn_block_dp/design.py's identical hook: hand the pieces to a caller assembling a
+        # larger aie.device. `rt_args` is already [L3 types ..., handles ...]; the split is at -3
+        # (misc producer, the per-group weight producers, the per-group output consumers).
+        return dict(workers=workers, seq=sequence,
+                    l3_types=rt_args[:-3], handles=rt_args[-3:])
+
     rt = Runtime(sequence, rt_args)
 
     prog = Program(dev, rt, workers=workers)
