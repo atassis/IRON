@@ -147,34 +147,104 @@ def my_matvec(
             [np.int32, L1_C_ty],
         )
 
+    MAX_WRAP = 1023
+    MAX_STRIDE = (1 << 20) - 1  # conservative element-stride bound for the wrap dims
+    GRAN_ELEMS = 2  # 4-byte shim granularity / 2-byte bf16 element
+
+    def split_run(run, lim=MAX_WRAP, gran=GRAN_ELEMS):
+        """Factor a contiguous run into (hi, lo), both <= lim and lo a multiple of gran
+        (the address-granularity-aligned inner size), lo maximal. None if no such
+        split exists (caller then falls back to the per-batch path)."""
+        lo_start = (lim // gran) * gran
+        for lo in range(lo_start, 0, -gran):
+            if run % lo == 0 and (run // lo) <= lim:
+                return (run // lo, lo)
+        return None
+
+    A_run, A_bstride = (M // cols) * a_row_width, _AM * a_row_width
+    C_run, C_bstride = (M // cols), M
+    A_split, C_split = split_run(A_run), split_run(C_run)
+    coalesce = (
+        num_batches > 1
+        and num_batches % batch_group == 0
+        and A_bstride <= MAX_STRIDE
+        and C_bstride <= MAX_STRIDE
+        and A_bstride % GRAN_ELEMS == 0
+        and C_bstride % GRAN_ELEMS == 0
+        and A_split is not None
+        and C_split is not None
+    )
+
+    # GROUP REUSE: consume the shared matrix ONCE and run `batch_group` vectors over it, instead of
+    # re-streaming it per group member.
+    #
+    # `batch_group` exists so GQA does not need a `Repeat` op materialising a duplicate KV cache in
+    # DDR. It did save that copy -- and it did NOT save the read: the matrix operand carried an
+    # outer BD dim of `batch_group` at STRIDE 0, and the shim DMA has no cache, so the cache was
+    # physically streamed once per group member. Measured on device: at equal DDR bytes, one matrix
+    # read sixteen times costs the same as sixteen distinct matrices read once (269.3 vs 268.0 us),
+    # so the repeat was paid in full. On the Qwen3-0.6B decode that is 117.4 MB/token.
+    #
+    # Inverting the loop nesting -- A outer, the group inner -- removes it, and removes the
+    # permutation with it: the [group, matrix] ordering was FORCED by the repeat (only the
+    # outermost BD dim may carry a zero stride), and it is what made B need a 4-D wrap-capped tap.
+    # With the matrix held, iteration order is plain matrix-major, output lands at
+    # `q = batch_group*matrix + member` by construction, and A, B and C are all flat again.
+    #
+    # Gated on `coalesce` only to keep the change to one path: without it the per-batch fallback
+    # would need its own restructuring for A and C to iterate different counts. That combination
+    # keeps the old repeat, which is correct and slower, and shows up as unchanged DDR bytes in
+    # `decode_ddr_bytes.py` rather than as silence.
+    group_reuse = batch_group > 1 and coalesce
+    n_vec = batch_group if group_reuse else 1
+
+    # A's depth follows n_vec too, and it is NOT cosmetic. Reusing the tile means the core spends
+    # n_vec matvec calls on each one, so a depth-2 fifo lets the DMA run only one tile ahead of a
+    # core that now takes n_vec times as long to drain it -- and the stream stalls. Measured on
+    # device at depth 2: the fix halved the DDR bytes (8.487 -> 4.293 MB on the scores arm) and
+    # halved the achieved bandwidth with them (44.3 -> 23.1 GB/s), for a net ~zero. The prefetch
+    # window has to grow with the work per tile. Costs 1 KB of L1 per extra slot on that arm.
     A_L3L1_fifos = [
-        ObjectFifo(L1_A_ty, name=f"A_L3L1_{i}", depth=2) for i in range(cols)
+        ObjectFifo(L1_A_ty, name=f"A_L3L1_{i}", depth=2 * n_vec) for i in range(cols)
     ]
+    # B and C likewise: the core holds n_vec vectors and output tiles at once. At n_vec == 1 all
+    # three are 2, 1 and 2 -- exactly as before.
     B_L3L1_fifos = [
-        ObjectFifo(L1_B_ty, name=f"B_L3L1_{i}", depth=1) for i in range(cols)
+        ObjectFifo(L1_B_ty, name=f"B_L3L1_{i}", depth=n_vec) for i in range(cols)
     ]
     C_L1L3_fifos = [
-        ObjectFifo(L1_C_ty, name=f"C_L1L3_{i}", depth=2) for i in range(cols)
+        ObjectFifo(L1_C_ty, name=f"C_L1L3_{i}", depth=2 * n_vec) for i in range(cols)
     ]
 
     def core_body(A_L3L1_fifo, B_L3L1_fifo, C_L1L3_fifo, matvec, gelu_kernel=None):
         one_idx = index.constant(1)
         for _ in range_(0xFFFFFFFF):  # batch dim handled as part of this loop
-            b = B_L3L1_fifo.acquire(1)
+            b = B_L3L1_fifo.acquire(n_vec)
             # The kernel function computes m output rows; each core is responsible for (M/cols) output rows, so we need to call the kernel (M/cols)/m times.
             for i_idx in range_(M // m_output // cols):
-                c = C_L1L3_fifo.acquire(1)
+                c = C_L1L3_fifo.acquire(n_vec)
                 i_i32 = index.casts(T.i32(), i_idx)
                 for j_idx in range_(m_output // m_input):
                     j_i32 = index.casts(T.i32(), j_idx)
                     output_row_offset = j_i32 * m_input
                     a = A_L3L1_fifo.acquire(1)
-                    matvec(m_input, output_row_offset, a, b, c)
+                    # The A tile is acquired ONCE and every vector in the group runs over it. The
+                    # group is a python-level unroll because batch_group is a build constant, and
+                    # because `b`/`c` are indexable views only when more than one was acquired.
+                    if n_vec == 1:
+                        matvec(m_input, output_row_offset, a, b, c)
+                    else:
+                        for g in range(n_vec):
+                            matvec(m_input, output_row_offset, a, b[g], c[g])
                     A_L3L1_fifo.release(1)
                 if gelu_kernel is not None:
-                    gelu_kernel(m_output, c)
-                C_L1L3_fifo.release(1)
-            B_L3L1_fifo.release(1)
+                    if n_vec == 1:
+                        gelu_kernel(m_output, c)
+                    else:
+                        for g in range(n_vec):
+                            gelu_kernel(m_output, c[g])
+                C_L1L3_fifo.release(n_vec)
+            B_L3L1_fifo.release(n_vec)
 
     workers = [
         Worker(
@@ -193,16 +263,19 @@ def my_matvec(
     # Distribution pattern for the input matrix A: each AIE core gets a contiguous chunk of rows.
     # The input matrix in DDR is MxK-sized (row-major); each core processes (M/cols)xK-sized matrices in chunks of mxK-sized tiles.
     # The chunking into mxK-sized tiles happens in the ObjectFIFO; the shim puts all data on the stream in sequence.
+    # One tap per DELIVERY of the matrix. Reusing the group means that is once per MATRIX;
+    # otherwise it stays once per batch, which for batch_group>1 is the same matrix twice.
+    n_a_deliveries = n_matrices if group_reuse else num_batches
     A_taps = [
         [
             TensorAccessPattern(
                 tensor_dims=L3_A_ty.__args__[0],
                 offset=col * (M // cols) * a_row_width
-                + (batch // batch_group) * _AM * a_row_width,
+                + (d if group_reuse else d // batch_group) * _AM * a_row_width,
                 sizes=[1, 1, 1, (M // cols) * a_row_width],
                 strides=[0, 0, 0, 1],
             )
-            for batch in range(num_batches)
+            for d in range(n_a_deliveries)
         ]
         for col in range(cols)
     ]
@@ -216,20 +289,6 @@ def my_matvec(
     # vector -- and it reads as 0/8 parity, not as a near miss.
     #
     # At batch_group=1 this is the old flat read: sizes=[1, num_batches, 1, K] with offset m*K.
-    MAX_WRAP = 1023
-    MAX_STRIDE = (1 << 20) - 1  # conservative element-stride bound for the wrap dims
-    GRAN_ELEMS = 2  # 4-byte shim granularity / 2-byte bf16 element
-
-    def split_run(run, lim=MAX_WRAP, gran=GRAN_ELEMS):
-        """Factor a contiguous run into (hi, lo), both <= lim and lo a multiple of gran
-        (the address-granularity-aligned inner size), lo maximal. None if no such
-        split exists (caller then falls back to the per-batch path)."""
-        lo_start = (lim // gran) * gran
-        for lo in range(lo_start, 0, -gran):
-            if run % lo == 0 and (run // lo) <= lim:
-                return (run // lo, lo)
-        return None
-
     # At batch_group=1 keep the ORIGINAL flat one-dimensional read byte for byte: leading 1s make
     # it a plain contiguous transfer whose length is not subject to the 10-bit wrap cap.
     #
@@ -242,7 +301,10 @@ def my_matvec(
     # like a run: op_ctx is gemv(M=head_dim, K=S), and at S=2048 an unsplit K trips
     # "Size 0 exceeds the [0:1023] range". op_scores (K=head_dim=128) never would, which is why the
     # k-only arm built and this one did not.
-    if batch_group == 1:
+    if batch_group == 1 or group_reuse:
+        # Flat, and for group_reuse that is the POINT: the core now consumes vectors in plain batch
+        # order (matrix-major, member-inner), which is the order they already sit in, so the
+        # permuted 4-D tap below -- and its wrap cap on K -- is not needed.
         B_tap = TensorAccessPattern(
             tensor_dims=L3_B_ty.__args__[0], offset=0,
             sizes=[1, 1, 1, num_batches * K], strides=[0, 0, 0, 1],
@@ -273,36 +335,17 @@ def my_matvec(
         for col in range(cols)
     ]
 
-    # Batch coalescing replaces the per-batch unroll with a single iterated BD.
+    # Batch coalescing replaces the per-batch unroll with a single iterated BD. The predicate and
+    # the run splits are computed above, because `group_reuse` depends on them.
     #
-    # Within one batch the run is contiguous (A_run = (M//cols)*K elements).
-    # The batch stride is the full matrix (A_bstride = M*K), so for cols>1 each column
-    # gathers its own slice out of every batch with a gap in between.
-    #
-    # The contiguous run is then split into two wrap dims [run_hi, run_lo] ONLY to fit
-    # the AIE shim's 10-bit (1023) wrap-size cap.
+    # Within one delivery the run is contiguous (A_run = (M//cols)*K elements). The stride between
+    # deliveries is the full matrix (A_bstride = M*K), so for cols>1 each column gathers its own
+    # slice out of every one with a gap in between. The contiguous run is split into two wrap dims
+    # [run_hi, run_lo] ONLY to fit the AIE shim's 10-bit (1023) wrap-size cap.
     #
     # FIXME: pull these shim BD bounds from the MLIR-AIE target model rather than
     # hard-coding them; they live in verifyStridesWraps in
     # https://github.com/Xilinx/mlir-aie/blob/main/lib/Dialect/AIEX/IR/AIEXDialect.cpp
-
-    # a_row_width == K (elements) for bf16, or the packed row-stride (bytes) for a quantized A --
-    # num_batches is asserted ==1 for quantized weight_dtype, so `coalesce` below is always False
-    # on that path and this arithmetic (sized for bf16's GRAN_ELEMS/MAX_STRIDE assumptions) is
-    # never acted on.
-    A_run, A_bstride = (M // cols) * a_row_width, _AM * a_row_width
-    C_run, C_bstride = (M // cols), M
-    A_split, C_split = split_run(A_run), split_run(C_run)
-    coalesce = (
-        num_batches > 1
-        and num_batches % batch_group == 0
-        and A_bstride <= MAX_STRIDE
-        and C_bstride <= MAX_STRIDE
-        and A_bstride % GRAN_ELEMS == 0
-        and C_bstride % GRAN_ELEMS == 0
-        and A_split is not None
-        and C_split is not None
-    )
 
     # The outer dim used to be a dead placeholder (size 1, stride 0). It carries the GROUP now:
     # [group_member, matrix, run_hi, run_lo].
@@ -317,12 +360,13 @@ def my_matvec(
     # At batch_group=1 this is byte-for-byte the original tap: sizes=[1, num_batches, ...],
     # strides=[0, bstride, ...]. A shim BD has exactly four dims and this uses all of them, so a
     # shape whose run needs a third dim cannot coalesce.
-    def coalesced_tap(L3_ty, col_off, split, outer_stride, inner_stride):
+    def coalesced_tap(L3_ty, col_off, split, outer_stride, inner_stride, outer=None, inner=None):
         run_hi, run_lo = split
         return TensorAccessPattern(
             tensor_dims=L3_ty.__args__[0],
             offset=col_off,
-            sizes=[batch_group, n_matrices, run_hi, run_lo],
+            sizes=[batch_group if outer is None else outer,
+                   n_matrices if inner is None else inner, run_hi, run_lo],
             strides=[outer_stride, inner_stride, run_lo, 1],
         )
 
@@ -336,12 +380,18 @@ def my_matvec(
         assert all(f.depth >= 2 for f in A_L3L1_fifos) and all(
             f.depth >= 2 for f in C_L1L3_fifos
         ), "coalesced GEMV wants A/C ObjectFifo depth>=2 for fill/compute overlap"
+        # With the group reused there is no repeat and no permutation: A walks its matrices and C
+        # walks its batches, both plain and both with a dead outer dim.
         A_taps_coalesced = [
-            coalesced_tap(L3_A_ty, col * (M // cols) * K, A_split, 0, A_bstride)
+            coalesced_tap(L3_A_ty, col * (M // cols) * K, A_split, 0, A_bstride,
+                          *((1, n_matrices) if group_reuse else (None, None)))
             for col in range(cols)
         ]
         C_taps_coalesced = [
-            coalesced_tap(L3_C_ty, col * (M // cols), C_split, C_bstride, batch_group * C_bstride)
+            coalesced_tap(L3_C_ty, col * (M // cols), C_split,
+                          0 if group_reuse else C_bstride,
+                          C_bstride if group_reuse else batch_group * C_bstride,
+                          *((1, num_batches) if group_reuse else (None, None)))
             for col in range(cols)
         ]
 
