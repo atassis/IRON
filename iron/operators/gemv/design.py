@@ -148,8 +148,29 @@ def my_matvec(
         )
 
     MAX_WRAP = 1023
-    MAX_STRIDE = (1 << 20) - 1  # conservative element-stride bound for the wrap dims
+    # The shim NOC tile's BD step field is 20 bits -- not a convention, the hardware width:
+    # `AIETargetModel.h::AIE2TargetModel::getDmaBdStepBits` returns 20 for ShimNOCTile (17 for a
+    # MemTile, 13 for a core tile). But the field counts ADDRESS GRANULES, not elements:
+    # `getAddressGenGranularity()` is 32 bits on AIE2/AIE2P, and `getHardwareStridesWraps` scales an
+    # element stride by `elemWidth / addressGranularity` before `verifyStridesWraps` compares it.
+    #
+    # This bound was written in ELEMENTS and compared against the granule field width, which for
+    # bf16 is exactly 2x too strict -- and its own FIXME below predicted it ("pull these shim BD
+    # bounds from the MLIR-AIE target model rather than hard-coding them"). Cost, measured: the
+    # decode's KV cache has a per-head stride of `alloc * head_dim` elements, so at head_dim=128 the
+    # element bound caps the allocation at 8191 where the hardware allows 16383 -- one whole
+    # doubling of the context a wide-allocation decode can address before its reads stop coalescing.
+    MAX_STRIDE_GRANULES = (1 << 20) - 1
     GRAN_ELEMS = 2  # 4-byte shim granularity / 2-byte bf16 element
+    # Elements per granule is a property of the ELEMENT TYPE, and this file hardcodes the bf16 ratio.
+    # A quantized A is i8-typed (4 elements per granule), so the conversion would differ -- but
+    # `num_batches` is asserted ==1 for a non-bf16 weight_dtype, which makes `coalesce` False and
+    # this arithmetic unreachable on that path. Asserted rather than left to a comment.
+    assert dtype_in_str == "bf16" or num_batches == 1, (
+        f"coalescing arithmetic assumes {GRAN_ELEMS} elements/granule (bf16); "
+        f"dtype_in={dtype_in_str} with num_batches={num_batches} would need its own ratio"
+    )
+    MAX_STRIDE = MAX_STRIDE_GRANULES * GRAN_ELEMS
 
     def split_run(run, lim=MAX_WRAP, gran=GRAN_ELEMS):
         """Factor a contiguous run into (hi, lo), both <= lim and lo a multiple of gran
