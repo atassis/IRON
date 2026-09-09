@@ -31,6 +31,96 @@ Calls into the mv.cc kernel code. That kernel computes `m_input` output rows per
 # done from here, and raise this only by BUILDING the larger value rather than by re-deriving it.
 MAX_GROUP_REUSE = 4
 
+# The core's stack and locals, held back from the L1 budget below -- mirrors
+# tmatvec/design.py's L1_HEADROOM_BYTES for the same reason: this tree has twice paid for a
+# kernel frame that silently overwrote the objectFIFO buffers placed above it.
+L1_HEADROOM_BYTES = 4096
+
+
+def l1_budget_bytes(dev):
+    """This core's usable L1, in bytes -- DERIVED from the target model, not a literal.
+
+    tmatvec/design.py's AIE2P_L1_BYTES comment says getLocalMemorySize() is "C++ only" and the
+    Python bindings expose no accessor. That is stale for this checkout:
+    `aie.dialects.aie.get_target_model(int(dev.resolve())).get_local_memory_size()` IS bound
+    (verified 2026-09-09; returns 65536 for npu1, npu2 and every column-count variant of both --
+    core-tile local memory is uniform across the family). Deriving it here means a future core
+    tile with a different size does not silently inherit this chip's number.
+    """
+    from aie.dialects.aie import get_target_model
+
+    return get_target_model(int(dev.resolve())).get_local_memory_size()
+
+
+def l1_footprint_bytes(m_input, m_output, K, a_row_width, itemsize_in, n_vec):
+    """Bytes this design places in one core's L1, by term.
+
+    A, B and C ALL scale with n_vec -- unlike TMatVec's rows_per_chunk, which sizes only its A
+    term, GROUP REUSE (see the block below) holds n_vec vectors/tiles on-core at once, so every
+    FIFO's depth follows it: A at 2*n_vec, B at n_vec, C at 2*n_vec, matching the ObjectFifo()
+    calls below exactly. B and C are always bf16 (2 B/elem); A's itemsize follows weight_dtype --
+    a_row_width is already BYTES for a quantized (packed) row and ELEMENTS for bf16, so
+    itemsize_in (1 or 2, set where a_row_width itself is) makes both cases the same formula.
+    """
+    return (
+        2 * n_vec * m_input * a_row_width * itemsize_in  # A objectfifo
+        + n_vec * K * 2  # B objectfifo, always bf16
+        + 2 * n_vec * m_output * 2  # C objectfifo, always bf16
+    )
+
+
+def largest_fitting_n_vec(m_input, m_output, K, a_row_width, itemsize_in, l1_bytes):
+    """The largest n_vec in [1, MAX_GROUP_REUSE] that FITS, or 0 if even n_vec=1 does not."""
+    ok = [
+        n for n in range(1, MAX_GROUP_REUSE + 1)
+        if l1_footprint_bytes(m_input, m_output, K, a_row_width, itemsize_in, n)
+        + L1_HEADROOM_BYTES <= l1_bytes
+    ]
+    return max(ok) if ok else 0
+
+
+def check_l1_fits(dev, m_input, m_output, K, a_row_width, itemsize_in, n_vec, l1_bytes=None):
+    """Raise-worthy message if the tiling does not FIT, else None.
+
+    K008: the tiling must FIT, not merely divide -- nothing downstream checks it, and a miss
+    surfaces at aiecc as "'aie.tile' op Basic sequential allocation also failed", naming a tile
+    and not a size (ports tmatvec/design.py's check_l1_fits; see that file for the first
+    measurement of this failure mode). Called with the FINAL n_vec -- already declined to 1 by
+    the group_fits_bds gate above if it was going to be -- so unlike that gate's BD-count ceiling,
+    there is no further fallback here: a miss is unconditional and must raise.
+
+    Because A, B and C all scale with n_vec (see l1_footprint_bytes), n_vec=1 is always the best
+    this knob can do -- there is no "blocking term the knob cannot reach" case the way TMatVec's W
+    is independent of rows_per_chunk. So the advice is either the largest n_vec that fits, or,
+    once n_vec=1 itself does not fit, that m_input/m_output/K -- not batch_group -- has to shrink.
+    """
+    budget = l1_bytes if l1_bytes is not None else l1_budget_bytes(dev)
+    used = l1_footprint_bytes(m_input, m_output, K, a_row_width, itemsize_in, n_vec)
+    if used + L1_HEADROOM_BYTES <= budget:
+        return None
+    a = 2 * n_vec * m_input * a_row_width * itemsize_in
+    b = n_vec * K * 2
+    c = 2 * n_vec * m_output * 2
+    terms = f"A {a} + B {b} + C {c}"
+    fits = largest_fitting_n_vec(m_input, m_output, K, a_row_width, itemsize_in, budget)
+    if fits:
+        advice = (
+            f"largest n_vec (batch_group, capped at MAX_GROUP_REUSE={MAX_GROUP_REUSE}) that fits "
+            f"here is {fits}."
+        )
+    else:
+        floor = l1_footprint_bytes(m_input, m_output, K, a_row_width, itemsize_in, 1)
+        advice = (
+            f"NO n_vec fits, not even 1 (no reuse): A+B+C alone total {floor} B. batch_group "
+            f"cannot help, it is already at its floor -- shrink m_input, m_output or K instead."
+        )
+    return (
+        f"GEMV does not fit L1: {used} B ({terms}) + {L1_HEADROOM_BYTES} B headroom exceeds "
+        f"{budget} B at m_input={m_input} m_output={m_output} K={K} a_row_width={a_row_width} "
+        f"n_vec={n_vec}. " + advice
+    )
+
+
 def my_matvec(
     dev,
     cols,
@@ -76,10 +166,14 @@ def my_matvec(
 
     assert M % cols == 0
 
+    # itemsize_in tracks dtype_in's byte width by hand: np.dtype[bfloat16]/np.dtype[np.int8] are
+    # typing GenericAliases at runtime (numpy's __class_getitem__), not real dtype instances, so
+    # neither has a usable .itemsize -- the L1 check below needs the width as a plain int.
     if weight_dtype == "bf16":
         dtype_in = np.dtype[bfloat16]
         dtype_in_str = "bf16"
         a_row_width = K  # elements/row, dtype_in-sized
+        itemsize_in = 2
     else:
         # Group-quantized A: see iron/operators/gemv/quant.py for the exact byte layout
         # (`[n_groups x f32 scale][payload]` per row) and aie_kernels/generic/mv_quant.cc for the
@@ -97,6 +191,7 @@ def my_matvec(
         dtype_in = np.dtype[np.int8]
         dtype_in_str = weight_dtype
         a_row_width = row_stride_bytes(K, group_size, weight_dtype)  # bytes/row, int8-sized
+        itemsize_in = 1
 
     L1_A_ty = np.ndarray[
         (
@@ -269,6 +364,14 @@ def my_matvec(
     if batch_group > 1 and coalesce and not group_fits_bds:
         print(f"[gemv] group_reuse DECLINED: batch_group={batch_group} > the measured-good "
               f"ceiling {MAX_GROUP_REUSE}; falling back to the ungrouped read (M={M} K={K})")
+
+    # K008, the sibling gap this operator had until now: nothing checked that the tiling FITS L1,
+    # only that shapes divide evenly (the asserts at the top of this function). n_vec is FINAL
+    # here -- already declined to 1 above if the BD ceiling was going to decline it -- so raise
+    # rather than print: unlike that decline, an L1 miss has nothing smaller left to fall back to.
+    _msg = check_l1_fits(dev, m_input, m_output, K, a_row_width, itemsize_in, n_vec)
+    if _msg is not None:
+        raise ValueError(_msg)
 
     # A's depth follows n_vec too, and it is NOT cosmetic. Reusing the tile means the core spends
     # n_vec matvec calls on each one, so a depth-2 fifo lets the DMA run only one tile ahead of a

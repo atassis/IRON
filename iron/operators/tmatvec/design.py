@@ -33,8 +33,12 @@ whole rows are 256 B and past it.
 """
 
 
-# AIE2P core-tile local memory. Stated, not derived: the Python bindings expose no accessor
-# (AIETargetModel::getLocalMemorySize() is C++ only). Callers may override per target.
+# AIE2P core-tile local memory. Kept as a fallback default, NOT because it cannot be derived: the
+# claim this comment used to make -- that the Python bindings expose no accessor and
+# AIETargetModel::getLocalMemorySize() is C++ only -- is FALSE on this bindings build. Measured
+# 2026-09-09: `get_target_model(int(dev.resolve())).get_local_memory_size()` returns 65536 for npu1
+# and npu2 and every column variant, and the sibling gemv design now derives its budget that way.
+# A callable that takes a `dev` should ask; this literal is for the paths that have none.
 AIE2P_L1_BYTES = 65536
 # The core's stack and locals. The stack alone defaults to 0x400, and this tree has twice paid for
 # a frame that silently overwrote the objectFIFO buffers placed above it.
