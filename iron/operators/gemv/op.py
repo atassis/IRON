@@ -39,6 +39,12 @@ class GEMV(MLIROperator):
     # buffer size and the batch stride move; the run, the C tile and the core loop all follow M.
     # repr=False + the `name` override below, matching the epilogue/weight_dtype convention.
     alloc_M: int | None = field(default=None, repr=False)
+    # Store A's `alloc_M` rows in BLOCKS of `block_size` rows (n_matrices interleaved every block)
+    # instead of one `alloc_M`-row-per-matrix slab. None (default) is one block -- byte-identical
+    # to the pre-blocking layout. See design.py's block_size docstring for the exact addressing;
+    # this operator stays KV-agnostic, the caller (e.g. gen_llm_decode.py, via
+    # iron.common.kv_layout) is what knows why a particular block_size was chosen.
+    block_size: int | None = field(default=None, repr=False)
     # How many batches share one TaskGroup, i.e. one device-side drain wait, on the per-batch
     # fallback path. 1 is the historical behaviour. Measured on the scores shape at a wide
     # allocation: 16 barriers -> 4 is -20.7% at an IDENTICAL descriptor count, so the fallback's
@@ -78,6 +84,11 @@ class GEMV(MLIROperator):
             raise ValueError(
                 f"alloc_M ({self.alloc_M}) must be >= M ({self.M}): it is the ALLOCATED row "
                 f"count per matrix, not a second window"
+            )
+        _am = self.M if self.alloc_M is None else self.alloc_M
+        if self.block_size is not None and (self.block_size <= 0 or _am % self.block_size != 0):
+            raise ValueError(
+                f"block_size ({self.block_size}) must be a positive divisor of alloc_M ({_am})"
             )
         if self.tile_size_output is None:
             self.tile_size_output = self.tile_size_input
@@ -154,6 +165,9 @@ class GEMV(MLIROperator):
         # the same design as alloc_M=None, so it keeps the stable name.
         if self.alloc_M is not None and self.alloc_M != self.M:
             base = f"{base}_am{self.alloc_M}"
+        # Same reasoning: a blocked A is a different design from the flat one at the same alloc_M.
+        if self.block_size is not None and self.block_size != (self.alloc_M or self.M):
+            base = f"{base}_blk{self.block_size}"
         if self.barrier_chunk != 1:
             base = f"{base}_bc{self.barrier_chunk}"
         return base
@@ -173,6 +187,7 @@ class GEMV(MLIROperator):
             self.num_batches, self.batch_group,
             self.epilogue, self.weight_dtype, self.group_size,
             self.alloc_M, self.kernel_vector_size, self.barrier_chunk,
+            self.block_size,
             self._kernel_link_file,
         ))
 
@@ -212,6 +227,7 @@ class GEMV(MLIROperator):
                     "group_size": self.group_size,
                     "alloc_M": self.alloc_M,
                     "barrier_chunk": self.barrier_chunk,
+                    "block_size": self.block_size,
                 },
             ),
         )

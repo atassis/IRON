@@ -138,6 +138,7 @@ def my_matvec(
     group_size=0,
     alloc_M=None,
     barrier_chunk=1,
+    block_size=None,
 ):
     if m_output is None:
         m_output = m_input
@@ -219,6 +220,20 @@ def my_matvec(
         f"alloc_M ({alloc_M}) must be >= M ({M}): it is the ALLOCATED row count, not a second window"
     )
     _AM = M if alloc_M is None else alloc_M
+    # BLOCKED matrix storage: instead of each matrix's `_AM` rows sitting contiguous (per-matrix
+    # stride `_AM*a_row_width`, which SCALES WITH `_AM` and is what overflows a narrow hardware
+    # stride field at a wide allocation -- see kv-cache-layout-for-full-context), the `_AM` rows are
+    # stored in `_AM//block_size` BLOCKS of `block_size` rows, `n_matrices` interleaved every block:
+    # block-major, matrix-minor, row innermost. `block_size is None` (default) is ONE block == the
+    # whole allocation -- byte-identical to the pre-blocking layout; every existing caller is
+    # unaffected. This is a GENERIC access-pattern capability (not KV-cache-specific -- the KV
+    # cache's own addressing, T-derivation and runtime offset live in iron.common.kv_layout, which
+    # gen_llm_decode.py asks to compute the `alloc_M`/`block_size` this design is handed).
+    assert block_size is None or (block_size > 0 and _AM % block_size == 0), (
+        f"block_size ({block_size}) must be a positive divisor of alloc_M ({_AM})"
+    )
+    _BLK = _AM if block_size is None else block_size
+    blocked = _BLK != _AM
     L3_A_ty = np.ndarray[
         (n_matrices * _AM * a_row_width,),
         dtype_in,
@@ -284,9 +299,23 @@ def my_matvec(
                 return (run // lo, lo)
         return None
 
-    A_run, A_bstride = (M // cols) * a_row_width, _AM * a_row_width
+    # Under blocking the per-matrix run is no longer one `_AM`-row slab -- A is read as
+    # `num_col_blocks` separate `_BLK`-row chunks per column, so A_run/A_split (the flat-run wrap
+    # split) do not apply to A at all; only C keeps the flat run/split below. A_bstride here is the
+    # LARGEST stride A's blocked tap will actually carry -- block-to-block (`n_matrices*_BLK*
+    # a_row_width`), which bounds head-to-head (`_BLK*a_row_width`) too since n_matrices >= 1 -- so
+    # the same coalesce/MAX_STRIDE gate below still means "does this tap's widest stride fit the
+    # hardware field", just against the blocked stride instead of the flat `_AM*a_row_width` one
+    # (which is exactly the quantity blocking exists to avoid bounding by).
+    A_run = (M // cols) * a_row_width
+    A_bstride = (n_matrices * _BLK * a_row_width) if blocked else (_AM * a_row_width)
     C_run, C_bstride = (M // cols), M
-    A_split, C_split = split_run(A_run), split_run(C_run)
+    A_split, C_split = (None if blocked else split_run(A_run)), split_run(C_run)
+    if blocked:
+        assert (M // cols) % _BLK == 0, (
+            f"blocked GEMV needs each column's share of M ({M // cols}) to be a whole number of "
+            f"blocks (block_size={_BLK}) -- got M={M} cols={cols} block_size={_BLK}"
+        )
     coalesce = (
         num_batches > 1
         and num_batches % batch_group == 0
@@ -294,7 +323,7 @@ def my_matvec(
         and C_bstride <= MAX_STRIDE
         and A_bstride % GRAN_ELEMS == 0
         and C_bstride % GRAN_ELEMS == 0
-        and A_split is not None
+        and (blocked or A_split is not None)
         and C_split is not None
     )
 
@@ -372,6 +401,19 @@ def my_matvec(
     _msg = check_l1_fits(dev, m_input, m_output, K, a_row_width, itemsize_in, n_vec)
     if _msg is not None:
         raise ValueError(_msg)
+
+    if blocked and not group_reuse:
+        # Scope boundary, not a hardware limit: the blocked tap below reuses d3 (the iteration
+        # dim), which group_reuse's A already leaves as a dead [outer=1] placeholder -- see
+        # coalesced_tap's call for A. The non-group_reuse coalesced path uses d3 for a REAL
+        # batch_group repeat (stride 0, only ever read on A's old defect path) and the per-batch
+        # fallback (coalesce=False) has no iterated BD to extend at all; both would need their own
+        # dimension budget worked out, unexercised by the shipped decode graph, so this refuses
+        # loud instead of silently addressing A wrong.
+        raise NotImplementedError(
+            "blocked GEMV (block_size != alloc_M) is only implemented for the group_reuse path "
+            f"(batch_group={batch_group} > 1 and coalesce=True); got group_reuse={group_reuse}"
+        )
 
     # A's depth follows n_vec too, and it is NOT cosmetic. Reusing the tile means the core spends
     # n_vec matvec calls on each one, so a depth-2 fifo lets the DMA run only one tile ahead of a
@@ -568,11 +610,42 @@ def my_matvec(
         ), "coalesced GEMV wants A/C ObjectFifo depth>=2 for fill/compute overlap"
         # With the group reused there is no repeat and no permutation: A walks its matrices and C
         # walks its batches, both plain and both with a dead outer dim.
-        A_taps_coalesced = [
-            coalesced_tap(L3_A_ty, col * (M // cols) * K, A_split, 0, A_bstride,
-                          *((1, n_matrices) if group_reuse else (None, None)))
-            for col in range(cols)
-        ]
+        if blocked:
+            # BLOCKED A: the [outer=1, inner=n_matrices] shape above repurposes its dead outer dim
+            # (group_reuse's A never uses it -- see coalesced_tap's call: outer_stride is always 0
+            # for A) to carry MATRIX instead, freeing the inner dim for BLOCK. Per column, this
+            # column's (M//cols) rows are `blocks_per_col` CONSECUTIVE blocks starting at
+            # `block_start`; for a fixed matrix the run within one block (`_BLK*a_row_width`
+            # elements) still needs the same hi/lo wrap split A_run did before blocking.
+            #   sizes   = [n_matrices,        blocks_per_col,         run_hi, run_lo]
+            #   strides = [_BLK*a_row_width,  n_matrices*_BLK*a_row_width, run_lo, 1]
+            # matches iron.common.kv_layout.KVLayout's head_stride/block_stride one-to-one, with
+            # `n_matrices` standing in for that module's `Hkv` -- this design stays KV-agnostic,
+            # the caller (gen_llm_decode.py) is what knows this A happens to be a KV cache.
+            blocks_per_col = (M // cols) // _BLK
+            blk_run_split = split_run(_BLK * a_row_width)
+            assert blk_run_split is not None, (
+                f"blocked GEMV: no wrap-legal split for one block's run "
+                f"({_BLK * a_row_width} elements, block_size={_BLK})"
+            )
+            blk_run_hi, blk_run_lo = blk_run_split
+            head_stride = _BLK * a_row_width
+            block_stride = n_matrices * _BLK * a_row_width
+            A_taps_coalesced = [
+                TensorAccessPattern(
+                    tensor_dims=L3_A_ty.__args__[0],
+                    offset=(col * blocks_per_col) * block_stride,
+                    sizes=[n_matrices, blocks_per_col, blk_run_hi, blk_run_lo],
+                    strides=[head_stride, block_stride, blk_run_lo, 1],
+                )
+                for col in range(cols)
+            ]
+        else:
+            A_taps_coalesced = [
+                coalesced_tap(L3_A_ty, col * (M // cols) * K, A_split, 0, A_bstride,
+                              *((1, n_matrices) if group_reuse else (None, None)))
+                for col in range(cols)
+            ]
         C_taps_coalesced = [
             coalesced_tap(L3_C_ty, col * (M // cols), C_split,
                           0 if group_reuse else C_bstride,

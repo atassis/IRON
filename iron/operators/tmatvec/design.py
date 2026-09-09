@@ -122,6 +122,7 @@ def transposed_matvec(
     verbose=False,
     alloc_K=None,
     l1_bytes=None,
+    block_size=None,
 ):
     assert num_batches % batch_group == 0, (
         f"num_batches ({num_batches}) must be a multiple of batch_group ({batch_group})"
@@ -140,6 +141,15 @@ def transposed_matvec(
         f"alloc_K ({alloc_K}) must be >= K ({K})"
     )
     _AK = K if alloc_K is None else alloc_K
+    # BLOCKED A, one head per column so no cross-column head walk is needed here (unlike gemv's
+    # M-split, which packs several matrices under one column) -- see gemv/design.py's block_size
+    # docstring for the shared addressing shape. `block_size is None` is one block == `_AK`,
+    # byte-identical to the pre-blocking layout.
+    assert block_size is None or (block_size > 0 and _AK % block_size == 0), (
+        f"block_size ({block_size}) must be a positive divisor of alloc_K ({_AK})"
+    )
+    _BLK = _AK if block_size is None else block_size
+    blocked = _BLK != _AK
 
     n_chunks = K // rows_per_chunk
 
@@ -200,15 +210,61 @@ def transposed_matvec(
     # with a task group per chunk deadlocks (ERT_CMD_STATE_TIMEOUT). The real fix is to route A
     # L3->L2->L1 through a MemTile, which has 48 BDs and 512 KB and does object-sized chunking with
     # proper locks -- the pattern strided_copy uses via .forward().
-    A_taps = [
-        TensorAccessPattern(
-            tensor_dims=L3_A_ty.__args__[0],
-            offset=c * _AK * M,
-            sizes=[1, 1, 1, K * M],
-            strides=[0, 0, 0, 1],
+    if blocked:
+        # column c is head c (n_matrices == cols, asserted above): its `_AK` rows are
+        # `num_blocks` blocks of `_BLK` rows, `cols` heads interleaved every block -- so column c's
+        # OWN data starts at `c*head_stride` and its `num_blocks` blocks are `block_stride` apart
+        # (`cols` standing in for iron.common.kv_layout.KVLayout's `Hkv`; this design stays
+        # KV-agnostic, same split of concerns as gemv/design.py's block_size).
+        #   sizes   = [1,            num_blocks,   run_hi, run_lo]
+        #   strides = [0,            block_stride, run_lo, 1]
+        # K (the REDUCED extent) rather than _AK sizes num_blocks: a windowed read (_AK > K) still
+        # only walks the K rows actually consumed, same as the unblocked branch's `K * M` run does.
+        from iron.common.kv_layout import split_run
+
+        assert K % _BLK == 0, (
+            f"blocked TMatVec needs the reduced extent K ({K}) to be a whole number of blocks "
+            f"(block_size={_BLK})"
         )
-        for c in range(cols)
-    ]
+        num_blocks = K // _BLK
+        head_stride = _BLK * M
+        block_stride = cols * _BLK * M
+        # Fail loud in Python rather than let aiecc reject an out-of-range stride deep in MLIR
+        # verification -- same 20-bit shim / 4-byte-granule arithmetic gemv/design.py's MAX_STRIDE
+        # checks, restated here because this design has no stride-bound check at all today (its
+        # unblocked tap's only nonzero stride was always 1, so nothing ever needed one).
+        _MAX_STRIDE_GRANULES = (1 << 20) - 1
+        _GRAN_ELEMS = 2  # 4-byte shim granularity / 2-byte bf16 element
+        assert block_stride // _GRAN_ELEMS <= _MAX_STRIDE_GRANULES, (
+            f"blocked TMatVec: block_stride ({block_stride} elements = "
+            f"{block_stride // _GRAN_ELEMS} granules) exceeds the shim's 20-bit step field "
+            f"({_MAX_STRIDE_GRANULES} granules) -- block_size={_BLK} is too large for cols={cols}"
+        )
+        blk_run_split = split_run(_BLK * M)
+        assert blk_run_split is not None, (
+            f"blocked TMatVec: no wrap-legal split for one block's run "
+            f"({_BLK * M} elements, block_size={_BLK})"
+        )
+        blk_run_hi, blk_run_lo = blk_run_split
+        A_taps = [
+            TensorAccessPattern(
+                tensor_dims=L3_A_ty.__args__[0],
+                offset=c * head_stride,
+                sizes=[1, num_blocks, blk_run_hi, blk_run_lo],
+                strides=[0, block_stride, blk_run_lo, 1],
+            )
+            for c in range(cols)
+        ]
+    else:
+        A_taps = [
+            TensorAccessPattern(
+                tensor_dims=L3_A_ty.__args__[0],
+                offset=c * _AK * M,
+                sizes=[1, 1, 1, K * M],
+                strides=[0, 0, 0, 1],
+            )
+            for c in range(cols)
+        ]
     # W: column c takes its group's batches, which are contiguous because batches sharing a matrix
     # are consecutive by construction (batch b reads matrix b // batch_group).
     W_taps = [
