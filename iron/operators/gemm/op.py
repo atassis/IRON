@@ -30,6 +30,12 @@ class GEMM(MLIROperator):
     tile_n: int = 64
     b_col_maj: bool = False
     c_col_maj: bool = False
+    # B stored BLOCKED: its rows in groups of `b_block_rows`, consecutive groups `b_block_stride`
+    # elements apart, other matrices interleaved in the gap. `None` (both) is the flat layout every
+    # caller had before, down to the descriptor -- see iron.common.kv_layout.blocked_access_pattern.
+    # Both are excluded from the operator NAME when None, so a flat GEMM's artifact does not move.
+    b_block_rows: int | None = None
+    b_block_stride: int | None = None
     num_aie_columns: int = field(default=8)
     emulate_bf16_mmul_with_bfp16: bool = field(default=True, repr=False)
     prio_accuracy: bool = field(default=False, repr=False)
@@ -47,6 +53,8 @@ class GEMM(MLIROperator):
         "tile_n": "tn",
         "b_col_maj": "bc",
         "c_col_maj": "cc",
+        "b_block_rows": "bbr",
+        "b_block_stride": "bbs",
     }
 
     def __post_init__(self):
@@ -72,7 +80,40 @@ class GEMM(MLIROperator):
         if self.tile_n < min_tile_n:
             raise ValueError(f"tile_n ({self.tile_n}) must be >= {min_tile_n}")
 
+        if (self.b_block_rows is None) != (self.b_block_stride is None):
+            raise ValueError(
+                "b_block_rows and b_block_stride go together: a block size with no stride cannot "
+                "be addressed, and a stride with no block size has nothing to step over")
+        if self.b_block_rows is not None:
+            if self._b_rows % self.b_block_rows:
+                raise ValueError(
+                    f"b_block_rows ({self.b_block_rows}) must divide B's "
+                    f"{'N' if self.b_col_maj else 'K'} ({self._b_rows})")
+            if self.b_block_stride < self.b_block_rows * self._b_row_width:
+                raise ValueError(
+                    f"b_block_stride ({self.b_block_stride}) is under one block "
+                    f"({self.b_block_rows} x {self._b_row_width}): blocks would overlap")
+
         MLIROperator.__init__(self, context=self.context)
+
+    @property
+    def _b_rows(self):
+        """B's PHYSICAL leading extent -- N when it is read column-major, K otherwise. The blocked
+        axis in both cases, because both store the same [position, head_dim] cache."""
+        return self.N if self.b_col_maj else self.K
+
+    @property
+    def _b_row_width(self):
+        return self.K if self.b_col_maj else self.N
+
+    @property
+    def b_elems(self):
+        """B's allocated extent in elements. Blocked, that is not `K*N`: this matrix's rows reach
+        to the far end of its last block, past the interleaved peers in between."""
+        if self.b_block_rows is None:
+            return self.K * self.N
+        blocks = self._b_rows // self.b_block_rows
+        return (blocks - 1) * self.b_block_stride + self.b_block_rows * self._b_row_width
 
     @property
     def _kernel_flags_suffix(self):
@@ -98,6 +139,8 @@ class GEMM(MLIROperator):
                     "dtype_in_str": self.dtype_in,
                     "dtype_out_str": self.dtype_out,
                     "b_col_maj": int(self.b_col_maj),
+                    "b_block_rows": self.b_block_rows,
+                    "b_block_stride": self.b_block_stride,
                     "c_col_maj": int(self.c_col_maj),
                     "use_scalar": self.use_scalar,
                     "emulate_bf16_mmul_with_bfp16": self.emulate_bf16_mmul_with_bfp16,
@@ -152,9 +195,15 @@ class GEMM(MLIROperator):
     def get_arg_spec(self):
         return [
             AIERuntimeArgSpec("in", (self.M, self.K)),  # input A
+            # input B (weights). Blocked, B's extent is not K*N and it is not 2-D contiguous
+            # either, so it is declared as the flat run the descriptor actually addresses; flat, the
+            # shape is left exactly as it was so no existing sequence sees a changed spec.
             AIERuntimeArgSpec(
-                "in", (self.K, self.N) if not self.b_col_maj else (self.N, self.K)
-            ),  # input B (weights)
+                "in",
+                (self.b_elems,)
+                if self.b_block_rows is not None
+                else ((self.N, self.K) if self.b_col_maj else (self.K, self.N)),
+            ),
             AIERuntimeArgSpec(
                 "out", (self.M, self.N) if not self.c_col_maj else (self.N, self.M)
             ),  # output C

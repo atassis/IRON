@@ -6,7 +6,8 @@
 
 import pytest
 
-from iron.common.kv_layout import KVLayout, derive_block_size, split_run, validate_block_size
+from iron.common.kv_layout import (KVLayout, blocked_access_pattern, derive_block_size,
+                                   split_run, validate_block_size)
 
 
 # ---- KVLayout: T == S degenerates to the pre-blocking flat [Hkv, S, HD] formula ----
@@ -232,3 +233,100 @@ def test_blocked_taps_agree_with_degenerate_T_equals_S_case():
         got = _walk_4d(sizes, strides, offset)
         expect = [lay_flat.offset(head, pos) + d for pos in range(S) for d in range(HD)]
         assert got == expect
+
+
+# ---- head_span: what a whole-window operand has to be allowed to address ----
+
+def test_head_span_is_the_flat_slab_at_T_equals_S():
+    assert KVLayout(Hkv=8, S=2048, HD=128, T=2048).head_span == 2048 * 128
+
+
+def test_head_span_reaches_the_end_of_the_last_block():
+    lay = KVLayout(Hkv=8, S=2048, HD=128, T=128)
+    # The last element any head touches is the last of its slice of block num_blocks-1.
+    assert lay.head_span == lay.offset(0, lay.S - 1) + lay.HD
+    # And the last head's span must land exactly on the end of the buffer, not past it.
+    assert lay.head_base(lay.Hkv - 1) + lay.head_span == lay.total_elems
+
+
+# ---- blocked_access_pattern: the descriptor rewrite the prefill GEMMs read B through ----
+
+def _walk(sizes, strides, offset):
+    """Every address an n-D access pattern visits, sizes[0] slowest."""
+    addrs, total = [], 1
+    for s in sizes:
+        total *= s
+    for lin in range(total):
+        addr, rem = offset, lin
+        for d in range(len(sizes) - 1, -1, -1):
+            rem, i = divmod(rem, sizes[d])
+            addr += i * strides[d]
+        addrs.append(addr)
+    return addrs
+
+
+# The two descriptors TensorTiler2D.step_tiler actually produces for the prefill attention GEMMs
+# at M=256, S=2048, HD=128 -- scores (b_col_maj, B = [N=S, K=HD], 64x64 tiles over 8 columns) and
+# ctx (plain, B = [K=S, N=HD], 64x16 tiles). Transcribed rather than regenerated so this file
+# stays free of the aie import; if the tiling moves, the build's own descriptors move with it and
+# these become a check of a shape nothing builds.
+_SCORES = ([4, 2, 64, 64], [65536, 64, 128, 1], [c * 8192 for c in range(8)])
+_CTX = ([1, 32, 64, 16], [0, 8192, 128, 1], [c * 16 for c in range(8)])
+
+
+@pytest.mark.parametrize("sizes,strides,offsets", [_SCORES, _CTX])
+def test_blocked_access_pattern_visits_the_same_elements_where_KVLayout_puts_them(
+        sizes, strides, offsets):
+    HD, S, Hkv, T = 128, 2048, 8, 128
+    lay = KVLayout(Hkv=Hkv, S=S, HD=HD, T=T)
+    for offset in offsets:
+        b_off, b_sizes, b_strides = blocked_access_pattern(
+            offset, sizes, strides, HD, T, lay.block_stride)
+        got = _walk(b_sizes, b_strides, b_off)
+        # The flat pattern's Nth address is (row, col) of head 0's logical [S, HD] matrix; the
+        # blocked pattern's Nth must be where KVLayout says that (position, dim) lives.
+        expect = [lay.offset(0, r) + c
+                  for r, c in (divmod(a, HD) for a in _walk(sizes, strides, offset))]
+        assert got == expect
+        assert max(got) < lay.head_span
+
+
+def test_blocked_access_pattern_is_the_identity_when_the_window_is_one_block():
+    HD, S, Hkv = 128, 2048, 8
+    flat = KVLayout(Hkv=Hkv, S=S, HD=HD, T=S)
+    for sizes, strides, offsets in (_SCORES, _CTX):
+        for offset in offsets:
+            assert blocked_access_pattern(
+                offset, sizes, strides, HD, flat.T, flat.block_stride
+            ) == (offset, list(sizes), list(strides))
+
+
+def test_blocked_access_pattern_splits_a_dim_that_crosses_a_block():
+    # ctx walks 32 tiles of 64 positions. Under T=128 that is two tiles per block, so the one dim
+    # becomes two: whole blocks outer, the pair inside one block inner.
+    _, sizes, strides = blocked_access_pattern(0, *_CTX[:2], 128, 128, 131072)
+    assert sizes == [1, 16, 2, 64, 16]
+    assert strides == [0, 131072, 8192, 128, 1]
+
+
+def test_blocked_access_pattern_rewrites_a_whole_block_step_without_splitting():
+    # scores steps 512 positions at a time -- four whole blocks -- so the dim count is unchanged.
+    _, sizes, strides = blocked_access_pattern(0, *_SCORES[:2], 128, 128, 131072)
+    assert sizes == list(_SCORES[0])
+    assert strides == [4 * 131072, 64, 128, 1]
+
+
+def test_blocked_access_pattern_raises_on_a_step_it_cannot_express():
+    # 3 positions per step against a 128-position block: neither whole blocks nor a divisor of one.
+    with pytest.raises(ValueError, match="crosses a block boundary"):
+        blocked_access_pattern(0, [100, 128], [3 * 128, 1], 128, 128, 131072)
+
+
+def test_blocked_access_pattern_raises_on_a_step_that_is_neither_rows_nor_columns():
+    with pytest.raises(ValueError, match="neither under one row"):
+        blocked_access_pattern(0, [4, 8], [192, 1], 128, 128, 131072)
+
+
+def test_blocked_access_pattern_rejects_overlapping_blocks():
+    with pytest.raises(ValueError, match="under one block"):
+        blocked_access_pattern(0, [4, 8], [128, 1], 128, 128, 128 * 128 - 2)

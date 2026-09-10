@@ -110,6 +110,17 @@ class KVLayout:
         """
         return self.block_of(pos) * self.block_stride + self.within_block(pos) * self.HD
 
+    @property
+    def head_span(self) -> int:
+        """Elements from a head's base to the end of its LAST block -- the extent an operand that
+        covers the whole window has to be allowed to address.
+
+        A head's positions are contiguous only inside a block; across blocks they are `block_stride`
+        apart, so the slice handed to an operator reading the whole window is not `S*HD` long, it
+        reaches to the far end of block `num_blocks-1`. At `T == S` this is exactly `S*HD` again.
+        """
+        return (self.num_blocks - 1) * self.block_stride + self.head_stride
+
     def offset(self, head: int, pos: int) -> int:
         """Full element offset of (head, pos, 0). Spelled out for tests/documentation; every real
         call site uses the two halves separately (`head_base` baked in at build time, `kv_off`
@@ -135,6 +146,68 @@ def split_run(run: int, lim: int = 1023, gran: int = 2):
         if run % lo == 0 and (run // lo) <= lim:
             return (run // lo, lo)
     return None
+
+
+def blocked_access_pattern(offset, sizes, strides, row_width, block_rows, block_stride):
+    """Rewrite a FLAT row-major `[rows, row_width]` DMA access pattern into the equivalent one over
+    BLOCKED storage: the same rows in groups of `block_rows`, consecutive groups `block_stride`
+    elements apart -- the layout `KVLayout` describes, seen from a tiler that only knows the
+    logical matrix. Returns `(offset, sizes, strides)`; the element SEQUENCE is identical, only the
+    addresses it is read from move.
+
+    A pattern that already fits inside one block -- which every pattern does when `block_rows` is
+    the whole row count -- comes back unchanged, offset included. That is what makes a call site
+    safe to switch: a design whose storage is flat keeps its exact descriptor, so its artifact does
+    not move.
+
+    Raises rather than approximating. A dim whose row step neither lands on block boundaries nor
+    stays inside one block, and does not factor into a pair that does, has no blocked descriptor at
+    all -- and saying which dim names the tiling to change, which mis-addressing does not.
+    """
+    if len(sizes) != len(strides):
+        raise ValueError(f"len(sizes) ({len(sizes)}) != len(strides) ({len(strides)})")
+    if block_rows <= 0 or block_stride <= 0:
+        raise ValueError(f"block_rows ({block_rows}) and block_stride ({block_stride}) must be > 0")
+    if block_stride < block_rows * row_width:
+        raise ValueError(
+            f"block_stride ({block_stride}) is under one block ({block_rows} x {row_width}); "
+            f"consecutive blocks would overlap")
+    base_row, base_col = divmod(offset, row_width)
+    out_sizes, out_strides = [], []
+    # Rows of the base's own block already consumed. Every step that stays inside a block adds to
+    # it, and the test below is against the SUM: two dims can each fit in a block and still leave
+    # it together.
+    intra = base_row % block_rows
+    for dim, (size, stride) in enumerate(zip(sizes, strides)):
+        if size == 1 or stride == 0 or stride < row_width:
+            out_sizes.append(size)          # a column step, a stride-0 repeat, or no step at all
+            out_strides.append(stride)
+            continue
+        if stride % row_width:
+            raise ValueError(
+                f"dim {dim} steps {stride} elements, which is neither under one row "
+                f"({row_width}) nor a whole number of them -- not a row-major pattern")
+        q = stride // row_width             # the step, in rows
+        if q % block_rows == 0:
+            out_sizes.append(size)          # whole blocks at a time
+            out_strides.append((q // block_rows) * block_stride)
+            continue
+        if intra + q * (size - 1) < block_rows:
+            out_sizes.append(size)          # never leaves the block it starts in
+            out_strides.append(stride)
+            intra += q * (size - 1)
+            continue
+        lo = block_rows // q if q and block_rows % q == 0 else 0
+        if intra or not lo or size % lo:
+            raise ValueError(
+                f"dim {dim} ({size} x {q} rows, starting {intra} rows into a block) crosses a "
+                f"block boundary of {block_rows} rows and does not factor into whole blocks x "
+                f"rows-within-one; retile so the step divides the block or covers whole blocks")
+        out_sizes += [size // lo, lo]       # whole blocks outer, rows within one block inner
+        out_strides += [block_stride, stride]
+        intra = q * (lo - 1)
+    return ((base_row // block_rows) * block_stride + (base_row % block_rows) * row_width
+            + base_col, out_sizes, out_strides)
 
 
 def derive_block_size(HD: int, Hkv: int, addr_gran_elems: int = 2,

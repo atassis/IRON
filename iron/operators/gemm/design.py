@@ -22,6 +22,7 @@ from aie.iron import (
 from aie.iron.device import NPU1Col1, NPU1Col2, NPU1, NPU2, Tile
 from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D, TensorAccessPattern
 from aie.iron.controlflow import range_
+from iron.common.kv_layout import blocked_access_pattern
 from iron.operators._trace import maybe_enable_trace
 
 microkernel_mac_dim_map = {
@@ -148,6 +149,8 @@ def my_matmul(
     kernel_object=None,
     func_prefix="",
     generate_taps=False,
+    b_block_rows=None,
+    b_block_stride=None,
 ):
     n_aie_rows = 4
 
@@ -270,7 +273,20 @@ def my_matmul(
 
     # Define tensor types
     A_ty = np.ndarray[(M * K,), np.dtype[dtype_in]]
-    B_ty = np.ndarray[(K * N,), np.dtype[dtype_in]]
+    # B's rows may be stored BLOCKED (groups of b_block_rows rows, consecutive groups
+    # b_block_stride elements apart, peer matrices interleaved in the gap) -- then this matrix's
+    # rows reach past its peers to the end of its last block, and K*N is not its extent.
+    b_rows, b_row_width = (N, K) if b_col_maj else (K, N)
+    if (b_block_rows is None) != (b_block_stride is None):
+        raise ValueError("b_block_rows and b_block_stride must be given together")
+    if b_block_rows is not None and b_rows % b_block_rows:
+        raise ValueError(f"b_block_rows ({b_block_rows}) must divide B's rows ({b_rows})")
+    b_elems = (
+        K * N
+        if b_block_rows is None
+        else (b_rows // b_block_rows - 1) * b_block_stride + b_block_rows * b_row_width
+    )
+    B_ty = np.ndarray[(b_elems,), np.dtype[dtype_in]]
     C_ty = np.ndarray[(M * N,), np.dtype[dtype_out]]
     A_l2_ty = np.ndarray[(mem_tile_m_A * k,), np.dtype[dtype_in]]
     B_l2_ty = np.ndarray[(k * n,), np.dtype[dtype_in]]
@@ -550,6 +566,46 @@ def my_matmul(
             tile_group_col_major=True,  # Send all tiles in column before moving on to next column
             prune_step=False,
         )
+    if b_block_rows is not None:
+        # The tiler patterns the LOGICAL [b_rows, b_row_width] matrix, which under blocking is not
+        # what is in memory. Rewrite each column's descriptor rather than gather the storage back
+        # into the shape the tiler assumed -- a gather costs a full extra read AND write of B per
+        # use, 224 MiB per dispatch on the 28-layer qwen3-0.6b prefill that motivated this.
+        blocked_tiles = []
+        for tile in B_tiles:
+            off, sizes, strides = blocked_access_pattern(
+                tile.offset, tile.sizes, tile.strides, b_row_width, b_block_rows, b_block_stride
+            )
+            # Blocking makes B's outermost step a MULTIPLE of the block stride, which is where it
+            # can leave the shim BD's step field -- 20 bits counting 4-byte address granules
+            # (AIE2TargetModel::getDmaBdStepBits / getAddressGenGranularity). Checked here, against
+            # the tiling that produced it, because aiecc reports the same overflow as an unnamed
+            # stride/wrap verification failure much later.
+            gran = 4 // np.dtype(dtype_in).itemsize
+            for s in strides:
+                if s <= 1:
+                    continue          # the innermost run is contiguous; only STEPS use the field
+                if s % gran or s // gran > (1 << 20) - 1:
+                    raise ValueError(
+                        f"blocked B step {s} elements ({s / gran:.1f} granules) does not fit the "
+                        f"shim BD's 20-bit step field at tile_n={n} x {n_aie_cols} columns; the "
+                        f"step is (tile_n x columns / {b_block_rows} rows-per-block) x the "
+                        f"{b_block_stride}-element block stride, so a tile_n x columns of at most "
+                        f"{((1 << 20) - 1) * gran * b_block_rows // b_block_stride} rows fits")
+            # Dims of size 1 move nothing; blocking spends a dimension, and dropping them is what
+            # pays for it. A shim BD carries 4.
+            kept = [(z, s) for z, s in zip(sizes, strides) if z > 1]
+            if len(kept) > 4:
+                raise ValueError(
+                    f"blocked B needs {len(kept)} descriptor dimensions {kept}, over the 4 a shim "
+                    f"BD carries -- a larger b_block_rows, or a tile that divides it, costs one less"
+                )
+            blocked_tiles.append(
+                TensorAccessPattern(
+                    (b_elems,), off, [z for z, _ in kept], [s for _, s in kept]
+                )
+            )
+        B_tiles = blocked_tiles
 
     # Runtime operations to move data to/from the AIE-array
     def sequence(A, B, C, A_prods, B_prods, C_conses):
