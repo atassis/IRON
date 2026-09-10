@@ -153,6 +153,7 @@ def my_matmul(
     b_block_stride=None,
     a_row_stride=None,
     c_row_stride=None,
+    epilogue="none",
 ):
     n_aie_rows = 4
 
@@ -353,6 +354,19 @@ def my_matmul(
             [A_l1_ty, B_l1_ty, C_l1_ty],
         )
 
+    # A kernel run over the finished C tile before it leaves L1, so the stage after this GEMM is
+    # not a separate design reading C back out of DDR. Same shape as gemv's hook: one call per
+    # tile, after the K-reduction loop has filled it.
+    assert epilogue in ("none", "gelu", "silu")
+    epi_kernel = None
+    if epilogue != "none":
+        assert (m * n) % 32 == 0, (
+            f"{epilogue} epilogue walks the C tile 32 lanes at a time; m*n = {m}*{n} is not a "
+            f"multiple of 32")
+        epi_kernel = Kernel(
+            f"{func_prefix}{epilogue}_tile_bf16", gemm_object, [np.int32, C_l1_ty]
+        )
+
     # Tile declarations as tile[row][col]
     tiles = [[(col, row) for col in range(0, n_aie_cols)] for row in range(0, 6)]
     core_tiles = tiles[2:]
@@ -479,6 +493,7 @@ def my_matmul(
         my_rtp,
         barrier,
         elem_out_internal,
+        epi=None,
     ):
         barrier.wait_for_value(1)
         rtp_K_div_k = my_rtp[0]
@@ -501,8 +516,12 @@ def my_matmul(
             if use_larger_internal_buffer:
                 elem_out_transfer = out_c.acquire(1)
                 convert_copy(elem_out_internal, elem_out_transfer, m * n)
+                if epi is not None:
+                    epi(m * n, elem_out_transfer)
                 out_c.release(1)
             else:
+                if epi is not None:
+                    epi(m * n, elem_out_internal)
                 out_c.release(1)
 
     # Set up compute tiles
@@ -529,6 +548,7 @@ def my_matmul(
                         rtps[row][col],
                         workerBarriers[row][col],
                         acc_buffer,
+                        epi_kernel,
                     ],
                     tile=Tile(tile_col, tile_row),
                     stack_size=0xD00,

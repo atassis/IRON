@@ -7,6 +7,7 @@ from typing import ClassVar, Dict
 import numpy as np
 
 from iron.common import (
+    KernelArchiveArtifact,
     MLIROperator,
     AIERuntimeArgSpec,
     KernelObjectArtifact,
@@ -42,6 +43,11 @@ class GEMM(MLIROperator):
     # op instead of materialising a head-major copy -- see iron.common.kv_layout.restride_rows.
     a_row_stride: int | None = None
     c_row_stride: int | None = None
+    # A kernel run over the whole C tile once it is complete, before it leaves L1. "none" (default)
+    # is the operator every caller had. This is the mechanism a fused block needs: the stage after
+    # a GEMM stops being a separate design reading C back out of DDR. gemv has carried the same
+    # hook since 354cb38; this is its GEMM twin.
+    epilogue: str = field(default="none", repr=False)
     num_aie_columns: int = field(default=8)
     emulate_bf16_mmul_with_bfp16: bool = field(default=True, repr=False)
     prio_accuracy: bool = field(default=False, repr=False)
@@ -88,6 +94,14 @@ class GEMM(MLIROperator):
         if self.tile_n < min_tile_n:
             raise ValueError(f"tile_n ({self.tile_n}) must be >= {min_tile_n}")
 
+        if self.epilogue not in ("none", "gelu", "silu"):
+            raise ValueError(f"unknown epilogue {self.epilogue!r} (want 'none', 'gelu' or 'silu')")
+        # Both tile epilogues walk the C tile 32 lanes at a time from a 16-lane-aligned base, so a
+        # tile that is only 16-aligned makes the last iteration read and write past its end.
+        if self.epilogue != "none" and (self.tile_m * self.tile_n) % 32:
+            raise ValueError(
+                f"{self.epilogue} epilogue needs tile_m*tile_n % 32 == 0, got "
+                f"{self.tile_m}*{self.tile_n}")
         if (self.b_block_rows is None) != (self.b_block_stride is None):
             raise ValueError(
                 "b_block_rows and b_block_stride go together: a block size with no stride cannot "
@@ -143,6 +157,13 @@ class GEMM(MLIROperator):
         return (blocks - 1) * self.b_block_stride + self.b_block_rows * self._b_row_width
 
     @property
+    def name(self):
+        # epilogue is repr=False so an unfused GEMM keeps the name it has always had; a fused one
+        # must NOT share that artifact, because the design and the linked object both differ.
+        base = super().name
+        return base if self.epilogue == "none" else f"{base}_epi{self.epilogue}"
+
+    @property
     def _kernel_flags_suffix(self):
         """Suffix encoding compile-time flags that affect the kernel binary."""
         return f"_{int(self.prio_accuracy)}_{int(self.emulate_bf16_mmul_with_bfp16)}_{int(self.round_conv_even)}"
@@ -175,12 +196,25 @@ class GEMM(MLIROperator):
                     "emulate_bf16_mmul_with_bfp16": self.emulate_bf16_mmul_with_bfp16,
                     "prio_accuracy": self.prio_accuracy,
                     "separate_c_tiles": int(self.separate_c_tiles),
+                    "epilogue": self.epilogue,
                     "trace_size": 0,
                     "generate_taps": False,
-                    "kernel_object": f"gemm_{self.tile_m}x{self.tile_k}x{self.tile_n}_{int(self.b_col_maj)}_{int(self.c_col_maj)}{self._kernel_flags_suffix}.o",
+                    "kernel_object": self._kernel_link_file,
                 },
             ),
         )
+
+    @property
+    def _mm_object(self):
+        return (f"gemm_{self.tile_m}x{self.tile_k}x{self.tile_n}"
+                f"_{int(self.b_col_maj)}_{int(self.c_col_maj)}{self._kernel_flags_suffix}.o")
+
+    @property
+    def _kernel_link_file(self):
+        """With an epilogue the core links two kernels, so the object becomes an archive."""
+        if self.epilogue == "none":
+            return self._mm_object
+        return self._mm_object[:-2] + f"_{self.epilogue}_kernels.a"
 
     def get_kernel_artifacts(self):
         base_dir = self.context.base_dir
@@ -203,14 +237,27 @@ class GEMM(MLIROperator):
             kernel_flags.append("-DC_COL_MAJ")
 
         kernel_dir = get_kernel_dir()
+        mm_obj = KernelObjectArtifact(
+            self._mm_object,
+            extra_flags=kernel_flags,
+            dependencies=[SourceArtifact(base_dir / "aie_kernels" / kernel_dir / "mm.cc")],
+        )
+        if self.epilogue != "none":
+            # Both epilogue kernels live under aie2p/, so a fused epilogue is NPU2-only.
+            if kernel_dir != "aie2p":
+                raise NotImplementedError(
+                    f"GEMM {self.epilogue} epilogue is only available on NPU2 (aie2p); "
+                    f"current kernel dir is {kernel_dir!r}")
+            mm_obj = KernelArchiveArtifact(
+                self._kernel_link_file,
+                dependencies=[mm_obj, KernelObjectArtifact(
+                    f"{self.epilogue}.o",
+                    dependencies=[SourceArtifact(
+                        base_dir / "aie_kernels" / "aie2p" / f"{self.epilogue}.cc")],
+                )],
+            )
         return [
-            KernelObjectArtifact(
-                f"gemm_{self.tile_m}x{self.tile_k}x{self.tile_n}_{int(self.b_col_maj)}_{int(self.c_col_maj)}{self._kernel_flags_suffix}.o",
-                extra_flags=kernel_flags,
-                dependencies=[
-                    SourceArtifact(base_dir / "aie_kernels" / kernel_dir / "mm.cc")
-                ],
-            ),
+            mm_obj,
             KernelObjectArtifact(
                 "convert_copy.o",
                 [
