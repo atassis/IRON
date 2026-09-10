@@ -68,26 +68,48 @@ def _extract_core_regions(mlir_text):
 
 _ROWLEN_CALL_RE = re.compile(r"func\.call @\w*(mask_bf16|softmax_bf16|taccum_rows_bf16_f32)\(")
 
+# The SECOND operand is deliberately NOT captured: it is the runtime chunks value the compute
+# loop's own bound already traces to (see test_dynamic_window_drain_conserves_stream_acquires),
+# and leaving it alone is what stops this rule from also hiding a broken compute-loop bound.
+_SUBI_DRAIN_RE = re.compile(r"^\s*%\S+ = arith\.subi %(c\d+_i32(?:_\d+)?), %\S+ : i32\s*$")
+
 
 def _normalize_core_region(region):
-    """Strip the two terms that legitimately vary with max_seq but are NOT the trip count:
+    """Strip the three terms that legitimately vary with max_seq but are NOT the trip count:
     (1) the row-length CONSTANT fed to mask_bf16/softmax_bf16/taccum_rows_bf16_f32 -- a fresh
     `%cN_i32... = arith.constant N : i32` immediately followed by its sole use as that call's
-    row-length operand -- and (2) the sc/sw buffer WIDTH (S, the `2*gqa*S*2` L1 bytes design.py
-    costs to the window) wherever it appears as a `memref<Nxbf16>` type in one of the four kernel
-    call signatures. Both are anchored on the KERNEL NAME, never the numeric value: tile_elems
+    row-length operand; (2) the sc/sw buffer WIDTH (S, the `2*gqa*S*2` L1 bytes design.py costs
+    to the window) wherever it appears as a `memref<Nxbf16>` type in one of the four kernel call
+    signatures; (3) the drain loop's N_KV_CHUNKS operand -- design.py's `arith.subi(N_KV_CHUNKS,
+    chunks)`, the CONSTANT operand only, matched the same way as (1): a fresh
+    `%cN_i32... = arith.constant N : i32` immediately followed by its sole use as arith.subi's
+    FIRST operand. (1) and (2) are anchored on the KERNEL NAME, never the numeric value: tile_elems
     (tsi*D) equals max_seq by coincidence at this test's S=4096 (tsi=4, D=1024), and a blind
-    "replace this number" pass would conflate the two and silently launder a real difference."""
+    "replace this number" pass would conflate the two and silently launder a real difference. (3)
+    has no kernel name to anchor on, so it is anchored on the OP instead -- arith.subi appears
+    nowhere else in core_fn (verified against the emitted MLIR, not assumed) -- and only the
+    constant it subtracts FROM is stripped; the chunks value being subtracted is untouched, so a
+    broken compute-loop trip count still shows up as a diff here.
+
+    (3) is TRANSITIONAL, not a permanent carve-out: it exists only because the K/V-cache fill still
+    streams the full built window (N_KV_CHUNKS tiles) regardless of `chunks`. Once the fill itself
+    reads a runtime length -- streaming exactly `chunks` tiles -- the drain loop this rule
+    normalizes disappears, and this rule should be deleted with it, not carried forward."""
     lines = region.split("\n")
     out, i = [], 0
     while i < len(lines):
         m = re.match(r"^(\s*)%(c\d+_i32(?:_\d+)?) = arith\.constant (\d+) : i32\s*$", lines[i])
-        if (m and i + 1 < len(lines) and _ROWLEN_CALL_RE.search(lines[i + 1])
-                and re.search(rf"%{re.escape(m.group(2))}\b", lines[i + 1])):
-            out.append(f"{m.group(1)}%ROWLEN = arith.constant ROWLEN : i32")
-            out.append(re.sub(rf"%{re.escape(m.group(2))}\b", "%ROWLEN", lines[i + 1]))
-            i += 2
-            continue
+        if m and i + 1 < len(lines) and re.search(rf"%{re.escape(m.group(2))}\b", lines[i + 1]):
+            if _ROWLEN_CALL_RE.search(lines[i + 1]):
+                out.append(f"{m.group(1)}%ROWLEN = arith.constant ROWLEN : i32")
+                out.append(re.sub(rf"%{re.escape(m.group(2))}\b", "%ROWLEN", lines[i + 1]))
+                i += 2
+                continue
+            if _SUBI_DRAIN_RE.match(lines[i + 1]):
+                out.append(f"{m.group(1)}%NKVCHUNKS = arith.constant NKVCHUNKS : i32")
+                out.append(re.sub(rf"%{re.escape(m.group(2))}\b", "%NKVCHUNKS", lines[i + 1]))
+                i += 2
+                continue
         out.append(lines[i])
         i += 1
     text = "\n".join(out)
@@ -239,7 +261,9 @@ def test_dynamic_window_makes_the_core_trip_count_independent(tmp_path):
     literal handed to mask_k/softmax_k/tr_k (see design.py step 7/8) -- so it would have passed with
     the runtime-trip-count mechanism absent, present, or broken (it did fail, but for the wrong
     reason: those two terms, not the trip count). This instead diffs the `aie.core` MLIR text with
-    exactly those two terms normalised out, so what remains is the trip count alone.
+    `_normalize_core_region`'s terms stripped out, so what remains is the trip count alone (a third,
+    the drain loop's N_KV_CHUNKS, joined the first two once the fill's own leftover needed draining
+    -- see that function's docstring for why it is transitional rather than a fourth permanent term).
 
     Second half is the negative control -- reverting to window_parameter=None must still differ
     under the SAME normalisation, or this gate is exactly as vacuous as its predecessor."""
