@@ -46,6 +46,13 @@ class AttnBlockDataParallel(MLIROperator):
     stack_size: int = 0xD00
     kv_offset_parameter: str | None = "kv_off"
     mask_parameter: str = "sm_mask"
+    # None (default) keeps the window a BUILD constant -- today's behaviour, byte for byte. A name
+    # makes it a per-dispatch ScratchpadParameter. NOT repr=False: like kv_offset_parameter and
+    # mask_parameter above, this field rides MLIROperator.name's automatic field aggregation, so a
+    # windowed build's name diverges from a plain one for free -- no hand-written suffix needed
+    # (contrast decode_layer_dp/op.py's kv_alloc/kv_block_size, which ARE repr=False and own a
+    # `name` property override instead).
+    window_parameter: str | None = None
     wqkv_head_major: bool = False
     weight_depth: int = field(default=2, repr=False)
     context: object = field(default=None, repr=False)
@@ -59,6 +66,7 @@ class AttnBlockDataParallel(MLIROperator):
         "max_seq": "S",
         "kv_offset_parameter": "kvpar",
         "mask_parameter": "mpar",
+        "window_parameter": "winpar",
         "weight_depth": "wd",
         "wqkv_head_major": "hm",
     }
@@ -121,6 +129,7 @@ class AttnBlockDataParallel(MLIROperator):
                     "epsilon": self.epsilon,
                     "kv_offset_parameter": self.kv_offset_parameter,
                     "mask_parameter": self.mask_parameter,
+                    "window_parameter": self.window_parameter,
                     "weight_depth": self.weight_depth,
                     "tile_size_input": self.tile_size_input,
                     "stack_size": self.stack_size,

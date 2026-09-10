@@ -151,6 +151,7 @@ def attn_block_dp(
     n_aie_cols=8,
     kv_offset_parameter="kv_off",
     mask_parameter="sm_mask",
+    window_parameter=None,   # accepted, not yet read -- op.py threads it through in advance
     trace_size=0,
     weight_depth=2,
     wqkv_head_major=False,

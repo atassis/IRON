@@ -33,6 +33,19 @@ SHIPPED_TEXT = {"op0 QKVHeadDataParallel": 8000, "op1 GEMV scores": 1760,
                 "op2 Softmax": 1712, "op3 TMatVec ctx": 1664}
 
 
+def test_window_parameter_defaults_off_and_is_not_in_the_name():
+    """The switch must be invisible when unused: same operator name, so a shared build dir
+    cannot let a windowed build silently satisfy a plain one. Mirrors op.py's kv_alloc rule."""
+    from iron.operators.attn_block_dp.op import AttnBlockDataParallel
+    common = dict(D=1024, HD=128, Hq=16, Hkv=8, max_seq=4096, num_aie_columns=8,
+                  tile_size_input=4)
+    plain = AttnBlockDataParallel(**common)
+    off = AttnBlockDataParallel(**common, window_parameter=None)
+    assert off.name == plain.name
+    on = AttnBlockDataParallel(**common, window_parameter="attn_window")
+    assert on.name != plain.name, "a dynamic-window build must not share a name with a plain one"
+
+
 def main():
     D, HD, Hq, Hkv, N = 1024, 128, 16, 8, 8      # Qwen3-0.6B decode shapes
     argv = [a for a in sys.argv[1:] if not a.startswith("-")]
