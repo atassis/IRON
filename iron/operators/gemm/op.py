@@ -48,6 +48,10 @@ class GEMM(MLIROperator):
     # a GEMM stops being a separate design reading C back out of DDR. gemv has carried the same
     # hook since 354cb38; this is its GEMM twin.
     epilogue: str = field(default="none", repr=False)
+    # Elements the epilogue kernel loops over; None = the whole C tile. 0 is the NULL CONTROL --
+    # same call, same fifo pattern, no arithmetic -- which is how the epilogue's structural cost is
+    # separated from its own work. repr=True so it can never share an artifact with the real one.
+    epilogue_elems: int | None = None
     num_aie_columns: int = field(default=8)
     emulate_bf16_mmul_with_bfp16: bool = field(default=True, repr=False)
     prio_accuracy: bool = field(default=False, repr=False)
@@ -67,6 +71,7 @@ class GEMM(MLIROperator):
         "c_col_maj": "cc",
         "b_block_rows": "bbr",
         "b_block_stride": "bbs",
+        "epilogue_elems": "epin",
         "a_row_stride": "ars",
         "c_row_stride": "crs",
     }
@@ -197,6 +202,7 @@ class GEMM(MLIROperator):
                     "prio_accuracy": self.prio_accuracy,
                     "separate_c_tiles": int(self.separate_c_tiles),
                     "epilogue": self.epilogue,
+                    "epilogue_elems": self.epilogue_elems,
                     "trace_size": 0,
                     "generate_taps": False,
                     "kernel_object": self._kernel_link_file,

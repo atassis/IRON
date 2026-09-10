@@ -154,6 +154,7 @@ def my_matmul(
     a_row_stride=None,
     c_row_stride=None,
     epilogue="none",
+    epilogue_elems=None,
 ):
     n_aie_rows = 4
 
@@ -366,6 +367,11 @@ def my_matmul(
         epi_kernel = Kernel(
             f"{func_prefix}{epilogue}_tile_bf16", gemm_object, [np.int32, C_l1_ty]
         )
+    # NULL CONTROL. The epilogue call, the fifo pattern and the linked archive are identical; only
+    # the element count the kernel loops over changes. `epilogue_elems=0` therefore measures what
+    # the call STRUCTURE costs -- the epilogue holding the C objectFIFO between the matmul and the
+    # release -- separated from the epilogue's own arithmetic. Nothing ships with it.
+    epi_n = (m * n) if epilogue_elems is None else int(epilogue_elems)
 
     # Tile declarations as tile[row][col]
     tiles = [[(col, row) for col in range(0, n_aie_cols)] for row in range(0, 6)]
@@ -517,11 +523,11 @@ def my_matmul(
                 elem_out_transfer = out_c.acquire(1)
                 convert_copy(elem_out_internal, elem_out_transfer, m * n)
                 if epi is not None:
-                    epi(m * n, elem_out_transfer)
+                    epi(epi_n, elem_out_transfer)
                 out_c.release(1)
             else:
                 if epi is not None:
-                    epi(m * n, elem_out_internal)
+                    epi(epi_n, elem_out_internal)
                 out_c.release(1)
 
     # Set up compute tiles
