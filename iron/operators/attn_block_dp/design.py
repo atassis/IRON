@@ -365,6 +365,19 @@ def attn_block_dp(
         # is a build constant -- same one-value-one-meaning discipline as win_param's own comment.
         row_len = win_len if win_src is not None else S
 
+        # The K/V-cache fills stream N_KV_CHUNKS tiles into `stream_c` no matter what `chunks`
+        # is -- the fill side has no scratchpad parameter to shrink its own trip count by. A tile
+        # this core does not acquire here is not discarded, it is what the NEXT dispatch's first
+        # acquire returns: draining spends the bytes the fill already moved, not the MACs, which
+        # is the split window_parameter exists to measure. Guarded in Python, not emitted as an
+        # `scf.if`, because N_KV_CHUNKS - chunks is 0 on the constant-trip-count path and a
+        # zero-trip loop is still a loop the unwindowed core program must not contain.
+        def drain_remainder():
+            if win_src is not None:
+                for _ in range_(arith.subi(arith.constant(N_KV_CHUNKS, T.i32()), chunks)):
+                    stream_c.acquire(1)
+                    stream_c.release(1)
+
         # step 1: rebuild cur and n_in from D/HD chunks, then hn = weighted_RMSNorm(cur, n_in).
         for i in range(N_MISC_CHUNKS):
             ch = misc_c.acquire(1)
@@ -421,6 +434,7 @@ def attn_block_dp(
             for g in range(gqa):
                 sc_mv_k(rpc, row_off, at, qh_bufs[g], sc_bufs[g])
             stream_c.release(1)
+        drain_remainder()
 
         # step 7: softmax over a row this core produced. No exchange: the crossbar that forced
         # sc/sw through DDR existed only because scores and softmax disagreed about columns.
@@ -441,6 +455,7 @@ def attn_block_dp(
                 # to shrink, so it stays S rather than following mask_k/softmax_k onto row_len.
                 tr_k(rpc, 1, S, w_off, at, sw_bufs[g], acc_bufs[g])
             stream_c.release(1)
+        drain_remainder()
         for g in range(gqa):
             ct = out_p.acquire(1)
             tf_k(1, acc_bufs[g], ct)

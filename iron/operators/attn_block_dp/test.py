@@ -105,6 +105,133 @@ def _normalize_core_region(region):
     )
 
 
+def _extract_scf_for_blocks(region):
+    """Every LEAF `scf.for ... { ... }` in one core region, as (bound-operand, body-text) -- i.e.
+    every step loop, but not core_fn's own outer Worker dispatch loop, which wraps the WHOLE body
+    in one `scf.for %arg0 = %c0 to %c9223372036854775807 ...` (run forever, one dispatch per
+    iteration) and would otherwise swallow every other match into a single block. Brace-matched
+    like `_extract_core_regions`; a block whose own body contains another `scf.for` is a wrapper,
+    not a step loop, and is dropped -- core_fn nests loops no deeper than that one level today."""
+    blocks = []
+    for m in re.finditer(r"scf\.for %\S+ = %\S+ to %(\S+) step %\S+ \{", region):
+        brace = region.index("{", m.start())
+        depth, i = 0, brace
+        while True:
+            if region[i] == "{":
+                depth += 1
+            elif region[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        blocks.append((m.group(1), region[brace + 1:i]))
+    return [(b, body) for b, body in blocks if "scf.for " not in body]
+
+
+_ACQUIRE_RE = re.compile(r"^%\S+ = aie\.objectfifo\.acquire @(\S+)\(Consume, 1\) : memref<\d+xbf16>$")
+_RELEASE_RE = re.compile(r"^aie\.objectfifo\.release @(\S+)\(Consume, 1\)$")
+
+
+def _drain_block_fifo(body):
+    """A drain loop's body is EXACTLY one acquire and one release of the SAME fifo and nothing
+    else -- no func.call between them. That is what makes "acquire without computing" structurally
+    detectable in the IR text rather than argued from the Python source. Returns the fifo name, or
+    None if the block is not this shape (e.g. a compute loop, which always calls a kernel)."""
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if len(lines) != 2:
+        return None
+    acq, rel = _ACQUIRE_RE.match(lines[0]), _RELEASE_RE.match(lines[1])
+    return acq.group(1) if (acq and rel and acq.group(1) == rel.group(1)) else None
+
+
+def _chunks_ssa_for_bound(region, bound_operand):
+    """`bound_operand` is a compute loop's `to %X`. On a windowed build X is `arith.index_cast`
+    off the i32 `chunks` value read from the scratchpad parameter -- return that i32 SSA name.
+    None on a compile-time build, where the operand is a bare index constant instead."""
+    m = re.search(rf"%{re.escape(bound_operand)} = arith\.index_cast %(\S+) : i32 to index", region)
+    return m.group(1) if m else None
+
+
+def _drain_literal_for_bound(region, bound_operand, chunks_ssa):
+    """`bound_operand` is a drain loop's `to %X`. Confirms X traces through `arith.index_cast` off
+    an `arith.subi <LITERAL>, <chunks_ssa>` that names the SAME chunks value the sibling compute
+    loop's own bound traced to -- the identity that makes `compute + drain == LITERAL` hold for
+    every runtime value of chunks, not just the one this particular build happens to carry. Returns
+    the literal read out of the IR text, or None if the shape does not match."""
+    m = re.search(rf"%{re.escape(bound_operand)} = arith\.index_cast %(\S+) : i32 to index", region)
+    if not m:
+        return None
+    m2 = re.search(rf"%{re.escape(m.group(1))} = arith\.subi %(\S+), %(\S+) : i32", region)
+    if not m2 or m2.group(2) != chunks_ssa:
+        return None
+    m3 = re.search(rf"%{re.escape(m2.group(1))} = arith\.constant (\d+) : i32\b", region)
+    return int(m3.group(1)) if m3 else None
+
+
+def test_dynamic_window_drain_conserves_stream_acquires(tmp_path):
+    """The fill streams N_KV_CHUNKS tiles into `stream_c` regardless of `chunks` (design.py's
+    drain_remainder comment); step 6 and step 8 must each acquire exactly that many between their
+    compute loop and their drain loop, for every value `chunks` could take at runtime -- not just
+    the one this build's dispatch would carry, which this test never runs. Proved algebraically
+    from the IR text: the compute loop's bound and the drain loop's bound both trace back to the
+    SAME i32 SSA value, and the drain's is `arith.subi(LITERAL, that value)` -- so the two bounds
+    sum to LITERAL by construction, whatever `chunks` is. LITERAL is then checked against
+    N_KV_CHUNKS = S // rpc so a wrong constant (not just a wrong split) is still caught.
+
+    Control: a window_parameter=None build must contain NO acquire-only/release-only loop at all
+    (`_drain_block_fifo` finds none) -- the compute loop's own bound is already the build-time
+    literal, so nothing is left over to drain. Manually verified this control is not vacuous: with
+    `drain_remainder()`'s two call sites deleted from design.py, this same assertion on the SAME
+    "attn_window" build fails with "expected exactly one drain loop ... found 0" instead of passing.
+    """
+    D, HD, Hq, Hkv, S, tsi = 1024, 128, 16, 8, 1024, 4
+    rpc = (tsi * D) // HD               # TILE_ELEMS // HD, design.py's own derivation
+    n_kv_chunks = S // rpc
+
+    from iron.common import AIEContext
+    from iron.operators.attn_block_dp.op import AttnBlockDataParallel
+
+    def core_regions(window_parameter):
+        op = AttnBlockDataParallel(
+            D=D, HD=HD, Hq=Hq, Hkv=Hkv, max_seq=S, num_aie_columns=8, tile_size_input=tsi,
+            kv_alloc=4096, kv_block_size=128, window_parameter=window_parameter,
+            context=AIEContext(build_dir=tmp_path / f"drain_{window_parameter}"))
+        op.compile()
+        text = Path(op.xclbin_artifact.mlir_input.filename).read_text()
+        return _extract_core_regions(text)
+
+    on_regions = core_regions("attn_window")
+    assert len(on_regions) == 8
+    for region in on_regions:
+        blocks = _extract_scf_for_blocks(region)
+        for marker in ("sc_matvec_vectorized_bf16_bf16", "taccum_rows_bf16_f32"):
+            compute = [(i, b, body) for i, (b, body) in enumerate(blocks) if marker in body]
+            assert len(compute) == 1, f"expected exactly one {marker} loop, found {len(compute)}"
+            idx, compute_bound, compute_body = compute[0]
+            chunks_ssa = _chunks_ssa_for_bound(region, compute_bound)
+            assert chunks_ssa is not None, f"{marker} loop's trip count is not runtime-derived"
+
+            fifo = re.search(r"aie\.objectfifo\.acquire @(\S+)\(Consume, 1\)", compute_body).group(1)
+            # the NEXT block specifically -- stream_c is reused by every step, K- and V-cache
+            # included, so scanning the rest of the list for any @stream_c drain would match the
+            # OTHER cache's drain loop too and silently accept a missing one here.
+            assert idx + 1 < len(blocks), f"no loop follows the {marker} loop to drain {fifo}"
+            drain_bound, drain_body = blocks[idx + 1]
+            assert _drain_block_fifo(drain_body) == fifo, (
+                f"loop after the {marker} loop is not a pure {fifo} drain: {drain_body!r}")
+            literal = _drain_literal_for_bound(region, drain_bound, chunks_ssa)
+            assert literal is not None, (
+                f"{fifo} drain loop bound does not trace to arith.subi(N_KV_CHUNKS, chunks)")
+            assert literal == n_kv_chunks, (
+                f"compute + drain trip counts sum to {literal}, expected N_KV_CHUNKS={n_kv_chunks}")
+
+    off_regions = core_regions(None)
+    assert len(off_regions) == 8
+    for region in off_regions:
+        drains = [body for _, body in _extract_scf_for_blocks(region) if _drain_block_fifo(body)]
+        assert not drains, f"window_parameter=None must emit no drain loop, found {len(drains)}"
+
+
 def test_dynamic_window_makes_the_core_trip_count_independent(tmp_path):
     """The whole point: with the trip count read at runtime, two windows must compile to the SAME
     core PROGRAM. This test's predecessor compared whole core ELFs and was vacuous: two OTHER terms
