@@ -248,9 +248,12 @@ def restride_rows(offset, sizes, strides, row_width, new_row_width, col_base=0):
 
 
 def derive_block_size(HD: int, Hkv: int, addr_gran_elems: int = 2,
-                      shim_step_bits: int = 20, memtile_step_bits: int = 17) -> int:
+                      shim_step_bits: int = 20, memtile_step_bits: int = 17,
+                      S: int | None = None, n_cols: int | None = None) -> int:
     """Pick T: the largest power-of-two block size whose `block_stride` (in 4-byte address-
-    generation granules) fits the NARROWEST DMA step field this cache stream may ever cross.
+    generation granules) fits the NARROWEST DMA step field this cache stream may ever cross,
+    and -- when `S`/`n_cols` are given -- whose per-column share of S is a whole number of
+    blocks.
 
     Derived, not chosen -- three field limits were missed by exactly one elsewhere on this task
     (shim stride at S=16384, mem-tile stride at a T=256 trial, both one granule over), so this
@@ -266,9 +269,22 @@ def derive_block_size(HD: int, Hkv: int, addr_gran_elems: int = 2,
     `addr_gran_elems` is dtype-dependent (2 for bf16: 4-byte granule / 2-byte element) and is a
     caller-supplied constant, not discovered here -- this module does not own dtype width (see
     the module docstring).
+
+    `S`/`n_cols` are a SECOND, independent constraint this function used to not know about: the
+    blocked GEMV's group_reuse arm splits S across `n_cols` columns and needs each column's
+    share to be a whole number of blocks -- `(S // n_cols) % T == 0` -- which no combination of
+    HD/Hkv/field-width alone determines. The two constraints only collide on some geometries: a
+    single KV head shrinks `block_stride` (proportional to `Hkv`) enough that the field bound
+    keeps doubling T past `S // n_cols` before it ever binds. Gemma3-270M (HD=256, Hkv=1) is
+    exactly that case -- the field bound alone picks T=512, but S // n_cols is 256, and every
+    blocked-GEMV assertion downstream then fails on 256 % 512 != 0. Qwen3-0.6B (HD=128, Hkv=8)
+    never exercises this: its field-derived T=128 already divides S // n_cols=256, by the
+    geometry's luck, not by design. Left `None` (the default), this bound is not checked, so
+    every caller that predates it is unaffected.
     """
     step_bits = min(shim_step_bits, memtile_step_bits)
     max_stride_granules = (1 << step_bits) - 1
+    col_share = (S // n_cols) if (S is not None and n_cols is not None) else None
     T = 1
     while True:
         candidate = T * 2
@@ -277,6 +293,8 @@ def derive_block_size(HD: int, Hkv: int, addr_gran_elems: int = 2,
             break
         block_stride_granules = block_stride_elems // addr_gran_elems
         if block_stride_granules > max_stride_granules:
+            break
+        if col_share is not None and col_share % candidate:
             break
         T = candidate
     return T

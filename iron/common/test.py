@@ -131,6 +131,26 @@ def test_derive_block_size_scales_with_HD_and_Hkv():
     assert derive_block_size(HD=128, Hkv=4) == base * 2
 
 
+# ---- derive_block_size(S, n_cols=...): the second, column-share constraint the blocked GEMV
+# enforces that the field bound above knows nothing about (gemma3-270m was unbuildable without
+# it -- see the docstring for the Hkv=1 geometry that exposes the collision) ----
+
+def test_derive_block_size_qwen3_shape_unchanged_by_column_constraint():
+    # Regression guard: Qwen3-0.6B's default build (S=2048, COLS=8, S//COLS=256) never hits the
+    # column bound -- the field bound alone already lands on T=128, which divides 256. Passing
+    # S/n_cols must not move it.
+    assert derive_block_size(HD=128, Hkv=8, S=2048, n_cols=8) == 128
+
+
+def test_derive_block_size_gemma3_shape_divides_the_column_share():
+    # Gemma3-270M (Hkv=1, HD=256): the field bound alone picks T=512 (see the bug this fixes --
+    # blocked GEMV then needs S // COLS=256 to be a whole number of T=512 blocks, and isn't). The
+    # column constraint caps T at S // n_cols=256, which the field bound alone does not know to do.
+    T = derive_block_size(HD=256, Hkv=1, S=2048, n_cols=8)
+    assert T == 256
+    assert (2048 // 8) % T == 0
+
+
 # ---- split_run: the wrap-cap splitter tmatvec's blocked tap now shares with gemv's ----
 
 def test_split_run_reconstructs_the_run():
