@@ -210,6 +210,43 @@ def blocked_access_pattern(offset, sizes, strides, row_width, block_rows, block_
             + base_col, out_sizes, out_strides)
 
 
+def restride_rows(offset, sizes, strides, row_width, new_row_width, col_base=0):
+    """Re-target a row-major access pattern at a DIFFERENT row stride, same tile shape.
+
+    An operand that is a per-head slice of a wider token-major buffer (`q[:, h*HD:(h+1)*HD]` of a
+    `[M, Hq*HD]` buffer) has exactly the tile structure the tiler already built for a dense
+    `[M, HD]` matrix -- only the distance between consecutive rows differs. Returns
+    `(offset, sizes, strides)` with every ROW step rescaled and the offset's row component with it;
+    column steps and repeats are untouched. `new_row_width == row_width` returns the input
+    unchanged, so a dense call site keeps its exact descriptor.
+
+    `col_base` is where the slice starts in the wider buffer, in ELEMENTS, and it is a separate
+    argument rather than something to fold into `offset` because folding it is wrong in a way that
+    still runs: `offset` is in the DENSE matrix's coordinates, so a column base added to it is read
+    as ROWS by the decomposition below and lands the operand somewhere plausible and incorrect.
+
+    Exists so an operator can read or write a strided view in place instead of asking the graph for
+    a rearrange either side of it -- on the prefill attention block those two rearranges were two
+    ops per layer doing 0% compute.
+    """
+    if len(sizes) != len(strides):
+        raise ValueError(f"len(sizes) ({len(sizes)}) != len(strides) ({len(strides)})")
+    if row_width <= 0 or new_row_width <= 0:
+        raise ValueError(f"row widths must be > 0, got {row_width} and {new_row_width}")
+    out = []
+    for dim, (size, stride) in enumerate(zip(sizes, strides)):
+        if stride == 0 or size == 1 or stride < row_width:
+            out.append(stride)                       # repeat, degenerate dim, or a column step
+        elif stride % row_width:
+            raise ValueError(
+                f"dim {dim} steps {stride} elements, neither under one row ({row_width}) nor a "
+                f"whole number of them -- not a row-major pattern")
+        else:
+            out.append(stride // row_width * new_row_width)
+    row, col = divmod(offset, row_width)
+    return row * new_row_width + col + col_base, list(sizes), out
+
+
 def derive_block_size(HD: int, Hkv: int, addr_gran_elems: int = 2,
                       shim_step_bits: int = 20, memtile_step_bits: int = 17) -> int:
     """Pick T: the largest power-of-two block size whose `block_stride` (in 4-byte address-

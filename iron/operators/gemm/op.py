@@ -36,6 +36,12 @@ class GEMM(MLIROperator):
     # Both are excluded from the operator NAME when None, so a flat GEMM's artifact does not move.
     b_block_rows: int | None = None
     b_block_stride: int | None = None
+    # A read from, and C written into, a per-head SLICE of a wider token-major buffer: the same
+    # [M, K] / [M, N] tile shape, only the row stride differs. `None` is the dense operand every
+    # caller had before, down to the descriptor. Lets a graph drop the rearrange either side of an
+    # op instead of materialising a head-major copy -- see iron.common.kv_layout.restride_rows.
+    a_row_stride: int | None = None
+    c_row_stride: int | None = None
     num_aie_columns: int = field(default=8)
     emulate_bf16_mmul_with_bfp16: bool = field(default=True, repr=False)
     prio_accuracy: bool = field(default=False, repr=False)
@@ -55,6 +61,8 @@ class GEMM(MLIROperator):
         "c_col_maj": "cc",
         "b_block_rows": "bbr",
         "b_block_stride": "bbs",
+        "a_row_stride": "ars",
+        "c_row_stride": "crs",
     }
 
     def __post_init__(self):
@@ -94,7 +102,26 @@ class GEMM(MLIROperator):
                     f"b_block_stride ({self.b_block_stride}) is under one block "
                     f"({self.b_block_rows} x {self._b_row_width}): blocks would overlap")
 
+        for nm, stride, dense in (("a_row_stride", self.a_row_stride, self.K),
+                                  ("c_row_stride", self.c_row_stride, self.N)):
+            if stride is not None and stride < dense:
+                raise ValueError(
+                    f"{nm} ({stride}) is narrower than the operand it strides ({dense}); it is the "
+                    f"row pitch of the buffer the slice lives in, not the slice's own width")
+
         MLIROperator.__init__(self, context=self.context)
+
+    @property
+    def a_elems(self):
+        """A's allocated extent. Strided, the operand runs from its first row to the END of its
+        last -- `(M-1)*pitch + K`, not `M*pitch`, so the slice of the final head still fits."""
+        return self.M * self.K if self.a_row_stride is None \
+            else (self.M - 1) * self.a_row_stride + self.K
+
+    @property
+    def c_elems(self):
+        return self.M * self.N if self.c_row_stride is None \
+            else (self.M - 1) * self.c_row_stride + self.N
 
     @property
     def _b_rows(self):
@@ -141,6 +168,8 @@ class GEMM(MLIROperator):
                     "b_col_maj": int(self.b_col_maj),
                     "b_block_rows": self.b_block_rows,
                     "b_block_stride": self.b_block_stride,
+                    "a_row_stride": self.a_row_stride,
+                    "c_row_stride": self.c_row_stride,
                     "c_col_maj": int(self.c_col_maj),
                     "use_scalar": self.use_scalar,
                     "emulate_bf16_mmul_with_bfp16": self.emulate_bf16_mmul_with_bfp16,
@@ -194,7 +223,8 @@ class GEMM(MLIROperator):
 
     def get_arg_spec(self):
         return [
-            AIERuntimeArgSpec("in", (self.M, self.K)),  # input A
+            AIERuntimeArgSpec(  # input A
+                "in", (self.a_elems,) if self.a_row_stride is not None else (self.M, self.K)),
             # input B (weights). Blocked, B's extent is not K*N and it is not 2-D contiguous
             # either, so it is declared as the flat run the descriptor actually addresses; flat, the
             # shape is left exactly as it was so no existing sequence sees a changed spec.
@@ -204,9 +234,10 @@ class GEMM(MLIROperator):
                 if self.b_block_rows is not None
                 else ((self.N, self.K) if self.b_col_maj else (self.K, self.N)),
             ),
-            AIERuntimeArgSpec(
-                "out", (self.M, self.N) if not self.c_col_maj else (self.N, self.M)
-            ),  # output C
+            AIERuntimeArgSpec(  # output C
+                "out",
+                (self.c_elems,) if self.c_row_stride is not None
+                else ((self.M, self.N) if not self.c_col_maj else (self.N, self.M))),
         ]
 
     def reference(self, A, B):

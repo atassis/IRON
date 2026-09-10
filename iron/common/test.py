@@ -7,7 +7,7 @@
 import pytest
 
 from iron.common.kv_layout import (KVLayout, blocked_access_pattern, derive_block_size,
-                                   split_run, validate_block_size)
+                                   restride_rows, split_run, validate_block_size)
 
 
 # ---- KVLayout: T == S degenerates to the pre-blocking flat [Hkv, S, HD] formula ----
@@ -330,3 +330,48 @@ def test_blocked_access_pattern_raises_on_a_step_that_is_neither_rows_nor_column
 def test_blocked_access_pattern_rejects_overlapping_blocks():
     with pytest.raises(ValueError, match="under one block"):
         blocked_access_pattern(0, [4, 8], [128, 1], 128, 128, 128 * 128 - 2)
+
+
+# ---- restride_rows: reading a per-head slice of a wider buffer in place ----
+
+def test_restride_rows_is_the_identity_at_the_same_width():
+    off, sizes, strides = restride_rows(8192, [4, 2, 64, 64], [0, 64, 128, 1], 128, 128)
+    assert (off, sizes, strides) == (8192, [4, 2, 64, 64], [0, 64, 128, 1])
+
+
+def test_restride_rows_visits_the_head_slice_of_the_wider_buffer():
+    # The GEMM A tap for prefill's scores op: a dense [M=256, HD=128] matrix. Re-targeted at a
+    # [M, QD=2048] buffer it must visit exactly head h's columns, row for row.
+    HD, QD, M = 128, 2048, 256
+    for h in (0, 5, 15):
+        off, sizes, strides = restride_rows(0, [4, 2, 64, 64], [0, 64, 128, 1], HD, QD,
+                                            col_base=h * HD)
+        got = _walk(sizes, strides, off)
+        # every address must decode to (row, column) inside head h's band of the wide buffer
+        for a in got:
+            r, c = divmod(a, QD)
+            assert 0 <= r < M and h * HD <= c < (h + 1) * HD, (h, a)
+        # and the SEQUENCE must match the dense pattern, element for element
+        dense = _walk(sizes, [0, 64, 128, 1], 0)
+        assert [divmod(a, QD)[0] * HD + divmod(a, QD)[1] - h * HD for a in got] == dense
+
+
+def test_restride_rows_rescales_only_row_steps():
+    # dim1's 64 is half a row and must NOT move; dim2's 128 is one row and must.
+    _, _, strides = restride_rows(0, [4, 2, 64, 64], [0, 64, 128, 1], 128, 2048)
+    assert strides == [0, 64, 2048, 1]
+
+
+def test_restride_rows_takes_the_column_base_separately_from_the_offset():
+    # Folding the column base into `offset` is the misuse this argument exists to prevent: it is
+    # read as ROWS and lands the operand somewhere plausible and wrong.
+    HD, QD = 128, 2048
+    right, _, _ = restride_rows(0, [64, 64], [128, 1], HD, QD, col_base=5 * HD)
+    wrong, _, _ = restride_rows(5 * HD, [64, 64], [128, 1], HD, QD)
+    assert right == 5 * HD
+    assert wrong == 5 * QD and wrong != right
+
+
+def test_restride_rows_rejects_a_step_that_is_not_rows_or_columns():
+    with pytest.raises(ValueError, match="neither under one row"):
+        restride_rows(0, [4, 8], [192, 1], 128, 2048)

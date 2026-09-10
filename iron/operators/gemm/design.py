@@ -22,7 +22,7 @@ from aie.iron import (
 from aie.iron.device import NPU1Col1, NPU1Col2, NPU1, NPU2, Tile
 from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D, TensorAccessPattern
 from aie.iron.controlflow import range_
-from iron.common.kv_layout import blocked_access_pattern
+from iron.common.kv_layout import blocked_access_pattern, restride_rows
 from iron.operators._trace import maybe_enable_trace
 
 microkernel_mac_dim_map = {
@@ -151,6 +151,8 @@ def my_matmul(
     generate_taps=False,
     b_block_rows=None,
     b_block_stride=None,
+    a_row_stride=None,
+    c_row_stride=None,
 ):
     n_aie_rows = 4
 
@@ -272,7 +274,14 @@ def my_matmul(
     C_taps = []
 
     # Define tensor types
-    A_ty = np.ndarray[(M * K,), np.dtype[dtype_in]]
+    # A and C may be per-head SLICES of a wider token-major buffer: same tile shape, different row
+    # pitch. The extent then runs to the END of the last row, (M-1)*pitch + width, so the final
+    # head's slice still fits inside the buffer.
+    a_elems = M * K if a_row_stride is None else (M - 1) * a_row_stride + K
+    c_elems = M * N if c_row_stride is None else (M - 1) * c_row_stride + N
+    if c_row_stride is not None and c_col_maj:
+        raise ValueError("c_row_stride strides C's ROWS; c_col_maj has no rows to stride")
+    A_ty = np.ndarray[(a_elems,), np.dtype[dtype_in]]
     # B's rows may be stored BLOCKED (groups of b_block_rows rows, consecutive groups
     # b_block_stride elements apart, peer matrices interleaved in the gap) -- then this matrix's
     # rows reach past its peers to the end of its last block, and K*N is not its extent.
@@ -287,7 +296,7 @@ def my_matmul(
         else (b_rows // b_block_rows - 1) * b_block_stride + b_block_rows * b_row_width
     )
     B_ty = np.ndarray[(b_elems,), np.dtype[dtype_in]]
-    C_ty = np.ndarray[(M * N,), np.dtype[dtype_out]]
+    C_ty = np.ndarray[(c_elems,), np.dtype[dtype_out]]
     A_l2_ty = np.ndarray[(mem_tile_m_A * k,), np.dtype[dtype_in]]
     B_l2_ty = np.ndarray[(k * n,), np.dtype[dtype_in]]
     C_l2_ty = np.ndarray[(mem_tile_m_C * n,), np.dtype[dtype_out]]
@@ -545,6 +554,15 @@ def my_matmul(
         pattern_repeat=n_c_col_tiles_per_core,
         prune_step=False,
     )
+    if a_row_stride is not None:
+        # Same tiles, wider rows. col_base stays 0: the graph points the operand at the head's
+        # first column by SLICING the buffer, so the descriptor is head-independent and one design
+        # serves every head -- which is the whole reason this is a stride and not an offset.
+        restrided = []
+        for t in A_tiles:
+            off, sizes, strides = restride_rows(t.offset, t.sizes, t.strides, K, a_row_stride)
+            restrided.append(TensorAccessPattern((a_elems,), off, sizes, strides))
+        A_tiles = restrided
     if b_col_maj:
         B_tiles = TensorTiler2D.step_tiler(
             (N, K),  # Size of B matrix
@@ -670,8 +688,12 @@ def my_matmul(
                             C_offset = C_col_offset + C_row_offset
                             C_sizes = [N // mem_tile_n, n_aie_rows, n, m]
                             C_strides = [M * mem_tile_n, m, M, 1]
+                        if c_row_stride is not None:
+                            C_offset, C_sizes, C_strides = restride_rows(
+                                C_offset, C_sizes, C_strides, N, c_row_stride)
                         C_tile = TensorAccessPattern(
-                            (N, M) if c_col_maj else (M, N),
+                            (c_elems,) if c_row_stride is not None
+                            else ((N, M) if c_col_maj else (M, N)),
                             offset=C_offset,
                             sizes=C_sizes,
                             strides=C_strides,
