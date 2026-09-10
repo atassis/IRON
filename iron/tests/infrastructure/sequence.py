@@ -22,6 +22,8 @@ The ``OperatorSequence`` dispatch modes covered here are:
 
 from pathlib import Path
 
+import re
+
 import pytest
 import torch
 
@@ -163,6 +165,103 @@ def test_fused_mlir_contains_reconfiguration(sequence, aie_context, tmp_path):
     assert (
         text.count("aie.device") >= 3
     ), "expected two operator devices plus a top-level device"
+
+
+# ---------------------------------------------------------------------------
+# 2b. extra_runlists emits one NAMED runtime sequence per variant, over one arena.
+# ---------------------------------------------------------------------------
+
+
+def _variant_sequence(context, name, with_variant):
+    """Two runlists that differ only in WHICH design runs the second step.
+
+    That is the shape a per-dispatch selection needs: same buffers, same arena, a different
+    design per variant. `with_variant=False` is the negative control -- the same construction
+    with the variant withheld, so the assertions below can fail.
+    """
+    add = ElementwiseAdd(
+        size=_ADD_RELU_SIZE,
+        tile_size=_ADD_RELU_TILE,
+        num_aie_columns=_ADD_RELU_COLS,
+        context=context,
+    )
+    relu_wide = ReLU(
+        size=_ADD_RELU_SIZE,
+        num_aie_columns=_ADD_RELU_COLS,
+        num_channels=1,
+        tile_size=_ADD_RELU_TILE,
+        context=context,
+    )
+    relu_narrow = ReLU(
+        size=_ADD_RELU_SIZE,
+        num_aie_columns=_ADD_RELU_COLS,
+        num_channels=1,
+        tile_size=_ADD_RELU_TILE // 2,
+        context=context,
+    )
+    base = [(add, "a", "b", "temp"), (relu_wide, "temp", "out")]
+    extra = (
+        {"sequence_narrow": [(add, "a", "b", "temp"), (relu_narrow, "temp", "out")]}
+        if with_variant
+        else None
+    )
+    return OperatorSequence(
+        name=name,
+        runlist=base,
+        extra_runlists=extra,
+        input_args=["a", "b"],
+        output_args=["out"],
+        dispatch="fused",
+        context=context,
+    )
+
+
+def _fused_text(seq, tmp_path):
+    seq.subbuffer_layout, seq.buffer_sizes, seq.slice_info = (
+        seq.calculate_buffer_layout()
+    )
+    art = seq._dispatch.build_fused_mlir(seq)
+    art.filename = str(tmp_path / art.filename)
+    fuse_mlir(art)
+    return Path(art.filename).read_text(), seq
+
+
+@pytest.mark.parametrize("with_variant", [True, False])
+def test_extra_runlists_emit_named_sequences(with_variant, aie_context, tmp_path):
+    """A variant becomes its own named `aie.runtime_sequence` in the `main` device, which is
+    what aiecc turns into a second control code and XRT resolves as `main:<name>`.
+
+    The control (`with_variant=False`) is the same construction with the variant withheld: it
+    must produce exactly one sequence and NOT mention the variant's name anywhere, so a change
+    that silently ignored `extra_runlists` fails here rather than passing quietly.
+    """
+    seq = _variant_sequence(aie_context, f"infra_variants_{with_variant}", with_variant)
+    text, seq = _fused_text(seq, tmp_path)
+
+    # The MLIR printer ELIDES the symbol when it equals the assembly-format default, so the
+    # `sequence` variant prints bare and only a non-default variant shows an `@name`. That is
+    # also why every shipped artifact's `kernel_name: main:sequence` resolves against a fused
+    # module whose top-level sequence carries no visible symbol -- do not read the bare form as
+    # "unnamed". Top-level sequences are the ones taking the i8 arena.
+    top_level = re.findall(r"aie\.runtime_sequence\s*(@\w+)?\(%arg0: memref<\d+xi8>", text)
+    if not with_variant:
+        assert "sequence_narrow" not in text, "control leaked a variant it was never given"
+        assert len(top_level) == 1, f"control emitted {len(top_level)} top-level sequences"
+        # The narrow design must not be built at all when no variant references it.
+        assert len(seq.unique_designs()[0]) == 2
+        return
+
+    assert len(top_level) == 2, f"expected two top-level sequences, got {top_level}"
+    assert top_level[0] is None or top_level[0] == "", "default variant must print bare"
+    assert "@sequence_narrow" in top_level, f"variant sequence missing: {top_level}"
+    # Three designs: the shared add, and one ReLU per variant.
+    assert len(seq.unique_designs()[0]) == 3, "variant did not contribute its own design"
+    # ONE arena for both. A buffer named by both variants keeps a single offset, which is why a
+    # host may switch variants between dispatches without moving data.
+    assert set(seq.subbuffer_layout) >= {"a", "b", "temp", "out"}
+    # Each variant configures its OWN second-step device, so the two sequences are not copies.
+    devices = re.findall(r"aiex\.configure @(\w+)", text)
+    assert len(set(devices)) >= 3, f"variants share every device: {sorted(set(devices))}"
 
 
 # ---------------------------------------------------------------------------

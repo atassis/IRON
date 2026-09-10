@@ -57,6 +57,9 @@ def _require_xrt() -> None:
 # ##########################################################################
 
 
+DEFAULT_SEQUENCE = comp.DEFAULT_SEQUENCE
+
+
 class SequenceDispatch:
     """Policy object that decides how an :class:`OperatorSequence` is compiled
     and how its runtime callable is built.
@@ -140,8 +143,11 @@ class FusedDispatch(SequenceDispatch):
             design_names.append(op_name)
             operator_mlir_map[op_name] = mlir_artifact
 
-        for op, *bufs in seq.runlist:
-            comp_runlist.append((design_names[design_of[id(op)]], *bufs))
+        def to_comp(rl):
+            return [(design_names[design_of[id(op)]], *bufs) for op, *bufs in rl]
+
+        comp_runlist = to_comp(seq.runlist)
+        extra = {name: to_comp(rl) for name, rl in seq.extra_runlists.items()}
 
         return comp.SequenceMLIRArtifact(
             seq.name + "_fused.mlir",
@@ -150,6 +156,7 @@ class FusedDispatch(SequenceDispatch):
             subbuffer_layout=seq.subbuffer_layout,
             buffer_sizes=seq.buffer_sizes,
             slice_info=seq.slice_info,
+            extra_runlists=extra,
         )
 
     def _collect_kernel_artifacts(self, seq):
@@ -308,18 +315,27 @@ class OperatorSequence(AIEOperatorBase):
         extra_flags=None,
         share_designs=False,
         scratch_order=None,
+        extra_runlists=None,
         *args,
         **kwargs,
     ):
         dispatch = self._coerce_dispatch(dispatch)
-        if not all(
-            isinstance(op, MLIROperator) and all(isinstance(buf, str) for buf in bufs)
-            for op, *bufs in runlist
-        ):
-            raise TypeError(
-                "runlist entries must be (MLIROperator, *str) tuples; "
-                "each operator must be an MLIROperator and each buffer name must be a str"
+        self.extra_runlists = dict(extra_runlists or {})
+        if DEFAULT_SEQUENCE in self.extra_runlists:
+            raise ValueError(
+                f"extra_runlists must not redefine the default variant "
+                f"'{DEFAULT_SEQUENCE}'; pass it as `runlist`"
             )
+        for _rl in [runlist, *self.extra_runlists.values()]:
+            if not all(
+                isinstance(op, MLIROperator)
+                and all(isinstance(buf, str) for buf in bufs)
+                for op, *bufs in _rl
+            ):
+                raise TypeError(
+                    "runlist entries must be (MLIROperator, *str) tuples; "
+                    "each operator must be an MLIROperator and each buffer name must be a str"
+                )
         super().__init__(*args, **kwargs)
         self.runlist = runlist
         # Sharing changes which designs are built, so it belongs in the name that
@@ -345,11 +361,24 @@ class OperatorSequence(AIEOperatorBase):
             return _DISPATCH_ALIASES[dispatch]()
         raise TypeError("selected dispatch mode not supported")
 
+    @property
+    def runlists(self):
+        """Every dispatch variant, default first, keyed by its runtime-sequence symbol.
+
+        A variant is a SEPARATE named control code in the one full ELF, selected by the host at
+        `xrt::ext::kernel(ctx, "main:<name>")` against a single registered hw_context. Variants
+        therefore share this sequence's ARENA -- the layout below is computed over their union,
+        so a buffer keeps one offset no matter which variant references it, which is the whole
+        reason a host can switch variants between dispatches without moving any data.
+        """
+        return {DEFAULT_SEQUENCE: self.runlist, **self.extra_runlists}
+
     def unique_operators(self):
-        """Operators in runlist order, de-duplicated by identity."""
+        """Operators in runlist order across every variant, de-duplicated by identity."""
         seen = {}
-        for op, *_ in self.runlist:
-            seen.setdefault(id(op), op)
+        for rl in self.runlists.values():
+            for op, *_ in rl:
+                seen.setdefault(id(op), op)
         return list(seen.values())
 
     def unique_designs(self):
@@ -409,7 +438,7 @@ class OperatorSequence(AIEOperatorBase):
             {}
         )  # full_buffer_name (with slice) -> (base_name, start, end, args_spec)
 
-        for op, *bufs in self.runlist:
+        for op, *bufs in (e for rl in self.runlists.values() for e in rl):
             args_specs = op.get_arg_spec()
             if len(args_specs) != len(bufs):
                 raise ValueError(

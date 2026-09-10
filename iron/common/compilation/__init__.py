@@ -29,6 +29,7 @@ from .base import (
     ArchiveCompilationRule,
 )
 from .sequence import (
+    DEFAULT_SEQUENCE,
     SequenceMLIRArtifact,
     FusePythonGeneratedMLIRCompilationRule,
 )

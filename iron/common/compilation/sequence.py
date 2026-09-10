@@ -27,6 +27,7 @@ from . import (
 )
 
 RESET_DEVICE = "reset_device"
+DEFAULT_SEQUENCE = "sequence"
 
 
 def element_size_bytes(ty: ir.Type) -> int:
@@ -76,6 +77,7 @@ class SequenceMLIRArtifact(MLIRArtifact):
         subbuffer_layout: dict[str, tuple[str, int, int]],
         buffer_sizes: tuple[int, int, int],
         slice_info: dict[str, tuple[str, int, int]] | None = None,
+        extra_runlists: dict[str, list[tuple[str, ...]]] | None = None,
     ) -> None:
         dependencies = list(operator_mlir_map.values())
         super().__init__(filename, dependencies)
@@ -84,6 +86,23 @@ class SequenceMLIRArtifact(MLIRArtifact):
         self.subbuffer_layout = subbuffer_layout
         self.buffer_sizes = buffer_sizes
         self.slice_info = slice_info or {}
+        # Each entry becomes its own `aie.runtime_sequence` inside the `main` device, and aiecc
+        # emits one NAMED control code per runtime sequence into the single full ELF (one
+        # `instance` per sequence under one `xrt-kernel`, over a shared PDI list). XRT then
+        # resolves `main:<name>` at kernel construction against ONE registered hw_context, so a
+        # host can pre-create one kernel per variant and pick per dispatch. The default variant
+        # keeps the name `sequence` so `main:sequence` -- what every shipped artifact's meta
+        # records -- still resolves.
+        self.extra_runlists = dict(extra_runlists or {})
+        if DEFAULT_SEQUENCE in self.extra_runlists:
+            raise ValueError(
+                f"extra_runlists must not redefine the default variant '{DEFAULT_SEQUENCE}'"
+            )
+
+    @property
+    def runlists(self) -> dict[str, list[tuple[str, ...]]]:
+        """Every variant, default first, keyed by the runtime-sequence symbol it becomes."""
+        return {DEFAULT_SEQUENCE: self.runlist, **self.extra_runlists}
 
 
 # Helper Functions
@@ -226,8 +245,14 @@ def fuse_mlir(artifact: SequenceMLIRArtifact) -> None:
             dev_op.sym_name = ir.StringAttr.get(op_name)
             ctx.module.body.append(dev_op)
 
-        needs_reset = needs_additional_reset(artifact.runlist)
-        if needs_reset:
+        # One `aie.runtime_sequence` per variant. `needs_additional_reset` is a property of a
+        # runlist's own configure-point parity, so it is decided PER VARIANT; the empty reset
+        # device is emitted once and shared by whichever variants need it.
+        variant_runlists = artifact.runlists
+        variant_needs_reset = {
+            name: needs_additional_reset(rl) for name, rl in variant_runlists.items()
+        }
+        if any(variant_needs_reset.values()):
 
             @aie.device(device_ty)
             def reset():
@@ -247,12 +272,9 @@ def fuse_mlir(artifact: SequenceMLIRArtifact) -> None:
             buf_dtype = np.dtype[np.int8]
 
             # RuntimeSequenceOp
-            @aiex.runtime_sequence(
-                np.ndarray[(input_buffer_size,), buf_dtype],
-                np.ndarray[(output_buffer_size,), buf_dtype],
-                np.ndarray[(scratch_buffer_size,), buf_dtype],
-            )
-            def sequence(input_buf, output_buf, scratch_buf):
+            def sequence_body(
+                variant_runlist, variant_reset, input_buf, output_buf, scratch_buf
+            ):
                 consolidated_buffers = {
                     "input": input_buf,
                     "output": output_buf,
@@ -262,7 +284,7 @@ def fuse_mlir(artifact: SequenceMLIRArtifact) -> None:
                 # Execute operations in runlist order
                 configure_op = None
                 last_op_name = None
-                for op_name, *buffer_names in artifact.runlist:
+                for op_name, *buffer_names in variant_runlist:
                     expected_arg_types = sequence_arg_types[op_name]
 
                     # Avoid reconfiguring altogether if the same op is called multiple times consecutively
@@ -339,9 +361,19 @@ def fuse_mlir(artifact: SequenceMLIRArtifact) -> None:
                         sequence_sym_ref_attr = ir.FlatSymbolRefAttr.get("sequence")
                         run_op = aiex.RunOp(sequence_sym_ref_attr, buffer_ssa_values)
 
-                if needs_reset:
+                if variant_reset:
                     reset_op = aiex.ConfigureOp(ir.FlatSymbolRefAttr.get(RESET_DEVICE))
                     reset_op.body.blocks.append()
+
+            # `sym_name` is what aiecc keys the emitted control code on, and what XRT resolves as
+            # the `main:<name>` subkernel. Emitted in dict order, default variant first.
+            for seq_name, seq_runlist in variant_runlists.items():
+                aiex.runtime_sequence(
+                    np.ndarray[(input_buffer_size,), buf_dtype],
+                    np.ndarray[(output_buffer_size,), buf_dtype],
+                    np.ndarray[(scratch_buffer_size,), buf_dtype],
+                    sym_name=seq_name,
+                )(partial(sequence_body, seq_runlist, variant_needs_reset[seq_name]))
 
         # Write the fused MLIR to file
         with open(artifact.filename, "w") as f:
