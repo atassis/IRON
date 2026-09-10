@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from dataclasses import dataclass, field
 from typing import ClassVar, Dict
 
@@ -212,6 +213,9 @@ class DecodeLayerDataParallel(MLIROperator):
         QD = self.Hq * self.HD
         gen, a2 = kdir / "generic", kdir / arch
 
+        _rb = int(os.environ.get("SCORES_ROWBATCH", "1"))
+        _rb_tag = f"_rb{_rb}" if _rb > 1 else ""
+
         def obj(name, src, flags=(), prefix=None):
             return KernelObjectArtifact(name, dependencies=[SourceArtifact(src)],
                                         extra_flags=list(flags), prefix_symbols=prefix)
@@ -229,8 +233,12 @@ class DecodeLayerDataParallel(MLIROperator):
                 [f"-DRMS_COLS={self.HD}"], "attn_hd_"),
             obj(f"attn_gemv_{self.D}k.o", gen / "mv.cc",
                 [f"-DDIM_K={self.D}", "-DVEC_SIZE=64"], "attn_"),
-            obj(f"attn_sc_gemv_{self.HD}k.o", gen / "mv.cc",
-                [f"-DDIM_K={self.HD}", "-DVEC_SIZE=64"], "attn_sc_"),
+            # The SCORES gemv is the only core-bound op in this graph, so it is the one where a
+            # row-batched reduce can convert. GEMV_ROWBATCH rides in the NAME for the same reason
+            # the prefixes above do: the archive is keyed by name, so a -D-only difference would
+            # silently reuse the other variant's object. ROWBATCH=1 keeps the historical name.
+            obj(f"attn_sc_gemv_{self.HD}k{_rb_tag}.o", gen / "mv.cc",
+                [f"-DDIM_K={self.HD}", "-DVEC_SIZE=64", f"-DGEMV_ROWBATCH={_rb}"], "attn_sc_"),
             obj("attn_rope.o", gen / "rope.cc", ["-DTWO_HALVES"], "attn_"),
             obj("attn_softmax.o", a2 / "softmax.cc", (), "attn_"),
             obj(f"attn_tmv_{self.HD}n.o", gen / "mv_taccum.cc",
