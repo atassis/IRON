@@ -96,6 +96,7 @@ way once per layer; this does not make it worse and does not fix it.
 """
 
 import aie.dialects.index as index
+import aie.extras.dialects.arith as arith
 from aie.dialects.aie import T
 from ml_dtypes import bfloat16
 import numpy as np
@@ -151,6 +152,7 @@ def attn_block_dp(
     n_aie_cols=8,
     kv_offset_parameter="kv_off",
     mask_parameter="sm_mask",
+    window_parameter=None,   # None: N_KV_CHUNKS stays a build constant. A name: read at runtime.
     trace_size=0,
     weight_depth=2,
     wqkv_head_major=False,
@@ -271,6 +273,11 @@ def attn_block_dp(
     kv_off_param = (ScratchpadParameter(kv_offset_parameter, np.int32)
                     if kv_offset_parameter is not None else None)
     mask_param = ScratchpadParameter(mask_parameter, np.int32)
+    # Carries L, a WINDOW LENGTH in positions -- not a chunk count. A later task needs the length
+    # itself for the DMA side, and one parameter meaning one thing is what keeps two consumers
+    # (this core loop and that future fill) from disagreeing about what it means.
+    win_param = (ScratchpadParameter(window_parameter, np.int32)
+                 if window_parameter is not None else None)
 
     D_ty = np.ndarray[(D,), np.dtype[BF16]]
     HD_ty = np.ndarray[(HD,), np.dtype[BF16]]
@@ -338,12 +345,38 @@ def attn_block_dp(
 
     barriers = [WorkerRuntimeBarrier() for _ in range(N)]
 
-    def core_fn(misc_c, stream_c, out_p, mask_src, barrier,
+    def core_fn(misc_c, stream_c, out_p, mask_src, win_src, barrier,
                 cur_buf, nin_buf, hn_buf, raw_buf, nrm_buf, qh_bufs, sc_bufs, sw_bufs, acc_bufs,
                 copy_k, wnorm_d_k, wnorm_hd_k, mv_k, rope_k,
                 sc_mv_k, mask_k, softmax_k, tz_k, tr_k, tf_k):
+        # Read AFTER wait_for_value(1), never before: the sequence calls sync_parameters() and only
+        # then sets the barrier, so a read here sees THIS dispatch's value. Read earlier and it
+        # samples the PREVIOUS dispatch's -- corruption with no clean recurrence.
         barrier.wait_for_value(1)
         mask_len = mask_src.read()
+        win_len = win_src.read() if win_src is not None else None
+        # chunks is the trip count for the scores/context loops below. win_len is a LENGTH in
+        # positions (see win_param above), so arith.divsi converts it to a chunk count -- never
+        # Python `//` on an SSA value, which emits arith.floordivsi instead of the intended op.
+        chunks = (arith.divsi(win_len, arith.constant(rpc, T.i32()))
+                  if win_src is not None else N_KV_CHUNKS)
+        # row_len is win_len itself (not divided): the row length mask_k/softmax_k need to touch,
+        # vs S the BUILT buffer width. Falls back to S, byte-identical to today, when the window
+        # is a build constant -- same one-value-one-meaning discipline as win_param's own comment.
+        row_len = win_len if win_src is not None else S
+
+        # The K/V-cache fills stream N_KV_CHUNKS tiles into `stream_c` no matter what `chunks`
+        # is -- the fill side has no scratchpad parameter to shrink its own trip count by. A tile
+        # this core does not acquire here is not discarded, it is what the NEXT dispatch's first
+        # acquire returns: draining spends the bytes the fill already moved, not the MACs, which
+        # is the split window_parameter exists to measure. Guarded in Python, not emitted as an
+        # `scf.if`, because N_KV_CHUNKS - chunks is 0 on the constant-trip-count path and a
+        # zero-trip loop is still a loop the unwindowed core program must not contain.
+        def drain_remainder():
+            if win_src is not None:
+                for _ in range_(arith.subi(arith.constant(N_KV_CHUNKS, T.i32()), chunks)):
+                    stream_c.acquire(1)
+                    stream_c.release(1)
 
         # step 1: rebuild cur and n_in from D/HD chunks, then hn = weighted_RMSNorm(cur, n_in).
         for i in range(N_MISC_CHUNKS):
@@ -395,28 +428,34 @@ def attn_block_dp(
         # step 6: scores. One A tile serves BOTH query heads out of L1 -- the group reuse that
         # gemv's batch_group buys with an access pattern is free here, because the two heads that
         # share this kv head are on the same core.
-        for i in range_(N_KV_CHUNKS):
+        for i in range_(chunks):
             row_off = index.casts(T.i32(), i) * rpc
             at = stream_c.acquire(1)
             for g in range(gqa):
                 sc_mv_k(rpc, row_off, at, qh_bufs[g], sc_bufs[g])
             stream_c.release(1)
+        drain_remainder()
 
         # step 7: softmax over a row this core produced. No exchange: the crossbar that forced
         # sc/sw through DDR existed only because scores and softmax disagreed about columns.
         for g in range(gqa):
-            mask_k(sc_bufs[g], mask_len, S)
-            softmax_k(sc_bufs[g], sw_bufs[g], S)
+            mask_k(sc_bufs[g], mask_len, row_len)
+            softmax_k(sc_bufs[g], sw_bufs[g], row_len)
 
         # step 8: context, transposed-A over this core's V head.
         for g in range(gqa):
             tz_k(1, acc_bufs[g])
-        for i in range_(N_KV_CHUNKS):
+        for i in range_(chunks):
             w_off = index.casts(T.i32(), i) * rpc
             at = stream_c.acquire(1)
             for g in range(gqa):
+                # tr_k's 3rd arg is w_stride (mv_taccum.cc: w_in + g*w_stride + w_off), the
+                # spacing between GROUPS in a packed w buffer -- not a row length. groups=1 here
+                # makes it dead (g is always 0), but it is buffer geometry, not an element count
+                # to shrink, so it stays S rather than following mask_k/softmax_k onto row_len.
                 tr_k(rpc, 1, S, w_off, at, sw_bufs[g], acc_bufs[g])
             stream_c.release(1)
+        drain_remainder()
         for g in range(gqa):
             ct = out_p.acquire(1)
             tf_k(1, acc_bufs[g], ct)
@@ -429,7 +468,7 @@ def attn_block_dp(
                 core_fn,
                 [
                     misc_of.cons(), stream_ofs[c].cons(), out_ofs[c].prod(),
-                    mask_param, barriers[c],
+                    mask_param, win_param, barriers[c],
                     Buffer(D_ty, name=f"{fifo_prefix}cur_{c}"), Buffer(D_ty, name=f"{fifo_prefix}nin_{c}"),
                     Buffer(D_ty, name=f"{fifo_prefix}hn_{c}"),
                     Buffer(HD_ty, name=f"{fifo_prefix}raw_{c}"), Buffer(HD_ty, name=f"{fifo_prefix}nrm_{c}"),

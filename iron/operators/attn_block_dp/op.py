@@ -46,7 +46,25 @@ class AttnBlockDataParallel(MLIROperator):
     stack_size: int = 0xD00
     kv_offset_parameter: str | None = "kv_off"
     mask_parameter: str = "sm_mask"
+    # None (default) keeps the window a BUILD constant -- today's behaviour, byte for byte. A name
+    # makes it a per-dispatch ScratchpadParameter. NOT repr=False: like kv_offset_parameter and
+    # mask_parameter above, this field rides MLIROperator.name's automatic field aggregation, so a
+    # windowed build's name diverges from a plain one for free -- no hand-written suffix needed
+    # (contrast decode_layer_dp/op.py's kv_alloc/kv_block_size, which ARE repr=False and own a
+    # `name` property override instead).
+    window_parameter: str | None = None
     wqkv_head_major: bool = False
+    # Cache CAPACITY, when it differs from the attention WINDOW (`max_seq`). None (default) keeps
+    # them equal -- today's behaviour, byte for byte. `max_seq` stays what sizes the compute (sc/sw,
+    # the KV-chunk loop, the mask); `kv_alloc` sizes the KV cache buffers and the per-head stride, so
+    # a wide RESIDENT cache can be read through a narrow window. repr=False + the `name` override
+    # below -- mirrors decode_layer_dp/op.py's identical fields onto the operator whose design.py
+    # actually owns kc/vc's addressing (attn_block_dp itself was never given these two).
+    kv_alloc: int | None = field(default=None, repr=False)
+    # BLOCKED KV-cache storage: `kv_alloc` positions stored as `kv_alloc // kv_block_size` BLOCKS of
+    # `kv_block_size` positions, Hkv heads interleaved every block, instead of one `kv_alloc`-
+    # position slab per head. None (default) is one block -- byte-identical to the flat layout.
+    kv_block_size: int | None = field(default=None, repr=False)
     weight_depth: int = field(default=2, repr=False)
     context: object = field(default=None, repr=False)
 
@@ -59,9 +77,22 @@ class AttnBlockDataParallel(MLIROperator):
         "max_seq": "S",
         "kv_offset_parameter": "kvpar",
         "mask_parameter": "mpar",
+        "window_parameter": "winpar",
         "weight_depth": "wd",
         "wqkv_head_major": "hm",
     }
+
+    @property
+    def name(self) -> str:
+        # kv_alloc/kv_block_size are repr=False so the default path's name is unchanged, but a
+        # wide-cache or blocked design must not share an artifact name with the plain one at the
+        # same max_seq -- both would emit the same .mlir/.xclbin. Mirrors decode_layer_dp/op.py.
+        base = super().name
+        if self.kv_alloc is not None and self.kv_alloc != self.max_seq:
+            base = f"{base}_kva{self.kv_alloc}"
+        if self.kv_block_size is not None and self.kv_block_size != (self.kv_alloc or self.max_seq):
+            base = f"{base}_kvblk{self.kv_block_size}"
+        return base
 
     def __post_init__(self):
         # Every rule here is design.py's, checked at construction so a graph fails where it is
@@ -94,6 +125,22 @@ class AttnBlockDataParallel(MLIROperator):
             raise ValueError(
                 f"max_seq ({self.max_seq}) must divide by the cache rows per stream tile ({rpc})"
             )
+        # kv_alloc/kv_block_size: checked here too, redundantly with design.py's own asserts --
+        # decode_layer_dp's identical fields make the same trade, for a caller that wants to fail
+        # at construction rather than three frames down at MLIR generation.
+        if self.kv_alloc is not None and self.kv_alloc < self.max_seq:
+            raise ValueError(
+                f"kv_alloc ({self.kv_alloc}) must be >= max_seq ({self.max_seq}): it is the cache "
+                f"CAPACITY, not a second window"
+            )
+        _kva = self.max_seq if self.kv_alloc is None else self.kv_alloc
+        if self.kv_block_size is not None and (
+            self.kv_block_size <= 0 or _kva % self.kv_block_size != 0
+        ):
+            raise ValueError(
+                f"kv_block_size ({self.kv_block_size}) must be a positive divisor of kv_alloc "
+                f"({_kva})"
+            )
         # K008: the tiling must FIT, not merely divide -- and sc/sw are new L1 terms that scale
         # with max_seq, so a window this design cannot hold has to fail here and not as
         # "'aie.tile' op Basic sequential allocation also failed".
@@ -121,11 +168,14 @@ class AttnBlockDataParallel(MLIROperator):
                     "epsilon": self.epsilon,
                     "kv_offset_parameter": self.kv_offset_parameter,
                     "mask_parameter": self.mask_parameter,
+                    "window_parameter": self.window_parameter,
                     "weight_depth": self.weight_depth,
                     "tile_size_input": self.tile_size_input,
                     "stack_size": self.stack_size,
                     "n_aie_cols": self.num_aie_columns,
                     "wqkv_head_major": self.wqkv_head_major,
+                    "kv_alloc": self.kv_alloc,
+                    "kv_block_size": self.kv_block_size,
                 },
             ),
         )
@@ -180,7 +230,10 @@ class AttnBlockDataParallel(MLIROperator):
 
     def get_arg_spec(self):
         QD, KVD = self.Hq * self.HD, self.Hkv * self.HD
-        cache = self.Hkv * self.max_seq * self.HD
+        # kc/vc are sized by the cache CAPACITY, not the attention window: None (default) keeps
+        # them equal, byte for byte -- see design.py's KV_ALLOC.
+        KV_ALLOC = self.max_seq if self.kv_alloc is None else self.kv_alloc
+        cache = self.Hkv * KV_ALLOC * self.HD
         return [
             AIERuntimeArgSpec("in", (self.D,)),                    # cur
             AIERuntimeArgSpec("in", (self.D,)),                    # n_in

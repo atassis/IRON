@@ -84,6 +84,58 @@ def test_default_mlir_is_byte_identical():
     assert plain == explicit
 
 
+# GRANULE (op.py __post_init__): max_seq must be a multiple of lcm(rpc, kv_block), rpc = tsi*D//HD
+# being the stream tile in cache rows and kv_block the KV block (or the alloc when unblocked).
+def test_granule_qwen3_shape_is_legal():
+    """The doctrine's own worked example: D=1024, HD=128, tsi=4 -> rpc=32; unblocked, kv_block
+    collapses to max_seq itself, so lcm(32, max_seq)==max_seq iff rpc divides max_seq -- true at
+    max_seq=128 (128/32=4)."""
+    _op(max_seq=128)  # must not raise
+
+
+def test_granule_illegal_max_seq_raises():
+    """max_seq=100 is not a multiple of rpc=32 (100/32 is not whole), so the unblocked granule
+    (lcm(32,100)=800) is not a multiple of max_seq either -- refused at construction, not three
+    frames down in aiecc's placer."""
+    with pytest.raises(ValueError, match="granule"):
+        _op(max_seq=100)
+
+
+def test_granule_kv_block_widens_it_past_rpc_alone():
+    """kv_block_size=48 does not share rpc=32's power-of-two factor (lcm(32,48)=96), so max_seq=160
+    -- itself a clean multiple of rpc alone (160/32=5) -- must still be refused: a check that only
+    tested rpc would have missed this."""
+    with pytest.raises(ValueError, match="granule"):
+        _op(max_seq=160, kv_alloc=384, kv_block_size=48)
+    _op(max_seq=192, kv_alloc=384, kv_block_size=48)  # 192 is a multiple of lcm(32,48)=96
+
+
+def test_window_parameter_defaults_off_and_is_not_in_the_name():
+    """The switch must be invisible when unused: same operator name, so a shared build dir cannot
+    let a windowed build silently satisfy a plain one. Mirrors attn_block_dp/test.py."""
+    plain = _op()
+    off = _op(window_parameter=None)
+    assert off.name == plain.name
+    on = _op(window_parameter="attn_window")
+    assert on.name != plain.name, "a windowed build must not share a name with a plain one"
+    assert "winattn_window" in on.name, on.name
+
+
+def test_window_parameter_off_mlir_is_byte_identical():
+    plain = _op().get_mlir_artifact().generator()
+    off = _op(window_parameter=None).get_mlir_artifact().generator()
+    assert plain == off
+
+
+def test_window_parameter_on_reaches_attn_block_dp():
+    """Confirms the pass-through, not just the name suffix: attn_block_dp is the half that owns
+    the ScratchpadParameter, so its name must reach the generated MLIR text."""
+    off = _op(window_parameter=None).get_mlir_artifact().generator()
+    on = _op(window_parameter="attn_window").get_mlir_artifact().generator()
+    assert off != on
+    assert "attn_window" in on
+
+
 def main():
     D, FF, HD, Hq, Hkv = 1024, 3072, 128, 16, 8          # Qwen3-0.6B
     S = int(sys.argv[1]) if len(sys.argv) > 1 else 2048

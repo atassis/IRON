@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 import os
 from dataclasses import dataclass, field
 from typing import ClassVar, Dict
@@ -78,6 +79,14 @@ class DecodeLayerDataParallel(MLIROperator):
     # Same meaning as gemv/tmatvec's `block_size`, one level up. See attn_block_dp/design.py and
     # iron.common.kv_layout (KVLayout), the single owner of the offset/stride formulas this uses.
     kv_block_size: int | None = field(default=None, repr=False)
+    # Runtime attention window: None (default) keeps N_KV_CHUNKS a build constant -- today's
+    # behaviour, byte for byte. A name makes it a per-dispatch ScratchpadParameter; delegated
+    # straight to attn_block_dp, which owns every window term (mask/softmax row length, the two
+    # KV-chunk loops, the drain). repr=False + the `name` override below, matching kv_alloc/
+    # kv_block_size's convention above rather than attn_block_dp/op.py's own window_parameter
+    # field: that one rides the automatic name aggregation because attn_block_dp's `name` has no
+    # override to extend, while this class already has one for kv_alloc/kv_block_size.
+    window_parameter: str | None = field(default=None, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -115,6 +124,36 @@ class DecodeLayerDataParallel(MLIROperator):
                 f"kv_block_size ({self.kv_block_size}) must be a positive divisor of kv_alloc "
                 f"({_kva})"
             )
+        # GRANULE (K007: divisibility asserted where the shape is picked). Two constraints on
+        # max_seq already exist, but only inside attn_block_dp/design.py, at MLIR-generation time,
+        # and never combined: `assert S % rpc == 0` (unconditional -- rpc = tsi*D/HD is the stream
+        # tile in cache rows, and a windowed dispatch divides its runtime win_len by rpc via
+        # arith.divsi to get the KV-chunk trip count) and `assert S % _KVT == 0`, gated on
+        # `kv_blocked = _KVT != KV_ALLOC` -- i.e. ONLY when kv_block_size actually carves the cache
+        # into more than one block. A wide, UNBLOCKED kv_alloc (kv_block_size=None) reads its
+        # window as one flat run (`_kv_read_tap`'s non-blocked branch) and carries no relationship
+        # to max_seq at all -- design.py never asserts one, and test_kv_alloc_sizes_the_cache_not_
+        # the_window (max_seq=256, kv_alloc=4096) is exactly that legitimate shape. So the second
+        # term here mirrors kv_blocked exactly: kv_block_size when it is set AND differs from the
+        # alloc (real blocking), else max_seq itself (unblocked -- the whole window is its own one
+        # block, which folds this check down to rpc alone, byte for byte with today's kv_alloc
+        # tests). lcm(rpc, kv_block) is the smallest max_seq granularity that satisfies both real
+        # constraints at once; checked here, redundantly, for the same reason kv_alloc/
+        # kv_block_size are above -- so a bad shape fails at construction, not three frames down.
+        rpc = self.tile_size_input * self.D // self.HD      # stream tile in cache rows
+        kv_blocked = self.kv_block_size is not None and self.kv_block_size != _kva
+        kv_block = self.kv_block_size if kv_blocked else self.max_seq
+        granule = math.lcm(rpc, kv_block)
+        if self.max_seq % granule != 0:
+            raise ValueError(
+                f"max_seq ({self.max_seq}) must be a multiple of the granule ({granule}) = "
+                f"lcm(stream-tile rows={rpc}, kv block={kv_block})"
+            )
+        # Exposed so a caller building a runtime attn_window protocol (gen_llm_decode.py's
+        # DYNAMIC_WINDOW) can put this in meta.json without restating the formula -- the host must
+        # not re-derive it from dims.kv_block, which coincides with this value only at this model's
+        # shape and would be silently wrong at another head_dim/tile_size_input.
+        self.window_granule = granule
         # L1 IS THE EXCEPTION TO "delegate to the half" above: attn_block_dp's guard lives inside
         # its design.py FUNCTION (an assert), and this file calls that function directly rather
         # than through AttnBlockDataParallel -- so it fires at MLIR generation, not here, unless
@@ -183,6 +222,8 @@ class DecodeLayerDataParallel(MLIROperator):
             base = f"{base}_kva{self.kv_alloc}"
         if self.kv_block_size is not None and self.kv_block_size != (self.kv_alloc or self.max_seq):
             base = f"{base}_kvblk{self.kv_block_size}"
+        if self.window_parameter is not None:
+            base = f"{base}_win{self.window_parameter}"
         return base
 
     def get_mlir_artifact(self):
@@ -204,6 +245,7 @@ class DecodeLayerDataParallel(MLIROperator):
                     "wqkv_head_major": self.wqkv_head_major,
                     "kv_alloc": self.kv_alloc,
                     "kv_block_size": self.kv_block_size,
+                    "window_parameter": self.window_parameter,
                 },
             ),
         )
