@@ -46,6 +46,32 @@ def test_window_parameter_defaults_off_and_is_not_in_the_name():
     assert on.name != plain.name, "a dynamic-window build must not share a name with a plain one"
 
 
+def test_dynamic_window_makes_the_core_elf_window_independent(tmp_path):
+    """The whole point: with the trip count read at runtime, two windows must compile to the
+    SAME core program. The second half is the negative control -- without the parameter they
+    MUST differ, or this gate is vacuous."""
+    import hashlib
+    from pathlib import Path
+    from iron.common import AIEContext
+    from iron.operators.attn_block_dp.op import AttnBlockDataParallel
+
+    def core_elf_hashes(S, window_parameter):
+        op = AttnBlockDataParallel(
+            D=1024, HD=128, Hq=16, Hkv=8, max_seq=S, num_aie_columns=8, tile_size_input=4,
+            kv_alloc=4096, kv_block_size=128, window_parameter=window_parameter,
+            context=AIEContext(build_dir=tmp_path / f"S{S}_{window_parameter}"))
+        op.compile()
+        d = Path(op.xclbin_artifact.mlir_input.filename)
+        d = d.parent / f"{d.stem}.mlir.d"
+        return sorted(hashlib.sha256(p.read_bytes()).hexdigest()
+                      for p in d.glob("elfs_main_core_*/*.elf"))
+
+    assert core_elf_hashes(1024, "attn_window") == core_elf_hashes(4096, "attn_window"), \
+        "dynamic window still bakes the trip count into the core"
+    assert core_elf_hashes(1024, None) != core_elf_hashes(4096, None), \
+        "negative control: without the parameter the two MUST differ"
+
+
 def main():
     D, HD, Hq, Hkv, N = 1024, 128, 16, 8, 8      # Qwen3-0.6B decode shapes
     argv = [a for a in sys.argv[1:] if not a.startswith("-")]
