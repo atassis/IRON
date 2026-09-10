@@ -360,6 +360,10 @@ def attn_block_dp(
         # Python `//` on an SSA value, which emits arith.floordivsi instead of the intended op.
         chunks = (arith.divsi(win_len, arith.constant(rpc, T.i32()))
                   if win_src is not None else N_KV_CHUNKS)
+        # row_len is win_len itself (not divided): the row length mask_k/softmax_k need to touch,
+        # vs S the BUILT buffer width. Falls back to S, byte-identical to today, when the window
+        # is a build constant -- same one-value-one-meaning discipline as win_param's own comment.
+        row_len = win_len if win_src is not None else S
 
         # step 1: rebuild cur and n_in from D/HD chunks, then hn = weighted_RMSNorm(cur, n_in).
         for i in range(N_MISC_CHUNKS):
@@ -421,8 +425,8 @@ def attn_block_dp(
         # step 7: softmax over a row this core produced. No exchange: the crossbar that forced
         # sc/sw through DDR existed only because scores and softmax disagreed about columns.
         for g in range(gqa):
-            mask_k(sc_bufs[g], mask_len, S)
-            softmax_k(sc_bufs[g], sw_bufs[g], S)
+            mask_k(sc_bufs[g], mask_len, row_len)
+            softmax_k(sc_bufs[g], sw_bufs[g], row_len)
 
         # step 8: context, transposed-A over this core's V head.
         for g in range(gqa):
@@ -431,6 +435,10 @@ def attn_block_dp(
             w_off = index.casts(T.i32(), i) * rpc
             at = stream_c.acquire(1)
             for g in range(gqa):
+                # tr_k's 3rd arg is w_stride (mv_taccum.cc: w_in + g*w_stride + w_off), the
+                # spacing between GROUPS in a packed w buffer -- not a row length. groups=1 here
+                # makes it dead (g is always 0), but it is buffer geometry, not an element count
+                # to shrink, so it stays S rather than following mask_k/softmax_k onto row_len.
                 tr_k(rpc, 1, S, w_off, at, sw_bufs[g], acc_bufs[g])
             stream_c.release(1)
         for g in range(gqa):
