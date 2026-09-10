@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from dataclasses import dataclass, field
 from typing import ClassVar, Dict
 
@@ -192,6 +193,18 @@ class GEMV(MLIROperator):
         ))
 
     @property
+    def _rowbatch(self):
+        return int(os.environ.get("GEMV_ROWBATCH", "1"))
+
+    @property
+    def _rowbatch_tag(self):
+        # The row-batch count must ride in the OBJECT NAME, because the artifact cache keys on the
+        # name: two builds differing only by a -D would otherwise share one .o and the second would
+        # silently measure the first's kernel. ROWBATCH=1 keeps the historical name and is
+        # byte-identical to the pre-rowbatch ELF.
+        return f"_rb{self._rowbatch}" if self._rowbatch > 1 else ""
+
+    @property
     def _kernel_link_file(self):
         # With the gelu epilogue the core also links the gelu kernel, so the object becomes an
         # archive of (matvec, gelu); the plain matvec stays a single object.
@@ -199,7 +212,7 @@ class GEMV(MLIROperator):
             return f"gemv_{self.K}k_{self.kernel_vector_size}vs_{self.epilogue}_kernels.a"
         if self.weight_dtype != "bf16":
             return f"gemv_{self.K}k_{self.kernel_vector_size}vs_{self.weight_dtype}g{self.group_size}.o"
-        return f"gemv_{self.K}k_{self.kernel_vector_size}vs.o"
+        return f"gemv_{self.K}k_{self.kernel_vector_size}vs{self._rowbatch_tag}.o"
 
     def get_mlir_artifact(self):
         mlir_verbose = getattr(self.context, "mlir_verbose", False)
@@ -250,7 +263,7 @@ class GEMV(MLIROperator):
                 )
             ]
         matvec_obj = KernelObjectArtifact(
-            f"gemv_{self.K}k_{self.kernel_vector_size}vs.o",
+            f"gemv_{self.K}k_{self.kernel_vector_size}vs{self._rowbatch_tag}.o",
             dependencies=[
                 SourceArtifact(
                     self.context.base_dir / "aie_kernels" / "generic" / "mv.cc"
@@ -259,6 +272,7 @@ class GEMV(MLIROperator):
             extra_flags=[
                 f"-DDIM_K={self.K}",
                 f"-DVEC_SIZE={self.kernel_vector_size}",
+                f"-DGEMV_ROWBATCH={self._rowbatch}",
             ],
         )
         if self.epilogue != "none":
