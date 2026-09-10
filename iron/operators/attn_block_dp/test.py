@@ -46,30 +46,97 @@ def test_window_parameter_defaults_off_and_is_not_in_the_name():
     assert on.name != plain.name, "a dynamic-window build must not share a name with a plain one"
 
 
-def test_dynamic_window_makes_the_core_elf_window_independent(tmp_path):
-    """The whole point: with the trip count read at runtime, two windows must compile to the
-    SAME core program. The second half is the negative control -- without the parameter they
-    MUST differ, or this gate is vacuous."""
-    import hashlib
-    from pathlib import Path
+def _extract_core_regions(mlir_text):
+    """Every `aie.core(...) { ... }` op body, source order. Brace-matched by hand -- the .mlir
+    is text, not a parsed module, and a core body nests its own scf.for/if blocks that also use
+    `{ }`, so a regex match on the closing brace alone would stop at the first nested one."""
+    regions = []
+    for m in re.finditer(r"aie\.core\(", mlir_text):
+        brace = mlir_text.index("{", m.start())
+        depth, i = 0, brace
+        while True:
+            if mlir_text[i] == "{":
+                depth += 1
+            elif mlir_text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        regions.append(mlir_text[m.start():i + 1])
+    return regions
+
+
+_ROWLEN_CALL_RE = re.compile(r"func\.call @\w*(mask_bf16|softmax_bf16|taccum_rows_bf16_f32)\(")
+
+
+def _normalize_core_region(region):
+    """Strip the two terms that legitimately vary with max_seq but are NOT the trip count:
+    (1) the row-length CONSTANT fed to mask_bf16/softmax_bf16/taccum_rows_bf16_f32 -- a fresh
+    `%cN_i32... = arith.constant N : i32` immediately followed by its sole use as that call's
+    row-length operand -- and (2) the sc/sw buffer WIDTH (S, the `2*gqa*S*2` L1 bytes design.py
+    costs to the window) wherever it appears as a `memref<Nxbf16>` type in one of the four kernel
+    call signatures. Both are anchored on the KERNEL NAME, never the numeric value: tile_elems
+    (tsi*D) equals max_seq by coincidence at this test's S=4096 (tsi=4, D=1024), and a blind
+    "replace this number" pass would conflate the two and silently launder a real difference."""
+    lines = region.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        m = re.match(r"^(\s*)%(c\d+_i32(?:_\d+)?) = arith\.constant (\d+) : i32\s*$", lines[i])
+        if (m and i + 1 < len(lines) and _ROWLEN_CALL_RE.search(lines[i + 1])
+                and re.search(rf"%{re.escape(m.group(2))}\b", lines[i + 1])):
+            out.append(f"{m.group(1)}%ROWLEN = arith.constant ROWLEN : i32")
+            out.append(re.sub(rf"%{re.escape(m.group(2))}\b", "%ROWLEN", lines[i + 1]))
+            i += 2
+            continue
+        out.append(lines[i])
+        i += 1
+    text = "\n".join(out)
+    for pat in (
+        r"(func\.call @\w*sc_matvec_vectorized_bf16_bf16\([^)]*\) : "
+        r"\(i32, i32, memref<\d+xbf16>, memref<\d+xbf16>, memref<)\d+(xbf16>\) -> \(\))",
+        r"(func\.call @\w*mask_bf16\([^)]*\) : \(memref<)\d+(xbf16>, i32, i32\) -> \(\))",
+        r"(func\.call @\w*taccum_rows_bf16_f32\([^)]*\) : "
+        r"\(i32, i32, i32, i32, memref<\d+xbf16>, memref<)\d+(xbf16>, memref<\d+xf32>\) -> \(\))",
+    ):
+        text = re.sub(pat, r"\1SROW\2", text)
+    return re.sub(
+        r"(func\.call @\w*softmax_bf16\([^)]*\) : \(memref<)\d+(xbf16>, memref<)\d+(xbf16>, i32\) -> \(\))",
+        r"\1SROW\2SROW\3", text,
+    )
+
+
+def test_dynamic_window_makes_the_core_trip_count_independent(tmp_path):
+    """The whole point: with the trip count read at runtime, two windows must compile to the SAME
+    core PROGRAM. This test's predecessor compared whole core ELFs and was vacuous: two OTHER terms
+    scale with max_seq regardless of the trip count -- the sc/sw buffer size and the row-length
+    literal handed to mask_k/softmax_k/tr_k (see design.py step 7/8) -- so it would have passed with
+    the runtime-trip-count mechanism absent, present, or broken (it did fail, but for the wrong
+    reason: those two terms, not the trip count). This instead diffs the `aie.core` MLIR text with
+    exactly those two terms normalised out, so what remains is the trip count alone.
+
+    Second half is the negative control -- reverting to window_parameter=None must still differ
+    under the SAME normalisation, or this gate is exactly as vacuous as its predecessor."""
     from iron.common import AIEContext
     from iron.operators.attn_block_dp.op import AttnBlockDataParallel
 
-    def core_elf_hashes(S, window_parameter):
+    def core_regions(S, window_parameter):
         op = AttnBlockDataParallel(
             D=1024, HD=128, Hq=16, Hkv=8, max_seq=S, num_aie_columns=8, tile_size_input=4,
             kv_alloc=4096, kv_block_size=128, window_parameter=window_parameter,
             context=AIEContext(build_dir=tmp_path / f"S{S}_{window_parameter}"))
         op.compile()
-        d = Path(op.xclbin_artifact.mlir_input.filename)
-        d = d.parent / f"{d.stem}.mlir.d"
-        return sorted(hashlib.sha256(p.read_bytes()).hexdigest()
-                      for p in d.glob("elfs_main_core_*/*.elf"))
+        mlir_text = Path(op.xclbin_artifact.mlir_input.filename).read_text()
+        return [_normalize_core_region(r) for r in _extract_core_regions(mlir_text)]
 
-    assert core_elf_hashes(1024, "attn_window") == core_elf_hashes(4096, "attn_window"), \
-        "dynamic window still bakes the trip count into the core"
-    assert core_elf_hashes(1024, None) != core_elf_hashes(4096, None), \
-        "negative control: without the parameter the two MUST differ"
+    on_1024, on_4096 = core_regions(1024, "attn_window"), core_regions(4096, "attn_window")
+    assert len(on_1024) == 8 and len(on_4096) == 8
+    assert on_1024 == on_4096, "dynamic window still bakes the trip count into the core"
+
+    off_1024, off_4096 = core_regions(1024, None), core_regions(4096, None)
+    assert off_1024 != off_4096, (
+        "negative control: a compile-time trip count must still differ under the SAME "
+        "normalisation, or the assertion above cannot fail"
+    )
 
 
 def main():
