@@ -67,6 +67,56 @@ def _scale_header_bytes(n_groups: int, scale_dtype: str) -> int:
     return _SCALE_BYTES[scale_dtype] * n_groups
 
 
+# The payload's vector-load width in BYTES at a given VEC_SIZE. `aie::load_v<N>` on AIE2P needs
+# the pointer aligned to the access width -- 32 B for 256-bit, 64 B for 512-bit -- and aie_api
+# calls an unaligned pointer UNDEFINED BEHAVIOUR, not a slow path. int4 loads r/2 bytes (two
+# nibbles per byte), int8 loads r.
+def _load_bytes(weight_dtype: str, vec_size: int) -> int:
+    return vec_size // 2 if weight_dtype in ("int4", "int4a") else vec_size
+
+
+def header_bytes(K: int, group_size: int, weight_dtype: str, scale_dtype: str = "f32") -> int:
+    """Bytes before the payload. NOT padded -- see `max_legal_vec_size`."""
+    n_groups = K // group_size
+    return (_AFFINE_HEADER_BYTES * n_groups if is_affine(weight_dtype)
+            else _scale_header_bytes(n_groups, scale_dtype))
+
+
+def max_legal_vec_size(Ks, group_size: int, weight_dtype: str, scale_dtype: str = "f32",
+                       cap: int = 64) -> int:
+    """The widest VEC_SIZE whose payload load is aligned for every K a design builds.
+
+    THIS IS WHY int4 WAS CORRECT AND int8 WAS GARBAGE. The payload starts `header_bytes` into a
+    row and every later row starts at `row * row_stride`, so both have to clear the load width.
+    At K=1024 g=128 the header is 32 B: int4 loads 32 (two nibbles per byte) and clears it, int8
+    loads 64 and does not -- every even row misaligned, which computed ppl 4.25e9 and top-1
+    0.00% on device while compiling, linking, passing the numpy round-trip and running
+    bit-identically five times out of five.
+
+    Choosing the WIDTH rather than padding the header is deliberate. A padded header breaks
+    swiglu_mlp_dp's shared weight tile, which needs a row affine in K with a proportional header
+    (`TSI_GU * WROW_D == TSI_D * WROW_FF`); a round-up is not proportional. Planar scales are
+    the general fix and would make both problems disappear.
+
+    Raises if no width down to 8 is legal -- refuse rather than emit a kernel that lies.
+    """
+    if weight_dtype not in _QMAX and weight_dtype not in _AFFINE:
+        return cap
+    vec = min(cap, group_size)
+    while vec >= 8:
+        load = _load_bytes(weight_dtype, vec)
+        if all(header_bytes(K, group_size, weight_dtype, scale_dtype) % load == 0
+               and row_stride_bytes(K, group_size, weight_dtype, scale_dtype) % load == 0
+               for K in Ks):
+            return vec
+        vec //= 2
+    raise ValueError(
+        f"no legal VEC_SIZE for {weight_dtype} group_size={group_size} over K={sorted(Ks)}: the "
+        f"payload starts {[header_bytes(K, group_size, weight_dtype, scale_dtype) for K in Ks]} "
+        "bytes into a row and no load width down to 8 clears all of them. Planar scales (payload "
+        "at offset 0) is the fix; padding the header breaks the shared weight tile.")
+
+
 def row_stride_bytes(K: int, group_size: int, weight_dtype: str, scale_dtype: str = "f32") -> int:
     if weight_dtype not in _QMAX and weight_dtype not in _AFFINE:
         raise ValueError(f"unknown weight_dtype {weight_dtype!r} "
@@ -76,8 +126,7 @@ def row_stride_bytes(K: int, group_size: int, weight_dtype: str, scale_dtype: st
     n_groups = K // group_size
     if is_affine(weight_dtype):
         payload = K // 2 if weight_dtype == "int4a" else K
-        header = _AFFINE_HEADER_BYTES * n_groups
-        return header + payload      # 4 B/group: always %4, no alignment case to check
+        return _AFFINE_HEADER_BYTES * n_groups + payload
     payload = K // 2 if weight_dtype == "int4" else K
     header = _scale_header_bytes(n_groups, scale_dtype)
     stride = header + payload
@@ -183,13 +232,14 @@ def _pack_affine(W: np.ndarray, group_size: int, weight_dtype: str,
     stride = row_stride_bytes(K, group_size, weight_dtype)
     out = np.zeros((M, stride), dtype=np.uint8)
     hdr = 2 * n_groups
+    pay = 2 * hdr
     out[:, :hdr] = s.astype(ml_dtypes.bfloat16).view(np.uint8).reshape(M, hdr)
     out[:, hdr:2 * hdr] = m.astype(ml_dtypes.bfloat16).view(np.uint8).reshape(M, hdr)
     if weight_dtype == "int4a":
         nib = (q.astype(np.int16) & 0xF).astype(np.uint8)
-        out[:, 2 * hdr:] = (nib[:, 0::2] | (nib[:, 1::2] << 4)).astype(np.uint8)
+        out[:, pay:] = (nib[:, 0::2] | (nib[:, 1::2] << 4)).astype(np.uint8)
     else:
-        out[:, 2 * hdr:] = q.astype(np.int8).view(np.uint8)
+        out[:, pay:] = q.astype(np.int8).view(np.uint8)
     return out.reshape(-1).view(np.int8)
 
 
@@ -199,10 +249,11 @@ def _unpack_affine(packed: np.ndarray, M: int, K: int, group_size: int,
     stride = row_stride_bytes(K, group_size, weight_dtype)
     n_groups = K // group_size
     hdr = 2 * n_groups
+    pay = 2 * hdr
     rows = np.asarray(packed).view(np.uint8).reshape(M, stride)
     s = rows[:, :hdr].view(ml_dtypes.bfloat16).reshape(M, n_groups).astype(np.float32)
     m = rows[:, hdr:2 * hdr].view(ml_dtypes.bfloat16).reshape(M, n_groups).astype(np.float32)
-    payload = rows[:, 2 * hdr:]
+    payload = rows[:, pay:]
     if weight_dtype == "int4a":
         lo_n = (payload & 0x0F).astype(np.int8)
         lo_n = np.where(lo_n >= 8, lo_n - 16, lo_n)
@@ -258,14 +309,15 @@ def quantize_weight(W: np.ndarray, group_size: int, weight_dtype: str, *,
     q = np.clip(np.round(Wg / scale[:, :, None]), -qmax, qmax).astype(np.int32).reshape(M, K)
 
     out = np.zeros((M, stride), dtype=np.uint8)
-    header_bytes = _scale_header_bytes(n_groups, scale_dtype)
+    scale_bytes = _scale_header_bytes(n_groups, scale_dtype)
+    pay = scale_bytes
     if scale_dtype == "f32":
-        out[:, :header_bytes] = scale.reshape(M, n_groups).view(np.uint8).reshape(M, header_bytes)
+        out[:, :scale_bytes] = scale.reshape(M, n_groups).view(np.uint8).reshape(M, scale_bytes)
     else:
         import ml_dtypes  # lazy: only needed on the bf16-scale path
         scale_bf16 = scale.astype(ml_dtypes.bfloat16)
-        out[:, :header_bytes] = scale_bf16.reshape(M, n_groups).view(np.uint8).reshape(
-            M, header_bytes)
+        out[:, :scale_bytes] = scale_bf16.reshape(M, n_groups).view(np.uint8).reshape(
+            M, scale_bytes)
     if weight_dtype == "int4":
         # LOW nibble = even column, HIGH nibble = odd column -- matches
         # dequant_int4_group.cc's contract and mv_quant.cc's unpack.
@@ -273,7 +325,7 @@ def quantize_weight(W: np.ndarray, group_size: int, weight_dtype: str, *,
         packed = (q_nibble[:, 0::2] | (q_nibble[:, 1::2] << 4)).astype(np.uint8)
     else:
         packed = q.astype(np.int8).view(np.uint8)
-    out[:, header_bytes:] = packed
+    out[:, pay:] = packed
     return out.reshape(-1).view(np.int8)
 
 
@@ -294,19 +346,20 @@ def dequantize_weight(packed: np.ndarray, M: int, K: int, group_size: int, weigh
         return _unpack_affine(packed, M, K, group_size, weight_dtype)
     stride = row_stride_bytes(K, group_size, weight_dtype, scale_dtype)
     n_groups = K // group_size
-    header_bytes = _scale_header_bytes(n_groups, scale_dtype)
+    scale_bytes = _scale_header_bytes(n_groups, scale_dtype)
+    pay = scale_bytes
     rows = np.asarray(packed).view(np.uint8).reshape(M, stride)
     if scale_dtype == "f32":
-        scale = rows[:, :header_bytes].reshape(M, header_bytes).view(np.float32).reshape(
+        scale = rows[:, :scale_bytes].reshape(M, scale_bytes).view(np.float32).reshape(
             M, n_groups)
     else:
         import ml_dtypes  # lazy: only needed on the bf16-scale path
-        scale = rows[:, :header_bytes].reshape(M, header_bytes).view(ml_dtypes.bfloat16).reshape(
+        scale = rows[:, :scale_bytes].reshape(M, scale_bytes).view(ml_dtypes.bfloat16).reshape(
             M, n_groups).astype(np.float32)
     if emulate_kernel_scale_cast:
         import ml_dtypes
         scale = scale.astype(ml_dtypes.bfloat16).astype(np.float32)
-    payload = rows[:, header_bytes:]
+    payload = rows[:, pay:]
     if weight_dtype == "int4":
         lo = (payload & 0x0F).astype(np.int8)
         lo = np.where(lo >= 8, lo - 16, lo)
