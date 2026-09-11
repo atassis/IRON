@@ -114,6 +114,9 @@ BF16 = bfloat16
 # AIE2P core-tile local memory. Stated, not derived: the Python bindings expose no accessor
 # (AIETargetModel::getLocalMemorySize() is C++ only).
 FLASH_SM_VEC_LEN = 64   # mirrors aie_kernels/aie2p/flash_contract.h; a mismatch drops a tail
+# The r of mv.cc's r-wide chunking. Passed to the build as -DVEC_SIZE and asserted against both
+# reduction lengths below, so the value and the shapes it constrains cannot drift apart.
+GEMV_VEC_SIZE = 64
 L1_BYTES = 65536
 
 
@@ -173,6 +176,7 @@ def attn_block_dp(
     Hkv,
     max_seq,
     attn_split=None,
+    scores_rowbatch=1,
     epsilon=1e-6,
     tile_size_input=4,
     stack_size=0xD00,
@@ -396,17 +400,30 @@ def attn_block_dp(
         rail uses, so it is not a precision change.
         """
         return cols, 1.0 / cols
-    # Two matvec bindings at two DIM_Ks. mv.cc bakes DIM_K in at compile time and a func.func
-    # symbol is keyed by NAME, so the projection (K=D) and the scores (K=head_dim) need separate
-    # prefixed objects -- swiglu_mlp_dp's mv_gu/down_/o_ mechanism exactly.
+
+    # K007: the shapes are picked here, so the divisibility the kernel's r-wide chunking needs is
+    # asserted here. The runtime-K body cannot static_assert it the way the compile-time-K one does.
+    assert D % GEMV_VEC_SIZE == 0 and HD % GEMV_VEC_SIZE == 0, (
+        f"both reduction lengths must be a whole number of {GEMV_VEC_SIZE}-wide chunks, "
+        f"got D={D}, head_dim={HD}"
+    )
+    # One runtime-K body under two names -- an external func.func is keyed by name and typed by
+    # memref shape, and these callers are at D and at head_dim. The row-batched scores path takes K
+    # as a template parameter, so when it is on the scores keep their own compile-time-K symbol.
     mv_kernel = Kernel(
-        f"{func_prefix}matvec_vectorized_bf16_bf16", CORE_ARCHIVE,
-        [np.int32, np.int32, TILE_ty, D_ty, HD_ty],
+        f"{func_prefix}matvec_rtk_bf16_bf16", CORE_ARCHIVE,
+        [np.int32, np.int32, np.int32, TILE_ty, D_ty, HD_ty],
     )
-    sc_mv_kernel = Kernel(
-        f"{func_prefix}sc_matvec_vectorized_bf16_bf16", CORE_ARCHIVE,
-        [np.int32, np.int32, TILE_ty, HD_ty, SROW_ty],
-    )
+    if scores_rowbatch == 1:
+        sc_mv_kernel = Kernel(
+            f"{func_prefix}sc_matvec_rtk_bf16_bf16", CORE_ARCHIVE,
+            [np.int32, np.int32, np.int32, TILE_ty, HD_ty, SROW_ty],
+        )
+    else:
+        sc_mv_kernel = Kernel(
+            f"{func_prefix}sc_matvec_vectorized_bf16_bf16", CORE_ARCHIVE,
+            [np.int32, np.int32, TILE_ty, HD_ty, SROW_ty],
+        )
     rope_kernel = Kernel(f"{func_prefix}rope", CORE_ARCHIVE, [HD_ty, HD_ty, HD_ty, np.int32])
     mask_kernel = Kernel(
         f"{func_prefix}mask_bf16", CORE_ARCHIVE, [SROW_ty, np.int32, np.int32]
@@ -503,7 +520,7 @@ def attn_block_dp(
             for j in range_(N_W_TILES):
                 row_off = index.casts(T.i32(), j) * tsi
                 wt = stream_c.acquire(1)
-                mv_k(tsi, row_off, wt, hn_buf, raw_buf)
+                mv_k(tsi, row_off, D, wt, hn_buf, raw_buf)
                 stream_c.release(1)
             wnorm_hd_k(raw_buf, nqn_t, nrm_buf, *rms_len(HD), epsilon)
             rope_k(nrm_buf, ang_t, qh_bufs[g], HD)
@@ -513,7 +530,7 @@ def attn_block_dp(
         for j in range_(N_W_TILES):
             row_off = index.casts(T.i32(), j) * tsi
             wt = stream_c.acquire(1)
-            mv_k(tsi, row_off, wt, hn_buf, raw_buf)
+            mv_k(tsi, row_off, D, wt, hn_buf, raw_buf)
             stream_c.release(1)
         wnorm_hd_k(raw_buf, nkn_t, nrm_buf, *rms_len(HD), epsilon)
         rope_k(nrm_buf, ang_t, kt, HD)
@@ -524,7 +541,7 @@ def attn_block_dp(
         for j in range_(N_W_TILES):
             row_off = index.casts(T.i32(), j) * tsi
             wt = stream_c.acquire(1)
-            mv_k(tsi, row_off, wt, hn_buf, vt)
+            mv_k(tsi, row_off, D, wt, hn_buf, vt)
             stream_c.release(1)
         out_p.release(1)
         misc_c.release(3)
@@ -546,7 +563,10 @@ def attn_block_dp(
                 row_off = index.casts(T.i32(), i) * rpc
                 at = stream_c.acquire(1)
                 for g in range(gqa):
-                    sc_mv_k(rpc, row_off, at, qh_bufs[g], sc_bufs[g])
+                    if scores_rowbatch == 1:
+                        sc_mv_k(rpc, row_off, HD, at, qh_bufs[g], sc_bufs[g])
+                    else:
+                        sc_mv_k(rpc, row_off, at, qh_bufs[g], sc_bufs[g])
                 stream_c.release(1)
 
             # This segment's valid width, clamped into [0, L]. CLAMPED AT ZERO DELIBERATELY:

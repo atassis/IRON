@@ -15,6 +15,7 @@ from iron.common import (
 )
 import aie.utils as aie_utils
 from iron.common.device_utils import get_kernel_dir
+from iron.operators.attn_block_dp.design import GEMV_VEC_SIZE
 from iron.common.operator_bases import lut_based_ops_artifacts
 
 
@@ -201,19 +202,12 @@ class AttnBlockDataParallel(MLIROperator):
             "rms_norm.o",
             dependencies=[SourceArtifact(kdir / arch_dir / "rms_norm.cc")],
         )
-        # Two DIM_Ks of one source: the projection reduces over d_model, the scores over head_dim.
-        # mv.cc bakes DIM_K in, and a func.func symbol is keyed by name, so the second needs its
-        # own prefixed object -- swiglu_mlp_dp's mv_gu/down_/o_ mechanism.
+        # One object for both reduction lengths: the projection reduces over d_model and the scores
+        # over head_dim, and mv.cc's runtime-K body carries the scores' second name as an alias.
         mv_obj = KernelObjectArtifact(
-            f"gemv_{self.D}k_64vs.o",
+            f"gemv_{self.D}k_{GEMV_VEC_SIZE}vs.o",
             dependencies=[SourceArtifact(kdir / "generic" / "mv.cc")],
-            extra_flags=[f"-DDIM_K={self.D}", "-DVEC_SIZE=64"],
-        )
-        sc_mv_obj = KernelObjectArtifact(
-            f"sc_gemv_{self.HD}k_64vs.o",
-            dependencies=[SourceArtifact(kdir / "generic" / "mv.cc")],
-            extra_flags=[f"-DDIM_K={self.HD}", "-DVEC_SIZE=64"],
-            prefix_symbols="sc_",
+            extra_flags=[f"-DDIM_K={self.D}", f"-DVEC_SIZE={GEMV_VEC_SIZE}", "-DGEMV_ALIAS_SC"],
         )
         rope_obj = KernelObjectArtifact(
             "rope_0.o",
@@ -228,7 +222,7 @@ class AttnBlockDataParallel(MLIROperator):
             dependencies=[SourceArtifact(kdir / "generic" / "mv_taccum.cc")],
             extra_flags=[f"-DDIM_N={self.HD}"],
         )
-        deps = [copy_obj, rms_obj, mv_obj, sc_mv_obj, rope_obj, softmax_obj, tmv_obj]
+        deps = [copy_obj, rms_obj, mv_obj, rope_obj, softmax_obj, tmv_obj]
         deps += lut_based_ops_artifacts(arch_dir)   # softmax's exp2 LUT, when the arch needs one
         return [KernelArchiveArtifact("attn_block_dp_core.a", dependencies=deps)]
 

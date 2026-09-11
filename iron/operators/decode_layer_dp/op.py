@@ -18,6 +18,14 @@ from iron.common import (
 import aie.utils as aie_utils
 from iron.common.device_utils import get_kernel_dir
 from iron.common.operator_bases import lut_based_ops_artifacts
+from iron.operators.attn_block_dp.design import GEMV_VEC_SIZE
+
+
+def _scores_rowbatch():
+    """Rows the scores gemv reduces per call. Read in ONE place: it decides both which object the
+    archive gets and which symbol the design declares, and a disagreement is an undefined symbol at
+    the per-core link rather than anything the generator could catch."""
+    return int(os.environ.get("SCORES_ROWBATCH", "1"))
 
 
 def _mlp_l1_footprint_bytes(D, FF, mlp_cols, QD, tile_rows_gu, weight_depth, stack_size):
@@ -262,6 +270,7 @@ class DecodeLayerDataParallel(MLIROperator):
                     "kv_block_size": self.kv_block_size,
                     "window_parameter": self.window_parameter,
                     "attn_split": self.attn_split,
+                    "scores_rowbatch": _scores_rowbatch(),
                 },
             ),
         )
@@ -271,7 +280,7 @@ class DecodeLayerDataParallel(MLIROperator):
         QD = self.Hq * self.HD
         gen, a2 = kdir / "generic", kdir / arch
 
-        _rb = int(os.environ.get("SCORES_ROWBATCH", "1"))
+        _rb = _scores_rowbatch()
         _rb_tag = f"_rb{_rb}" if _rb > 1 else ""
 
         def obj(name, src, flags=(), prefix=None):
@@ -289,14 +298,17 @@ class DecodeLayerDataParallel(MLIROperator):
             # aliases the hd_ name onto the same body, so the D and head_dim call sites share one
             # copy on a core whose 16 KB program memory is the binding constraint.
             obj("attn_rms.o", a2 / "rms_norm.cc", (), "attn_"),
-            obj(f"attn_gemv_{self.D}k.o", gen / "mv.cc",
-                [f"-DDIM_K={self.D}", "-DVEC_SIZE=64"], "attn_"),
-            # The SCORES gemv is the only core-bound op in this graph, so it is the one where a
-            # row-batched reduce can convert. GEMV_ROWBATCH rides in the NAME for the same reason
-            # the prefixes above do: the archive is keyed by name, so a -D-only difference would
-            # silently reuse the other variant's object. ROWBATCH=1 keeps the historical name.
+            # The projection (K=d_model) and the scores (K=head_dim) share ONE runtime-K body,
+            # aliased to the scores' name -- unless SCORES_ROWBATCH is on, whose template takes K
+            # at compile time and so needs its own object. GEMV_ROWBATCH rides in the NAME because
+            # the archive is keyed by name and a -D-only difference would silently reuse the other.
+            obj("attn_gemv.o", gen / "mv.cc",
+                [f"-DDIM_K={self.D}", f"-DVEC_SIZE={GEMV_VEC_SIZE}"]
+                + (["-DGEMV_ALIAS_SC"] if _rb == 1 else []), "attn_"),
+        ] + ([] if _rb == 1 else [
             obj(f"attn_sc_gemv_{self.HD}k{_rb_tag}.o", gen / "mv.cc",
-                [f"-DDIM_K={self.HD}", "-DVEC_SIZE=64", f"-DGEMV_ROWBATCH={_rb}"], "attn_sc_"),
+                [f"-DDIM_K={self.HD}", f"-DVEC_SIZE={GEMV_VEC_SIZE}", f"-DGEMV_ROWBATCH={_rb}"], "attn_sc_"),
+        ]) + [
             obj("attn_rope.o", gen / "rope.cc", ["-DTWO_HALVES"], "attn_"),
             obj("attn_softmax.o", a2 / "softmax.cc", (), "attn_"),
             obj(f"attn_tmv_{self.HD}n.o", gen / "mv_taccum.cc",

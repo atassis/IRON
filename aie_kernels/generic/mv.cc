@@ -171,6 +171,32 @@ void matvec_vectorized_rowbatch(uint32_t m, const bfloat16 *__restrict a, const 
     }
 }
 
+// Runtime-K form. DIM_K is a template constant above, so the projection (K=d_model) and the scores
+// (K=head_dim) otherwise need two compiled bodies. Here K is an argument, and the two MLIR-visible
+// names alias onto one body -- an external func.func is keyed by name and typed by memref shape, so
+// the callers still need two declarations, but not two copies of the loop.
+// The cost is the pipelining hint: with K compile-time it is k/stride (16 at d_model, 2 at
+// head_dim); here it can only assert the minimum both call sites satisfy.
+template <uint32_t r>
+void matvec_vectorized_rtk(uint32_t m, uint32_t k,
+                           const bfloat16 *__restrict a, const bfloat16 *__restrict b,
+                           bfloat16 *__restrict c)
+{
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    bfloat16 *c_end = c + m;
+    const bfloat16 *b_end = b + k;
+    for (; c < c_end; c++) {
+        aie::accum<accfloat, r> acc = aie::zeros<accfloat, r>();
+        AIE_LOOP_MIN_ITERATION_COUNT(2)
+        for (const bfloat16 *__restrict b_cur = b; b_cur < b_end; b_cur += r, a += r) {
+            aie::vector<bfloat16, r> a_vec = aie::load_v<r>(a);
+            aie::vector<bfloat16, r> b_vec = aie::load_v<r>(b_cur);
+            acc = aie::mac(acc, a_vec, b_vec);
+        }
+        *c = static_cast<bfloat16>(aie::reduce_add(acc.template to_vector<float>()));
+    }
+}
+
 extern "C" {
 
 /* The row offset parameter in the functions below is a workaround. The output will be written to c + row_offset * m.
@@ -186,6 +212,30 @@ void matvec_scalar_bf16_bf16(uint32_t m,
     c_out += row_offset;
     matvec_scalar(m, DIM_K, a_in, b_in, c_out);
 }
+
+void matvec_rtk_bf16_bf16(uint32_t m,
+                          uint32_t row_offset,
+                          uint32_t k,
+                          const bfloat16 *__restrict a_in,
+                          const bfloat16 *__restrict b_in,
+                          bfloat16 *__restrict c_out)
+{
+    c_out += row_offset;
+    matvec_vectorized_rtk<VEC_SIZE>(m, k, a_in, b_in, c_out);
+}
+#ifdef GEMV_ALIAS_SC
+// The scores caller's second MLIR-visible name. An external func.func is keyed by name and typed by
+// memref shape, so a caller at d_model and one at head_dim cannot share a declaration -- but under
+// the bare-pointer calling convention they share an ABI, so they can share an address. Opt-in
+// because the row-batched path below takes k as a TEMPLATE parameter and so cannot share this body.
+void sc_matvec_rtk_bf16_bf16(uint32_t m,
+                             uint32_t row_offset,
+                             uint32_t k,
+                             const bfloat16 *__restrict a_in,
+                             const bfloat16 *__restrict b_in,
+                             bfloat16 *__restrict c_out)
+    __attribute__((alias("matvec_rtk_bf16_bf16")));
+#endif
 
 void matvec_vectorized_bf16_bf16(uint32_t m,
                                  uint32_t row_offset,
