@@ -195,16 +195,11 @@ class AttnBlockDataParallel(MLIROperator):
         copy_obj = KernelObjectArtifact(
             "add.o", dependencies=[SourceArtifact(kdir / "generic" / "add.cc")]
         )
+        # One object for both norm lengths: rms_norm.cc takes the length as an argument and aliases
+        # the hd_ name onto the same body, so the D and head_dim call sites share one copy.
         rms_obj = KernelObjectArtifact(
-            f"rms_norm_{self.D}.o",
+            "rms_norm.o",
             dependencies=[SourceArtifact(kdir / arch_dir / "rms_norm.cc")],
-            extra_flags=[f"-DRMS_COLS={self.D}"],
-        )
-        rms_hd_obj = KernelObjectArtifact(
-            f"hd_rms_norm_{self.HD}.o",
-            dependencies=[SourceArtifact(kdir / arch_dir / "rms_norm.cc")],
-            extra_flags=[f"-DRMS_COLS={self.HD}"],
-            prefix_symbols="hd_",
         )
         # Two DIM_Ks of one source: the projection reduces over d_model, the scores over head_dim.
         # mv.cc bakes DIM_K in, and a func.func symbol is keyed by name, so the second needs its
@@ -233,7 +228,7 @@ class AttnBlockDataParallel(MLIROperator):
             dependencies=[SourceArtifact(kdir / "generic" / "mv_taccum.cc")],
             extra_flags=[f"-DDIM_N={self.HD}"],
         )
-        deps = [copy_obj, rms_obj, rms_hd_obj, mv_obj, sc_mv_obj, rope_obj, softmax_obj, tmv_obj]
+        deps = [copy_obj, rms_obj, mv_obj, sc_mv_obj, rope_obj, softmax_obj, tmv_obj]
         deps += lut_based_ops_artifacts(arch_dir)   # softmax's exp2 LUT, when the arch needs one
         return [KernelArchiveArtifact("attn_block_dp_core.a", dependencies=deps)]
 

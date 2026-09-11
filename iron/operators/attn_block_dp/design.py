@@ -376,13 +376,26 @@ def attn_block_dp(
     copy_kernel = Kernel(
         f"{func_prefix}copy_offset_bf16_vector", CORE_ARCHIVE, [D_ty, HD_ty, np.int32, np.int32]
     )
+    # Two declarations, ONE body: rms_norm.cc aliases the hd_ name onto the other, so the second
+    # call site costs no program memory. They stay two declarations because an external func.func
+    # is typed by memref shape and these callers are at D and at head_dim.
     wnorm_d_kernel = Kernel(
-        f"{func_prefix}weighted_rms_norm_fixed", CORE_ARCHIVE, [D_ty, D_ty, D_ty, np.float32]
+        f"{func_prefix}weighted_rms_norm_cols", CORE_ARCHIVE,
+        [D_ty, D_ty, D_ty, np.int32, np.float32, np.float32]
     )
     wnorm_hd_kernel = Kernel(
-        f"{func_prefix}hd_weighted_rms_norm_fixed", CORE_ARCHIVE,
-        [HD_ty, HD_ty, HD_ty, np.float32]
+        f"{func_prefix}hd_weighted_rms_norm_cols", CORE_ARCHIVE,
+        [HD_ty, HD_ty, HD_ty, np.int32, np.float32, np.float32]
     )
+
+    def rms_len(cols):
+        """The (length, reciprocal) pair the norm takes, from ONE source so they cannot disagree.
+
+        The kernel multiplies by the reciprocal rather than dividing, because a runtime float
+        divide is the whole reason __divsf3 links into a core. Exact for the powers of two this
+        rail uses, so it is not a precision change.
+        """
+        return cols, 1.0 / cols
     # Two matvec bindings at two DIM_Ks. mv.cc bakes DIM_K in at compile time and a func.func
     # symbol is keyed by NAME, so the projection (K=D) and the scores (K=head_dim) need separate
     # prefixed objects -- swiglu_mlp_dp's mv_gu/down_/o_ mechanism exactly.
@@ -478,7 +491,7 @@ def attn_block_dp(
             ch = misc_c.acquire(1)
             copy_k(nin_buf, ch, HD, i * HD)
             misc_c.release(1)
-        wnorm_d_k(cur_buf, nin_buf, hn_buf, epsilon)
+        wnorm_d_k(cur_buf, nin_buf, hn_buf, *rms_len(D), epsilon)
 
         # step 2: n_qn, n_kn, ang -- read once per head, so acquired once and held.
         w3 = misc_c.acquire(3)
@@ -492,7 +505,7 @@ def attn_block_dp(
                 wt = stream_c.acquire(1)
                 mv_k(tsi, row_off, wt, hn_buf, raw_buf)
                 stream_c.release(1)
-            wnorm_hd_k(raw_buf, nqn_t, nrm_buf, epsilon)
+            wnorm_hd_k(raw_buf, nqn_t, nrm_buf, *rms_len(HD), epsilon)
             rope_k(nrm_buf, ang_t, qh_bufs[g], HD)
 
         # step 4: this core's k head, RoPE'd straight into the drain tile that appends it.
@@ -502,7 +515,7 @@ def attn_block_dp(
             wt = stream_c.acquire(1)
             mv_k(tsi, row_off, wt, hn_buf, raw_buf)
             stream_c.release(1)
-        wnorm_hd_k(raw_buf, nkn_t, nrm_buf, epsilon)
+        wnorm_hd_k(raw_buf, nkn_t, nrm_buf, *rms_len(HD), epsilon)
         rope_k(nrm_buf, ang_t, kt, HD)
         out_p.release(1)
 

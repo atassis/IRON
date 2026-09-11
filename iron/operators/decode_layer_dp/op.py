@@ -285,10 +285,10 @@ class DecodeLayerDataParallel(MLIROperator):
         # name, and an unprefixed `add.o` built for one half would be reused for the other.
         attn = [
             obj("attn_add.o", gen / "add.cc", prefix="attn_"),
-            obj(f"attn_rms_{self.D}.o", a2 / "rms_norm.cc",
-                [f"-DRMS_COLS={self.D}"], "attn_"),
-            obj(f"attn_hd_rms_{self.HD}.o", a2 / "rms_norm.cc",
-                [f"-DRMS_COLS={self.HD}"], "attn_hd_"),
+            # One object for both norm lengths: rms_norm.cc takes the length as an argument and
+            # aliases the hd_ name onto the same body, so the D and head_dim call sites share one
+            # copy on a core whose 16 KB program memory is the binding constraint.
+            obj("attn_rms.o", a2 / "rms_norm.cc", (), "attn_"),
             obj(f"attn_gemv_{self.D}k.o", gen / "mv.cc",
                 [f"-DDIM_K={self.D}", "-DVEC_SIZE=64"], "attn_"),
             # The SCORES gemv is the only core-bound op in this graph, so it is the one where a
