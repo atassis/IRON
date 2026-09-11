@@ -87,13 +87,18 @@ class DecodeLayerDataParallel(MLIROperator):
     # field: that one rides the automatic name aggregation because attn_block_dp's `name` has no
     # override to extend, while this class already has one for kv_alloc/kv_block_size.
     window_parameter: str | None = field(default=None, repr=False)
+    # SPLIT-K. The attention window is processed in segments of `attn_split` positions with the
+    # softmax carrying a running max/sum across them, so sc/sw are sized to a SEGMENT and this
+    # class's L1 check below stops being a cap on `max_seq`. None (default) is one segment, byte
+    # for byte the pre-split design. Delegated straight to attn_block_dp, which owns every term.
+    attn_split: int | None = field(default=None, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
         **MLIROperator._name_aliases,
         "attn_cols": "acol", "mlp_cols": "mcol", "max_seq": "S",
         "eps_attn": "ea", "eps_mlp": "em", "tile_size_input": "tsi",
-        "attn_stack_size": "ass", "mlp_stack_size": "mss",
+        "attn_stack_size": "ass", "mlp_stack_size": "mss", "attn_split": "sp",
         "weight_depth": "wd", "tile_rows_gu": "trg", "wqkv_head_major": "hm",
     }
 
@@ -164,16 +169,19 @@ class DecodeLayerDataParallel(MLIROperator):
 
         gqa = self.Hq // self.Hkv
         tile_elems = self.tile_size_input * self.D
-        attn_args = (self.D, self.HD, gqa, self.max_seq, tile_elems, self.weight_depth,
+        # The SPLIT, not the window: since split-K landed max_seq does not enter this budget.
+        attn_split = self.max_seq if self.attn_split is None else self.attn_split
+        attn_args = (self.D, self.HD, gqa, attn_split, tile_elems, self.weight_depth,
                      self.attn_stack_size)
         attn_used = l1_footprint_bytes(*attn_args)
         if attn_used > L1_BYTES:
             fixed = l1_footprint_bytes(*(attn_args[:3] + (0,) + attn_args[4:]))
             per_seq = l1_footprint_bytes(*(attn_args[:3] + (1,) + attn_args[4:])) - fixed
             raise ValueError(
-                f"attention L1 use {attn_used} B exceeds {L1_BYTES} B at max_seq={self.max_seq}: "
-                f"sc+sw cost {per_seq} B per unit of max_seq and are the only terms it drives; "
-                f"largest max_seq that fits is {(L1_BYTES - fixed) // per_seq}"
+                f"attention L1 use {attn_used} B exceeds {L1_BYTES} B at attn_split="
+                f"{attn_split}: sc+sw cost {per_seq} B per unit of SPLIT and are the only terms "
+                f"it drives -- max_seq ({self.max_seq}) no longer enters this budget; largest "
+                f"attn_split that fits is {(L1_BYTES - fixed) // per_seq}"
             )
 
         if self.D % self.mlp_cols or self.FF % self.mlp_cols:
