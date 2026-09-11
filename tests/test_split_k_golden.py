@@ -30,6 +30,15 @@ def split_k_context(scores, V, L, state_bf16):
     bfloat16) versus what partial_softmax_f32state_bf16 does (False: both f32). The probability
     row `p` is bf16 in BOTH arms -- that is the sw buffer and it is bf16 either way, so this
     isolates the STATE dtype and nothing else.
+
+    TWO THINGS ARE bf16 IN BOTH ARMS BECAUSE THE HARDWARE MAKES THEM SO, and modelling either as
+    f32 overstates what f32 state buys -- a first version of this file did exactly that and made
+    the gap look 27.8x when it is 2.3x:
+      - the segment max comes off `aie::reduce_max` over a bf16 vector, so it is bf16-representable
+        before it ever reaches the state;
+      - the correction factor comes off `aie::exp2<bfloat16>`, which returns a bf16 vector.
+        Measured separately: a f32 correction is worth 1.723e-03 against bf16's 1.718e-03 at
+        S=32768, i.e. nothing, so the kernel is free to use the vector primitive.
     """
     st = _bf if state_bf16 else (lambda x: np.float32(x))
     S, HD = V.shape
@@ -39,8 +48,9 @@ def split_k_context(scores, V, L, state_bf16):
 
     for start in range(0, S, L):
         seg = (scores[start:start + L] * LOG2E).astype(np.float32)
-        m_new = st(max(float(m), float(seg.max())))
-        corr = np.float32(0.0) if not np.isfinite(m) else st(np.exp2(np.float32(m) - np.float32(m_new)))
+        m_new = st(max(float(m), float(_bf(seg.max()))))       # reduce_max over a bf16 vector
+        corr = (np.float32(0.0) if not np.isfinite(m)
+                else _bf(np.exp2(np.float32(m) - np.float32(m_new))))   # aie::exp2 -> bf16
         p = _bf(np.exp2(seg - np.float32(m_new)))          # sw is bf16 in the real kernel
         acc = acc * np.float32(corr) + p @ V[start:start + L]
         l = st(np.float32(l) * np.float32(corr) + np.float32(p.sum()))
@@ -73,7 +83,7 @@ def test_f32_state_matches_full_row(S, L):
     scores, V = _case(S)
     rel = _rel_l2(split_k_context(scores, V, L, state_bf16=False), full_row_context(scores, V))
     print(f"  S={S:6d} L={L:5d} f32-state rel-L2 {rel:.3e}")
-    assert rel < 1e-3, f"split-K with f32 state diverged: rel-L2 {rel:.3e}"
+    assert rel < 5e-3, f"split-K with f32 state diverged: rel-L2 {rel:.3e}"
 
 
 def test_bf16_state_cost_is_measured_not_assumed():
