@@ -346,8 +346,13 @@ class DecodeLayerDataParallel(MLIROperator):
         else:
             from iron.operators.gemv.quant import max_legal_vec_size
             qvec = max_legal_vec_size([self.D, self.FF, QD], self.group_size, self.weight_dtype)
+            # Emit ONLY this dtype's wrapper. All four instantiate otherwise, and a template's
+            # static_asserts fire on instantiation -- so one VEC_SIZE would have to be legal for
+            # every dtype, dragging int4 to int8's alignment constraint.
         qtag = f"{qtag}_{qvec}vs" if self.weight_dtype != "bf16" else qtag
-        qflags = [] if self.weight_dtype == "bf16" else [f"-DGROUP_SIZE={self.group_size}"]
+        qflags = ([] if self.weight_dtype == "bf16"
+                  else [f"-DGROUP_SIZE={self.group_size}",
+                        f"-DQUANT_EMIT_{self.weight_dtype.upper()}=1"])
         mlp = [
             obj("mlp_add.o", gen / "add.cc", (), "mlp_"),
             obj("mlp_mul.o", gen / "mul.cc", (), "mlp_"),

@@ -144,8 +144,12 @@ class SwiGLUMLPDataParallel(MLIROperator):
             from iron.operators.gemv.quant import max_legal_vec_size
             _ks = [self.D, self.FF] + ([self.QD] if self.fuse_o else [])
             _vec = max_legal_vec_size(_ks, self.group_size, self.weight_dtype)
+            # Emit ONLY this dtype's wrapper. All four instantiate otherwise, and a template's
+            # static_asserts fire on instantiation -- so one VEC_SIZE would have to be legal for
+            # every dtype, dragging int4 to int8's alignment constraint.
         _qflags = ([] if self.weight_dtype == "bf16"
-                   else [f"-DGROUP_SIZE={self.group_size}"])
+                   else [f"-DGROUP_SIZE={self.group_size}",
+                         f"-DQUANT_EMIT_{self.weight_dtype.upper()}=1"])
         mv_gu_obj = KernelObjectArtifact(
             f"gemv_{self.D}k_{_vec}vs{_qtag}.o",
             dependencies=[SourceArtifact(_qsrc)],

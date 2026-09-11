@@ -293,32 +293,56 @@ void matvec_int8_affine(uint32_t m, const int8_t *__restrict a, const bfloat16 *
 
 }  // namespace
 
+// WHICH WRAPPER THIS OBJECT EMITS. Every caller compiles this source once per weight dtype and
+// names the object after it, so only one wrapper is ever linked -- but all four used to be
+// INSTANTIATED, and a template's static_asserts fire on instantiation whether or not anything
+// calls it. That forced one VEC_SIZE to be legal for all four dtypes at once, which would drag
+// int4 down to int8's alignment constraint and cost it the 64-wide load it is measured at parity
+// with. It also put four kernels' .text in every object, against 16 KB of program memory.
+//
+// Unset, all four are emitted -- the behaviour any caller that predates this flag expects.
+#if !defined(QUANT_EMIT_INT4) && !defined(QUANT_EMIT_INT8) && \
+    !defined(QUANT_EMIT_INT4A) && !defined(QUANT_EMIT_INT8A)
+#define QUANT_EMIT_INT4 1
+#define QUANT_EMIT_INT8 1
+#define QUANT_EMIT_INT4A 1
+#define QUANT_EMIT_INT8A 1
+#endif
+
 extern "C" {
 
 // Naming matches mv.cc's `matvec_{func_type}_{dtype_in}_{dtype_out}` convention
 // (iron/operators/gemv/design.py builds the Kernel() name from the same template).
+#if defined(QUANT_EMIT_INT4) && QUANT_EMIT_INT4
 void matvec_vectorized_int4_bf16(uint32_t m, uint32_t row_offset, const int8_t *__restrict a_in,
                                  const bfloat16 *__restrict b_in, bfloat16 *__restrict c_out) {
   c_out += row_offset;
   matvec_int4_dequant<VEC_SIZE, DIM_K, GROUP_SIZE>(m, a_in, b_in, c_out);
 }
+#endif
 
+#if defined(QUANT_EMIT_INT8) && QUANT_EMIT_INT8
 void matvec_vectorized_int8_bf16(uint32_t m, uint32_t row_offset, const int8_t *__restrict a_in,
                                  const bfloat16 *__restrict b_in, bfloat16 *__restrict c_out) {
   c_out += row_offset;
   matvec_int8_dequant<VEC_SIZE, DIM_K, GROUP_SIZE>(m, a_in, b_in, c_out);
 }
+#endif
 
+#if defined(QUANT_EMIT_INT4A) && QUANT_EMIT_INT4A
 void matvec_vectorized_int4a_bf16(uint32_t m, uint32_t row_offset, const int8_t *__restrict a_in,
                                   const bfloat16 *__restrict b_in, bfloat16 *__restrict c_out) {
   c_out += row_offset;
   matvec_int4_affine<VEC_SIZE, DIM_K, GROUP_SIZE>(m, a_in, b_in, c_out);
 }
+#endif
 
+#if defined(QUANT_EMIT_INT8A) && QUANT_EMIT_INT8A
 void matvec_vectorized_int8a_bf16(uint32_t m, uint32_t row_offset, const int8_t *__restrict a_in,
                                   const bfloat16 *__restrict b_in, bfloat16 *__restrict c_out) {
   c_out += row_offset;
   matvec_int8_affine<VEC_SIZE, DIM_K, GROUP_SIZE>(m, a_in, b_in, c_out);
 }
+#endif
 
 }  // extern "C"
