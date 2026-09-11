@@ -40,6 +40,13 @@ twice; attention requires 8 because `Hkv == n_aie_cols` is TMatVec's "one matrix
 binding on every stage. One `aie.device` does not require one column count, so they are not forced
 equal -- 12 of the array's 32 cores are used, and 3 of its 8 columns.
 
+WEIGHT FORMAT REACHES ONE HALF, and which one is a property of the fifos rather than a choice.
+The MLP half streams Wo, Wg, Wu and Wd down a single weight ObjectFifo, so `weight_dtype` names
+the format of all four together and swiglu_mlp_dp already carries the axis. The attention half
+streams Wqkv, K and V down ONE fifo per core -- the collapse that makes the channel budget below
+work at all -- so its three cannot differ, and giving Wqkv a narrow format means giving the caches
+one too. That is a dtype on attn_block_dp, which does not have one.
+
 SHIM CHANNELS, the constraint that killed the naive fusion. Separate cores means the two halves do
 NOT share their misc/weight/output fifos, so the budget is the SUM, not
 the max: attention 9 in / 8 out plus MLP 5 in / 4 out = **14 input and 12 output** of the
@@ -90,6 +97,8 @@ def decode_layer_dp(
     kv_alloc=None,
     kv_block_size=None,
     window_parameter=None,
+    weight_dtype="bf16",
+    group_size=0,
 ):
     QD = Hq * HD
     # The two halves land in ONE device-wide symbol table and ONE fifo namespace, so each gets its
@@ -108,6 +117,7 @@ def decode_layer_dp(
         dev, D, FF, epsilon=eps_mlp, stack_size=mlp_stack_size,
         func_prefix=f"{func_prefix}mlp_", n_aie_cols=mlp_cols, n_aie_rows=1,
         QD=QD, fuse_o=True, weight_depth=weight_depth, tile_rows_gu=tile_rows_gu,
+        weight_dtype=weight_dtype, group_size=group_size,
         fifo_prefix=f"{func_prefix}m_", parts_only=True,
     )
 

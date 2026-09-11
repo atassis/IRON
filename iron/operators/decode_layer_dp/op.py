@@ -15,22 +15,35 @@ from iron.common import (
     PythonGeneratedMLIRArtifact,
     DesignGenerator,
 )
+import numpy as np
+
 import aie.utils as aie_utils
 from iron.common.device_utils import get_kernel_dir
 from iron.common.operator_bases import lut_based_ops_artifacts
 
 
-def _mlp_l1_footprint_bytes(D, FF, mlp_cols, QD, tile_rows_gu, weight_depth, stack_size):
-    """The MLP half's per-core L1 use, bf16 + fuse_o=True (decode_layer_dp's only call shape).
+def _mlp_l1_footprint_bytes(D, FF, mlp_cols, QD, tile_rows_gu, weight_depth, stack_size,
+                            weight_dtype="bf16", group_size=0):
+    """The MLP half's per-core L1 use at fuse_o=True (decode_layer_dp's only call shape).
     Mirrors swiglu_mlp_dp/design.py's L1 budget block and this file's own get_arg_spec overlap
     arithmetic -- duplicated, not imported, because both are computed inline there rather than
     exported; the same trade SwiGLUMLPDataParallel._wo_rows_padded already makes. No term here
-    depends on max_seq."""
+    depends on max_seq.
+
+    The weight tile is the one term the format moves, and it moves the SAME way design.py's does:
+    `weight_depth * TSI_GU * WROW_D * WUNIT`, where a quantized row is packed BYTES rather than
+    bf16 elements. Every other buffer here is an activation and stays bf16."""
     d_per_core, ff_per_core = D // mlp_cols, FF // mlp_cols
-    wtile_units = (tile_rows_gu or 6) * D
-    o_window = -(-(D // mlp_cols) // (wtile_units // QD)) * (wtile_units // QD)
+    if weight_dtype == "bf16":
+        wrow_d, wunit = D, 2
+    else:
+        from iron.operators.gemv.quant import row_stride_bytes
+        wrow_d, wunit = row_stride_bytes(D, group_size, weight_dtype), 1
+    wtile_units = (tile_rows_gu or 6) * wrow_d
+    tsi_o = ((tile_rows_gu or 6) * D) // QD
+    o_window = -(-(D // mlp_cols) // tsi_o) * tsi_o
     misc = 2 * (D * 2)
-    weight = weight_depth * (wtile_units * 2)
+    weight = weight_depth * (wtile_units * wunit)
     out = 2 * (d_per_core * 2)
     persistent = 2 * (D * 2) + (FF * 2) + 2 * (ff_per_core * 2) + (d_per_core * 2)
     persistent += (QD * 2) + (o_window * 2)   # fuse_o: cx_buf + a_slice_buf
@@ -67,6 +80,11 @@ class DecodeLayerDataParallel(MLIROperator):
     weight_depth: int = field(default=2, repr=False)
     tile_rows_gu: int | None = field(default=None, repr=False)
     wqkv_head_major: bool = False
+    # Weight-stream format for the MLP HALF -- Wo, Wg, Wu and Wd, which share one ObjectFifo and
+    # therefore one format. The attention half has no such axis: Wqkv rides the same fifo as the
+    # K and V caches (see design.py), so a format for it is a format for them.
+    weight_dtype: str = field(default="bf16", repr=False)
+    group_size: int = field(default=0, repr=False)
     # Cache CAPACITY, when it differs from the attention WINDOW (`max_seq`). None (default) keeps
     # them equal -- today's behaviour, byte for byte. `max_seq` stays what sizes the compute (sc/sw,
     # the KV-chunk loop, the mask); `kv_alloc` sizes the KV cache buffers and the per-head stride,
@@ -95,6 +113,7 @@ class DecodeLayerDataParallel(MLIROperator):
         "eps_attn": "ea", "eps_mlp": "em", "tile_size_input": "tsi",
         "attn_stack_size": "ass", "mlp_stack_size": "mss",
         "weight_depth": "wd", "tile_rows_gu": "trg", "wqkv_head_major": "hm",
+        "weight_dtype": "wdt", "group_size": "g",
     }
 
     def __post_init__(self):
@@ -176,6 +195,23 @@ class DecodeLayerDataParallel(MLIROperator):
                 f"largest max_seq that fits is {(L1_BYTES - fixed) // per_seq}"
             )
 
+        # WEIGHT FORMAT. Checked here rather than left to swiglu_mlp_dp/design.py's asserts,
+        # because those fire at MLIR generation -- after placement of the attention half -- and
+        # this class calls that design as a bare function, not through SwiGLUMLPDataParallel.
+        # The attention half has no axis to check: it takes bf16 and nothing else.
+        if self.weight_dtype != "bf16":
+            from iron.operators.gemv.quant import row_stride_bytes
+            if self.group_size <= 0:
+                raise ValueError(
+                    f"weight_dtype={self.weight_dtype!r} needs an explicit group_size > 0")
+            for what, K in (("D", self.D), ("FF", self.FF), ("QD", self.Hq * self.HD)):
+                # Raises on a K that is not a whole number of groups, and on a packed row stride
+                # that would misalign the per-row scale read.
+                row_stride_bytes(K, self.group_size, self.weight_dtype)
+                if K % self.group_size:
+                    raise ValueError(f"{what}={K} must be a whole number of groups "
+                                     f"({self.group_size})")
+
         if self.D % self.mlp_cols or self.FF % self.mlp_cols:
             raise ValueError(
                 f"D ({self.D}) and FF ({self.FF}) must both divide mlp_cols ({self.mlp_cols})"
@@ -184,7 +220,8 @@ class DecodeLayerDataParallel(MLIROperator):
         # mlp_cols/QD) -- checked anyway because it was exactly as unguarded as attention was.
         mlp_used = _mlp_l1_footprint_bytes(self.D, self.FF, self.mlp_cols, self.Hq * self.HD,
                                            self.tile_rows_gu, self.weight_depth,
-                                           self.mlp_stack_size)
+                                           self.mlp_stack_size, self.weight_dtype,
+                                           self.group_size)
         if mlp_used > L1_BYTES:
             raise ValueError(
                 f"MLP L1 use {mlp_used} B exceeds {L1_BYTES} B at mlp_cols={self.mlp_cols} -- "
@@ -224,7 +261,7 @@ class DecodeLayerDataParallel(MLIROperator):
             base = f"{base}_kvblk{self.kv_block_size}"
         if self.window_parameter is not None:
             base = f"{base}_win{self.window_parameter}"
-        return base
+        return f"{base}{self._wtag}"
 
     def get_mlir_artifact(self):
         return PythonGeneratedMLIRArtifact(
@@ -246,6 +283,8 @@ class DecodeLayerDataParallel(MLIROperator):
                     "kv_alloc": self.kv_alloc,
                     "kv_block_size": self.kv_block_size,
                     "window_parameter": self.window_parameter,
+                    "weight_dtype": self.weight_dtype,
+                    "group_size": self.group_size,
                 },
             ),
         )
@@ -286,18 +325,26 @@ class DecodeLayerDataParallel(MLIROperator):
             obj(f"attn_tmv_{self.HD}n.o", gen / "mv_taccum.cc",
                 [f"-DDIM_N={self.HD}"], "attn_"),
         ] + lut_based_ops_artifacts(arch)
+        # The MLP half's three matvecs follow its weight format. mv_quant.cc exports
+        # matvec_vectorized_{dtype}_bf16 with mv.cc's signature except that `a_in` is int8, and
+        # GROUP_SIZE is the extra flag -- swiglu_mlp_dp/op.py builds the same three standalone.
+        # The tag rides in the object NAMES as well as the archive's: the archive is keyed by
+        # name, so a -D-only difference would silently reuse the other format's object.
+        qsrc = gen / ("mv.cc" if self.weight_dtype == "bf16" else "mv_quant.cc")
+        qtag = self._wtag
+        qflags = [] if self.weight_dtype == "bf16" else [f"-DGROUP_SIZE={self.group_size}"]
         mlp = [
             obj("mlp_add.o", gen / "add.cc", (), "mlp_"),
             obj("mlp_mul.o", gen / "mul.cc", (), "mlp_"),
             obj(f"mlp_rms_{self.D}.o", a2 / "rms_norm.cc",
                 [f"-DRMS_COLS={self.D}"], "mlp_"),
             obj("mlp_silu.o", a2 / "silu.cc", (), "mlp_"),
-            obj(f"mlp_gemv_{self.D}k.o", gen / "mv.cc",
-                [f"-DDIM_K={self.D}", "-DVEC_SIZE=64"], "mlp_"),
-            obj(f"mlp_down_gemv_{self.FF}k.o", gen / "mv.cc",
-                [f"-DDIM_K={self.FF}", "-DVEC_SIZE=64"], "mlp_down_"),
-            obj(f"mlp_o_gemv_{QD}k.o", gen / "mv.cc",
-                [f"-DDIM_K={QD}", "-DVEC_SIZE=64"], "mlp_o_"),
+            obj(f"mlp_gemv_{self.D}k{qtag}.o", qsrc,
+                [f"-DDIM_K={self.D}", "-DVEC_SIZE=64"] + qflags, "mlp_"),
+            obj(f"mlp_down_gemv_{self.FF}k{qtag}.o", qsrc,
+                [f"-DDIM_K={self.FF}", "-DVEC_SIZE=64"] + qflags, "mlp_down_"),
+            obj(f"mlp_o_gemv_{QD}k{qtag}.o", qsrc,
+                [f"-DDIM_K={QD}", "-DVEC_SIZE=64"] + qflags, "mlp_o_"),
             obj("mlp_add_cxcopy.o", gen / "add.cc", (), "mlp_cx_"),
             obj("mlp_add_oacopy.o", gen / "add.cc", (), "mlp_oa_"),
         ]
@@ -305,8 +352,29 @@ class DecodeLayerDataParallel(MLIROperator):
         # func_prefix -- "attn_" and "mlp_", set by design.py's decode_layer_dp.
         return [
             KernelArchiveArtifact("attn_attn_block_dp_core.a", dependencies=attn),
-            KernelArchiveArtifact("mlp_swiglu_mlp_dp_core.a", dependencies=mlp),
+            KernelArchiveArtifact(f"mlp_swiglu_mlp_dp_core{self._wtag}.a", dependencies=mlp),
         ]
+
+    @property
+    def _wtag(self):
+        """Format fragment shared by the object names, the archive name and `name`. Must equal
+        swiglu_mlp_dp/design.py's `_WTAG`, which is what the emitted MLIR calls the archive."""
+        return "" if self.weight_dtype == "bf16" else f"_{self.weight_dtype}g{self.group_size}"
+
+    def _wrow(self, K):
+        """Wire units per weight ROW of width K: bf16 elements, or packed bytes when quantized."""
+        if self.weight_dtype == "bf16":
+            return K
+        from iron.operators.gemv.quant import row_stride_bytes
+        return row_stride_bytes(K, self.group_size, self.weight_dtype)
+
+    def _wspec(self, n_units):
+        """One MLP-half weight argument, sized in wire units. dtype is OMITTED for bf16 rather
+        than passed as None -- AIERuntimeArgSpec's default is not None, and passing it explicitly
+        sizes the arena at 8 bytes/element instead of 2."""
+        if self.weight_dtype == "bf16":
+            return AIERuntimeArgSpec("in", (n_units,))
+        return AIERuntimeArgSpec("in", (n_units,), dtype=np.int8)
 
     def get_arg_spec(self):
         D, FF, HD, Hq, Hkv, S = self.D, self.FF, self.HD, self.Hq, self.Hkv, self.max_seq
@@ -334,10 +402,10 @@ class DecodeLayerDataParallel(MLIROperator):
             AIERuntimeArgSpec("inout", (cache,)),             # vc
             AIERuntimeArgSpec("inout", (QD,)),                # cx    (shared: attn out, mlp in)
             AIERuntimeArgSpec("in", (D,)),                    # n_pf
-            AIERuntimeArgSpec("in", (wo_rows * QD,)),         # Wo
-            AIERuntimeArgSpec("in", (FF * D,)),               # Wg
-            AIERuntimeArgSpec("in", (FF * D,)),               # Wu
-            AIERuntimeArgSpec("in", (D * FF,)),               # Wd
+            self._wspec(wo_rows * self._wrow(QD)),           # Wo
+            self._wspec(FF * self._wrow(D)),                  # Wg
+            self._wspec(FF * self._wrow(D)),                  # Wu
+            self._wspec(D * self._wrow(FF)),                  # Wd
             AIERuntimeArgSpec("inout", (FF,)),                # gh all-gather scratch
             AIERuntimeArgSpec("inout", (D,)),                 # a all-gather scratch
             AIERuntimeArgSpec("out", (D,)),                   # nxt
