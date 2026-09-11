@@ -36,7 +36,16 @@ def strided_copy(
     num_aie_channels=1,
     input_offset_parameter=None,
     output_offset_parameter=None,
+    input_offset_patch_marker=0,
+    output_offset_patch_marker=0,
 ):
+    # A non-zero *_offset_patch_marker bakes that sentinel into the BD tap in place of the static
+    # offset, and widens tensor_dims by it so codegen's bounds check does not reject it. The host
+    # rewrites that ELF word per token (npu-xrt FusedElfPatcher scans for the magic), so one
+    # compiled whole-decode ELF serves every position. Distinct from *_offset_parameter, which is
+    # the scratchpad path: there the ELF offset is constant and the parameter adds to it per
+    # dispatch. Both exist because the patched arm is the control the scratchpad arm is validated
+    # against (xdna-engine verify_fused_decode.py vs verify_fused_decode_sp.py).
     assert len(input_sizes) == len(input_strides)
     assert len(output_sizes) == len(output_strides)
 
@@ -105,9 +114,13 @@ def strided_copy(
 
     input_taps = [
         TensorAccessPattern(
-            tensor_dims=(int(input_buffer_size),),
+            tensor_dims=(int(input_buffer_size + input_offset_patch_marker),),
             offset=(
-                input_offset
+                (
+                    input_offset_patch_marker
+                    if input_offset_patch_marker != 0
+                    else input_offset
+                )
                 + c
                 * (input_sizes[input_highest_sz_idx] // num_aie_channels)
                 * input_strides[input_highest_sz_idx]
@@ -124,9 +137,13 @@ def strided_copy(
 
     output_taps = [
         TensorAccessPattern(
-            tensor_dims=(int(output_buffer_size),),
+            tensor_dims=(int(output_buffer_size + output_offset_patch_marker),),
             offset=(
-                output_offset
+                (
+                    output_offset_patch_marker
+                    if output_offset_patch_marker != 0
+                    else output_offset
+                )
                 + c
                 * (output_sizes[output_highest_sz_idx] // num_aie_channels)
                 * output_strides[output_highest_sz_idx]

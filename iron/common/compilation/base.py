@@ -639,11 +639,20 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
         for artifact in worklist:
             mlir_source = artifact.mlir_input
             work_dir = _aiecc_work_dir(mlir_source.filename)
-            options = [
-                f"-j{os.environ.get('AIECC_JOBS', '1')}",
-                "--expand-load-pdis",
-                "--get-scratchpad-parameters",
-            ] + artifact.extra_flags
+            # SKIP_EXPAND_PDIS / DISABLE_REPEATER / AIECC_OPT are BUILD-TIME shortcuts for the
+            # measurement gates, never for a shipped artifact: dropping --expand-load-pdis yields a
+            # correct ELF that dispatches ~1.48x slower (measured B=16 12-layer, 383.7 vs 258.6 ms),
+            # which is the whole point -- it makes an hours-long 8-column build finish so the rest of
+            # the pipeline can be gated. A gate that sets one of these and is silently ignored
+            # compares the wrong ELF, so they are read here rather than left to the caller.
+            options = [f"-j{os.environ.get('AIECC_JOBS', '1')}"]
+            if not os.environ.get("SKIP_EXPAND_PDIS"):
+                options.append("--expand-load-pdis")
+            if os.environ.get("DISABLE_REPEATER"):
+                options.append("--disable-repeater-scripts")
+            if os.environ.get("AIECC_OPT"):
+                options += ["-O", os.environ["AIECC_OPT"]]
+            options += ["--get-scratchpad-parameters"] + artifact.extra_flags
 
             def _compile(
                 artifact=artifact,
