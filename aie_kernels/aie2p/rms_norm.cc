@@ -115,6 +115,46 @@ void rms_norm_fixed(const T *restrict input,
 }
 #endif
 
+// Length-parameterised form. `cols` and its reciprocal both arrive as arguments, so neither scalar-
+// float construct the RMS_COLS form exists to avoid comes back: `sum_sq / cols` is what links
+// __divsf3 (1168 B) and __floatsisf, and `cols % N` is what keeps the remainder loops alive.
+// `cols / N` is an integer divide by a compile-time power of two, i.e. a shift.
+// PRECONDITION: N divides cols. A remainder is not handled and not detectable here -- callers with
+// a ragged length want `rms_norm_general` above.
+template <typename T, int N>
+void rms_norm_cols(const T *restrict input,
+                   const T *restrict input2,
+                   T *restrict output,
+                   int32_t cols,
+                   float inv_cols,
+                   float epsilon)
+{
+    event0();
+    const int vector_chunks = cols / N;
+    ::aie::vector<float, N> add_res = ::aie::zeros<float, N>();
+    for (int i = 0; i < vector_chunks; i++) {
+        ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input + i * N);
+        ::aie::vector<float, N> square_v = ::aie::mul_square(reg_a);
+        add_res = ::aie::add(add_res, square_v);
+    }
+    float inv_rms = aie::invsqrt(::aie::reduce_add(add_res) * inv_cols + epsilon);
+    ::aie::accum<accfloat, N> inv_rms_v;
+    inv_rms_v.from_vector(::aie::broadcast<float, N>(inv_rms), 0);
+
+    for (int i = 0; i < vector_chunks; i++) {
+        ::aie::accum<accfloat, N> reg_a;
+        reg_a.from_vector(::aie::load_v<N>(input + i * N), 0);
+        reg_a = ::aie::mul(reg_a.template to_vector<float>(), inv_rms_v.template to_vector<float>());
+        if (input2) {
+            ::aie::accum<accfloat, N> reg_b;
+            reg_b.from_vector(::aie::load_v<N>(input2 + i * N), 0);
+            reg_a = ::aie::mul(reg_a.template to_vector<float>(), reg_b.template to_vector<float>());
+        }
+        ::aie::store_v(output + i * N, reg_a.template to_vector<T>());
+    }
+    event1();
+}
+
 extern "C" {
 void rms_norm_bf16_vector(bfloat16 *input, bfloat16 *output, int32_t size, float epsilon)
 {
@@ -131,6 +171,20 @@ void weighted_rms_norm_fixed(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out, fl
     rms_norm_fixed<bfloat16, 32, RMS_COLS>(a_in, b_in, c_out, epsilon);
 }
 #endif
+// ONE body, two MLIR-visible names. An external func.func is keyed by NAME and typed by memref
+// SHAPE, so a caller at D and a caller at head_dim cannot share a declaration -- but under the
+// bare-pointer calling convention both lower to the same ABI, so they can share an address. The
+// alias is what keeps the second call site from costing a second 960 B copy of this loop on a core
+// whose 16 KB program memory is the binding constraint.
+void weighted_rms_norm_cols(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out,
+                            int32_t cols, float inv_cols, float epsilon)
+{
+    ::aie::set_rounding(aie::rounding_mode::conv_even); // round-to-nearest-even; do not inherit a floor rounding mode
+    rms_norm_cols<bfloat16, 32>(a_in, b_in, c_out, cols, inv_cols, epsilon);
+}
+void hd_weighted_rms_norm_cols(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out,
+                               int32_t cols, float inv_cols, float epsilon)
+    __attribute__((alias("weighted_rms_norm_cols")));
 void weighted_rms_norm(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out, int32_t size, float epsilon)
 {
     ::aie::set_rounding(aie::rounding_mode::conv_even); // round-to-nearest-even; do not inherit a floor rounding mode

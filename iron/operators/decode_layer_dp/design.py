@@ -101,6 +101,7 @@ def decode_layer_dp(
     group_size=0,
     split_gh=1,
     attn_split=None,
+    scores_rowbatch=1,
 ):
     QD = Hq * HD
     # The two halves land in ONE device-wide symbol table and ONE fifo namespace, so each gets its
@@ -113,7 +114,7 @@ def decode_layer_dp(
         stack_size=attn_stack_size, func_prefix=f"{func_prefix}attn_", n_aie_cols=attn_cols,
         weight_depth=weight_depth, wqkv_head_major=wqkv_head_major,
         kv_alloc=kv_alloc, kv_block_size=kv_block_size, window_parameter=window_parameter,
-        attn_split=attn_split,
+        attn_split=attn_split, scores_rowbatch=scores_rowbatch,
         fifo_prefix=f"{func_prefix}a_", parts_only=True, norms_packed=True,
     )
     m = my_swiglu_mlp_dp(
