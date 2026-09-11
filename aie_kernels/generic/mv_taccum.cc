@@ -97,4 +97,27 @@ void taccum_finish_bf16(uint32_t groups,
     }
 }
 
+/* Split-K's finish: the same convert, preceded by the normalisation the softmax deferred.
+ *
+ * A SEPARATE function rather than an extra argument on the one above, because tmatvec/design.py
+ * binds taccum_finish_bf16 too (with three arguments) and a func.func symbol is keyed by NAME --
+ * changing the shared signature would break that operator silently at MLIR generation.
+ */
+void taccum_finish_scaled_bf16(uint32_t groups,
+                               const float *__restrict state,
+                               const float *__restrict acc,
+                               bfloat16 *__restrict c_out)
+{
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    // partial_softmax_f32state_bf16 writes raw exp2 and grows a running sum in state[1]: the
+    // denominator is not known until the last segment has been seen, so the one divide the whole
+    // attention does lands here.
+    const float inv_l = aie::inv(state[1]);
+    for (uint32_t g = 0; g < groups; g++) {
+        aie::accum<accfloat, DIM_N> ac;
+        ac.from_vector(aie::mul(aie::load_v<DIM_N>(acc + g * DIM_N), inv_l).template to_vector<float>());
+        aie::store_v(c_out + g * DIM_N, ac.template to_vector<bfloat16>());
+    }
+}
+
 } // extern "C"
