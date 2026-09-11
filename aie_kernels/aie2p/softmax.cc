@@ -205,8 +205,7 @@ void partial_softmax_bf16(bfloat16 *restrict input,
 float partial_softmax_f32state_bf16(bfloat16 *restrict input_vector,
                                     bfloat16 *restrict output_vector,
                                     float *restrict state,
-                                    const int32_t vector_size,
-                                    const bfloat16 scale)
+                                    const int32_t vector_size)
 {
     event0();
     ::aie::set_rounding(FLASH_ROUNDING_MODE);
@@ -219,7 +218,10 @@ float partial_softmax_f32state_bf16(bfloat16 *restrict input_vector,
     aie::vector<bfloat16, FLASH_SM_VEC_LEN> log2e_vec, max_val_vec, exp_val;
     aie::accum<accfloat, FLASH_SM_VEC_LEN> scaled_accum, exp_in_accum, exp_val_accum;
 
-    log2e_vec = aie::broadcast<bfloat16, FLASH_SM_VEC_LEN>(scale);
+    // The file's own log2e, not a caller argument -- softmax_bf16 above is bound the same way
+    // (input, output, size) and attn_block_dp's q is already pre-scaled by 1/sqrt(head_dim) in the
+    // qk-norm, so there is no second scale for a caller to vary.
+    log2e_vec = aie::broadcast<bfloat16, FLASH_SM_VEC_LEN>((bfloat16)log2e);
 
     // Pass 1 -- this segment's max over the SCALED values. Starts at -inf, not at 0 the way
     // softmax_simple_bf16 does: a full-row softmax is shift-invariant so 0 is harmless there, but
