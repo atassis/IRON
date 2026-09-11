@@ -380,9 +380,7 @@ def attn_block_dp(
     copy_kernel = Kernel(
         f"{func_prefix}copy_offset_bf16_vector", CORE_ARCHIVE, [D_ty, HD_ty, np.int32, np.int32]
     )
-    # Two declarations, ONE body: rms_norm.cc aliases the hd_ name onto the other, so the second
-    # call site costs no program memory. They stay two declarations because an external func.func
-    # is typed by memref shape and these callers are at D and at head_dim.
+    # Two declarations, one body -- see rms_norm.cc's weighted_rms_norm_cols.
     wnorm_d_kernel = Kernel(
         f"{func_prefix}weighted_rms_norm_cols", CORE_ARCHIVE,
         [D_ty, D_ty, D_ty, np.int32, np.float32, np.float32]
@@ -407,9 +405,8 @@ def attn_block_dp(
         f"both reduction lengths must be a whole number of {GEMV_VEC_SIZE}-wide chunks, "
         f"got D={D}, head_dim={HD}"
     )
-    # One runtime-K body under two names -- an external func.func is keyed by name and typed by
-    # memref shape, and these callers are at D and at head_dim. The row-batched scores path takes K
-    # as a template parameter, so when it is on the scores keep their own compile-time-K symbol.
+    # One runtime-K body under two names -- see rms_norm.cc. The row-batched scores path takes K as
+    # a template parameter, so when it is on the scores keep their own compile-time-K symbol.
     mv_kernel = Kernel(
         f"{func_prefix}matvec_rtk_bf16_bf16", CORE_ARCHIVE,
         [np.int32, np.int32, np.int32, TILE_ty, D_ty, HD_ty],

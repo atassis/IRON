@@ -172,11 +172,9 @@ void matvec_vectorized_rowbatch(uint32_t m, const bfloat16 *__restrict a, const 
 }
 
 // Runtime-K form. DIM_K is a template constant above, so the projection (K=d_model) and the scores
-// (K=head_dim) otherwise need two compiled bodies. Here K is an argument, and the two MLIR-visible
-// names alias onto one body -- an external func.func is keyed by name and typed by memref shape, so
-// the callers still need two declarations, but not two copies of the loop.
-// The cost is the pipelining hint: with K compile-time it is k/stride (16 at d_model, 2 at
-// head_dim); here it can only assert the minimum both call sites satisfy.
+// (K=head_dim) otherwise need two compiled bodies; here K is an argument. Alias mechanics: see
+// rms_norm.cc's weighted_rms_norm_cols. The cost is the pipelining hint -- with K compile-time it is
+// k/stride (16 at d_model, 2 at head_dim); here it can only assert the minimum both callers satisfy.
 template <uint32_t r>
 void matvec_vectorized_rtk(uint32_t m, uint32_t k,
                            const bfloat16 *__restrict a, const bfloat16 *__restrict b,
@@ -224,10 +222,8 @@ void matvec_rtk_bf16_bf16(uint32_t m,
     matvec_vectorized_rtk<VEC_SIZE>(m, k, a_in, b_in, c_out);
 }
 #ifdef GEMV_ALIAS_SC
-// The scores caller's second MLIR-visible name. An external func.func is keyed by name and typed by
-// memref shape, so a caller at d_model and one at head_dim cannot share a declaration -- but under
-// the bare-pointer calling convention they share an ABI, so they can share an address. Opt-in
-// because the row-batched path below takes k as a TEMPLATE parameter and so cannot share this body.
+// The scores caller's second name for the body above -- see rms_norm.cc. Opt-in because the
+// row-batched path below takes k as a TEMPLATE parameter and so cannot share this body.
 void sc_matvec_rtk_bf16_bf16(uint32_t m,
                              uint32_t row_offset,
                              uint32_t k,
