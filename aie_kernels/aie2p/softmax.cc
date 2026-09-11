@@ -229,13 +229,18 @@ void partial_softmax_f32state_bf16(bfloat16 *restrict input_vector,
     // Pass 1 -- this segment's max over the SCALED values. Starts at -inf, not at 0 the way
     // softmax_simple_bf16 does: a full-row softmax is shift-invariant so 0 is harmless there, but
     // a max that has to COMPOSE with the previous segment's must be the real one.
-    float seg_max = -INFINITY;
+    // ONE scalar reduce at the end, not one per vector. The obvious form -- reduce_max per
+    // iteration then `if (r > seg_max)` -- is what softmax_simple_bf16 above does, and on AIE2P it
+    // costs a __gtsf2 LIBCALL every iteration: the scalar unit has no f32, so every scalar float
+    // compare becomes a call. At vector_size 4096 that is 64 calls per segment per head where one
+    // would do. Keeping the running max as a VECTOR makes the loop body pure vector work.
+    aie::vector<bfloat16, FLASH_SM_VEC_LEN> max_acc =
+        aie::broadcast<bfloat16, FLASH_SM_VEC_LEN>((bfloat16)-INFINITY);
     for (int i = 0; i < elem_iters; i++) {
         scaled_accum = aie::mul(*it_max_in++, log2e_vec);
-        float r = aie::reduce_max(scaled_accum.to_vector<bfloat16>());
-        if (r > seg_max)
-            seg_max = r;
+        max_acc = aie::max(max_acc, scaled_accum.to_vector<bfloat16>());
     }
+    const float seg_max = aie::reduce_max(max_acc);
 
     const float m_prev = state[0];
 
