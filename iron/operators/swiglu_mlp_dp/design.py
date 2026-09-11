@@ -166,7 +166,7 @@ def _split_run(total, lim=1023, gran=2):
 def my_swiglu_mlp_dp(
     dev, D, FF, epsilon=1e-5, stack_size=0x800, func_prefix="", n_aie_cols=8, n_aie_rows=1,
     QD=None, fuse_o=False, trace_size=0, weight_dtype="bf16", group_size=0,
-    weight_depth=2, tile_rows_gu=None, fifo_prefix="", parts_only=False,
+    weight_depth=2, tile_rows_gu=None, fifo_prefix="", parts_only=False, split_gh=1,
 ):
     """`func_prefix` is required (not optional) by iron.common.sequence.FusedDispatch the moment
     this design is placed in an OperatorSequence -- see gemv/design.py's identical parameter for
@@ -661,7 +661,21 @@ def my_swiglu_mlp_dp(
         # Barrier: gh_scratch must be fully written before any core reads it back. Every core's R
         # output-fifo drains for gh land at disjoint, contiguous offsets that together cover all
         # of gh_scratch exactly once, in the natural FF order Wd's rows expect.
-        tg2 = TaskGroup()
+        #
+        # `split_gh` is an INSTRUMENT, not a feature. It chops this ONE group into k groups over
+        # the same drains in the same order, so bytes, shim tasks, BDs, configures and designs are
+        # all byte-identical and the ONLY thing that moves is the number of sync points: +(k-1) per
+        # layer. That is the one axis left after BD-chaining refuted the per-task model on device
+        # (105 -> 64 tasks/layer at constant bytes bought +0.209 ms, the wrong sign): per-task and
+        # per-sync-point were confounded until something moved them independently, and only this
+        # does.
+        # Splitting HERE is safe in the invariant this file states one-directionally in time
+        # (every task in group k reachable by the core using only groups <= k): these are all
+        # DRAINS whose fills were issued in strictly earlier groups, and each column's output fifo
+        # is its own, so an undrained column stalls its own core without blocking another
+        # column's drain. Contrast attn_block_dp's tg3, where splitting fills from drains
+        # deadlocks a core that interleaves them.
+        gh_drains = []
         for g in range(n_aie_cols):
             for r in range(R):
                 if n_aie_rows == 1:
@@ -671,8 +685,14 @@ def my_swiglu_mlp_dp(
                         FF, g * n_aie_rows * FF_PER_CORE + r * D_PER_CORE,
                         n_aie_rows, FF_PER_CORE, 1, D_PER_CORE,
                     )
+                gh_drains.append((g, tap))
+        k = max(1, min(int(split_gh), len(gh_drains)))
+        per = -(-len(gh_drains) // k)
+        for lo in range(0, len(gh_drains), per):
+            tg2 = TaskGroup()
+            for g, tap in gh_drains[lo:lo + per]:
                 gout_cs[g].drain(gh_scratch, tap, wait=True, group=tg2)
-        tg2.finish()
+            tg2.finish()
 
         # gh_scratch refill AND Wd share this group: both are exactly what the core's down-matvec
         # step needs next, and neither has an ordering hazard against anything still pending.

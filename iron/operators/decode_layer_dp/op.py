@@ -105,6 +105,9 @@ class DecodeLayerDataParallel(MLIROperator):
     # field: that one rides the automatic name aggregation because attn_block_dp's `name` has no
     # override to extend, while this class already has one for kv_alloc/kv_block_size.
     window_parameter: str | None = field(default=None, repr=False)
+    # INSTRUMENT (see swiglu_mlp_dp/design.py): chop the gh drain group into k groups. Moves ONLY
+    # the sync-point count, +(k-1) per layer, at identical bytes/tasks/BDs/configures/designs.
+    split_gh: int = field(default=1, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -261,6 +264,8 @@ class DecodeLayerDataParallel(MLIROperator):
             base = f"{base}_kvblk{self.kv_block_size}"
         if self.window_parameter is not None:
             base = f"{base}_win{self.window_parameter}"
+        if self.split_gh != 1:
+            base = f"{base}_sgh{self.split_gh}"
         return f"{base}{self._wtag}"
 
     def get_mlir_artifact(self):
@@ -285,6 +290,7 @@ class DecodeLayerDataParallel(MLIROperator):
                     "window_parameter": self.window_parameter,
                     "weight_dtype": self.weight_dtype,
                     "group_size": self.group_size,
+                    "split_gh": self.split_gh,
                 },
             ),
         )
