@@ -254,6 +254,7 @@ class DecodeLayerDataParallel(MLIROperator):
                     "kv_alloc": self.kv_alloc,
                     "kv_block_size": self.kv_block_size,
                     "window_parameter": self.window_parameter,
+                    "attn_split": self.attn_split,
                 },
             ),
         )
