@@ -49,5 +49,10 @@ static_assert(sizeof(float) == 4, "flash running state assumes a 4-byte f32 elem
 // mha.cc's 4-band scale_buffer protocol ([m_prev][m_i][l][segment-sum -> correction], each B_q
 // wide) is likewise not what this design speaks. Our state is two f32 words per group.
 
-// Running state, one per (core, gqa group): [0] running max, [1] running sum.
-#define FLASH_STATE_WORDS 2
+// Running state, one per (core, gqa group):
+//   [0] running max, [1] running sum, [2] the correction factor the last segment produced.
+//
+// [2] is state rather than a return value because an IRON Kernel call DISCARDS its result
+// (aie/helpers/dialects/func.py::call), so a kernel cannot hand a scalar to the next one. mha.cc
+// reaches the same conclusion and parks its correction in scale_buffer + 3*B_q.
+#define FLASH_STATE_WORDS 3

@@ -198,14 +198,17 @@ void partial_softmax_bf16(bfloat16 *restrict input,
  * bf16's 1.718e-03 at S=32768, i.e. nothing. No scalar exp2 is needed on the core.
  */
 
-// One segment of an online softmax. Reads/updates `state` = {running max, running sum}, writes
-// UNNORMALISED exp2 to `output` -- the divide by the running sum happens once, in
-// taccum_finish_bf16, after the last segment. Returns the factor the caller must apply to the f32
-// context accumulator before adding this segment's contribution.
-float partial_softmax_f32state_bf16(bfloat16 *restrict input_vector,
-                                    bfloat16 *restrict output_vector,
-                                    float *restrict state,
-                                    const int32_t vector_size)
+// One segment of an online softmax. Reads/updates `state` = {running max, running sum, correction}
+// and writes UNNORMALISED exp2 to `output` -- the divide by the running sum happens once, in
+// taccum_finish_scaled_bf16, after the last segment.
+//
+// The correction the caller must apply to the f32 context accumulator goes in state[2] rather than
+// being returned: an IRON Kernel call discards its result, so a kernel cannot hand a scalar to the
+// next one. mha.cc parks its own correction in scale_buffer + 3*B_q for the same reason.
+void partial_softmax_f32state_bf16(bfloat16 *restrict input_vector,
+                                   bfloat16 *restrict output_vector,
+                                   float *restrict state,
+                                   const int32_t vector_size)
 {
     event0();
     ::aie::set_rounding(FLASH_ROUNDING_MODE);
@@ -245,8 +248,9 @@ float partial_softmax_f32state_bf16(bfloat16 *restrict input_vector,
             aie::broadcast<bfloat16, FLASH_SM_VEC_LEN>((bfloat16)0.0f);
         for (int i = 0; i < elem_iters; i++)
             *it_exp_out++ = z;
+        state[2] = 1.0f;
         event1();
-        return 1.0f;
+        return;
     }
 
     const float m_new = (seg_max > m_prev) ? seg_max : m_prev;
@@ -279,9 +283,9 @@ float partial_softmax_f32state_bf16(bfloat16 *restrict input_vector,
 
     state[0] = m_new;
     state[1] = state[1] * corr + seg_sum;
+    state[2] = corr;
 
     event1();
-    return corr;
 }
 
 // {running max, running sum} for one group, before any segment has run.
@@ -289,14 +293,16 @@ void flash_state_init(float *restrict state)
 {
     state[0] = -INFINITY;
     state[1] = 0.0f;
+    state[2] = 1.0f;
 }
 
-// Scale an f32 context accumulator in place by the factor partial_softmax_f32state_bf16 returned.
+// Scale an f32 context accumulator in place by the factor the last partial_softmax_f32state_bf16
+// left in state[2].
 // mha.cc::rescale_O does the same job for a 64x64 bf16 tile with the layout hardcoded into three
 // fixed loops; this one takes a length and a dtype that match attn_block_dp's [gqa][head_dim] f32.
-void acc_rescale_f32(uint32_t n, float factor, float *restrict acc)
+void acc_rescale_f32(uint32_t n, const float *restrict state, float *restrict acc)
 {
-    aie::vector<float, 16> f = aie::broadcast<float, 16>(factor);
+    aie::vector<float, 16> f = aie::broadcast<float, 16>(state[2]);
     for (uint32_t i = 0; i < n; i += 16)
         aie::store_v(acc + i, aie::mul(aie::load_v<16>(acc + i), f).to_vector<float>());
 }
