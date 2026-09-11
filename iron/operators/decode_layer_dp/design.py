@@ -90,6 +90,7 @@ def decode_layer_dp(
     kv_alloc=None,
     kv_block_size=None,
     window_parameter=None,
+    split_gh=1,
 ):
     QD = Hq * HD
     # The two halves land in ONE device-wide symbol table and ONE fifo namespace, so each gets its
@@ -108,7 +109,7 @@ def decode_layer_dp(
         dev, D, FF, epsilon=eps_mlp, stack_size=mlp_stack_size,
         func_prefix=f"{func_prefix}mlp_", n_aie_cols=mlp_cols, n_aie_rows=1,
         QD=QD, fuse_o=True, weight_depth=weight_depth, tile_rows_gu=tile_rows_gu,
-        fifo_prefix=f"{func_prefix}m_", parts_only=True,
+        fifo_prefix=f"{func_prefix}m_", parts_only=True, split_gh=split_gh,
     )
 
     # L3 arguments, with the two the halves SHARE folded together rather than duplicated:
