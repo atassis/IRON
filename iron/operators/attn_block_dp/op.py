@@ -54,6 +54,11 @@ class AttnBlockDataParallel(MLIROperator):
     # `name` property override instead).
     window_parameter: str | None = None
     wqkv_head_major: bool = False
+    # SPLIT-K. The attention window is processed in segments of `attn_split` positions, with the
+    # softmax carrying a running max/sum across them, so sc/sw are sized to a SEGMENT and L1 stops
+    # scaling with `max_seq`. None (default) is one segment -- byte for byte the pre-split design.
+    # This is what lifts the 4544-position window cap; see the L1 check below.
+    attn_split: int | None = field(default=None, repr=False)
     # Cache CAPACITY, when it differs from the attention WINDOW (`max_seq`). None (default) keeps
     # them equal -- today's behaviour, byte for byte. `max_seq` stays what sizes the compute (sc/sw,
     # the KV-chunk loop, the mask); `kv_alloc` sizes the KV cache buffers and the per-head stride, so
@@ -75,6 +80,7 @@ class AttnBlockDataParallel(MLIROperator):
         "tile_size_input": "tsi",
         "stack_size": "ss",
         "max_seq": "S",
+        "attn_split": "sp",
         "kv_offset_parameter": "kvpar",
         "mask_parameter": "mpar",
         "window_parameter": "winpar",
@@ -92,6 +98,11 @@ class AttnBlockDataParallel(MLIROperator):
             base = f"{base}_kva{self.kv_alloc}"
         if self.kv_block_size is not None and self.kv_block_size != (self.kv_alloc or self.max_seq):
             base = f"{base}_kvblk{self.kv_block_size}"
+        # repr=False like its siblings above; same DYNAMIC_WINDOW-class collision risk a shared
+        # build dir would otherwise hit -- a cached attn_split=None (or different split) ELF could
+        # silently satisfy a request for another. attn_split=None keeps the pre-split name unchanged.
+        if self.attn_split is not None:
+            base = f"{base}_sp{self.attn_split}"
         return base
 
     def __post_init__(self):
@@ -146,13 +157,15 @@ class AttnBlockDataParallel(MLIROperator):
         # "'aie.tile' op Basic sequential allocation also failed".
         from iron.operators.attn_block_dp.design import l1_footprint_bytes, L1_BYTES
 
-        used = l1_footprint_bytes(self.D, self.HD, self.Hq // self.Hkv, self.max_seq, tile,
+        split = self.max_seq if self.attn_split is None else self.attn_split
+        used = l1_footprint_bytes(self.D, self.HD, self.Hq // self.Hkv, split, tile,
                                  self.weight_depth, self.stack_size)
         if used > L1_BYTES:
             gqa = self.Hq // self.Hkv
             raise ValueError(
-                f"L1 use {used} B exceeds {L1_BYTES} B at max_seq={self.max_seq}: sc+sw alone are "
-                f"{2 * gqa * self.max_seq * 2} B and are the terms max_seq drives"
+                f"L1 use {used} B exceeds {L1_BYTES} B at attn_split={split}: sc+sw alone are "
+                f"{2 * gqa * split * 2} B and are the terms the SPLIT drives (max_seq="
+                f"{self.max_seq} no longer enters this budget)"
             )
         MLIROperator.__init__(self, context=self.context)
 
@@ -176,6 +189,7 @@ class AttnBlockDataParallel(MLIROperator):
                     "wqkv_head_major": self.wqkv_head_major,
                     "kv_alloc": self.kv_alloc,
                     "kv_block_size": self.kv_block_size,
+                    "attn_split": self.attn_split,
                 },
             ),
         )

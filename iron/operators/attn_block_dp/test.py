@@ -75,26 +75,47 @@ _SUBI_DRAIN_RE = re.compile(r"^\s*%\S+ = arith\.subi %(c\d+_i32(?:_\d+)?), %\S+ 
 
 
 def _normalize_core_region(region):
-    """Strip the three terms that legitimately vary with max_seq but are NOT the trip count:
+    """Strip the four terms that legitimately vary with max_seq (or, for (4), with something
+    outside this text entirely) but are NOT the trip count:
     (1) the row-length CONSTANT fed to mask_bf16/softmax_bf16/taccum_rows_bf16_f32 -- a fresh
     `%cN_i32... = arith.constant N : i32` immediately followed by its sole use as that call's
     row-length operand; (2) the sc/sw buffer WIDTH (S, the `2*gqa*S*2` L1 bytes design.py costs
     to the window) wherever it appears as a `memref<Nxbf16>` type in one of the four kernel call
-    signatures; (3) the drain loop's N_KV_CHUNKS operand -- design.py's `arith.subi(N_KV_CHUNKS,
-    chunks)`, the CONSTANT operand only, matched the same way as (1): a fresh
-    `%cN_i32... = arith.constant N : i32` immediately followed by its sole use as arith.subi's
-    FIRST operand. (1) and (2) are anchored on the KERNEL NAME, never the numeric value: tile_elems
+    signatures; (3) the drain loop's TOTAL operand -- design.py's
+    `arith.subi(TOTAL, arith.muli(nsplits, PER_SPLIT))`, the TOTAL constant only, matched the same
+    way as (1): a fresh `%cN_i32... = arith.constant N : i32` whose sole use is arith.subi's FIRST
+    operand. (1) and (2) are anchored on the KERNEL NAME, never the numeric value: tile_elems
     (tsi*D) equals max_seq by coincidence at this test's S=4096 (tsi=4, D=1024), and a blind
     "replace this number" pass would conflate the two and silently launder a real difference. (3)
-    has no kernel name to anchor on, so it is anchored on the OP instead -- arith.subi appears
-    nowhere else in core_fn (verified against the emitted MLIR, not assumed) -- and only the
-    constant it subtracts FROM is stripped; the chunks value being subtracted is untouched, so a
-    broken compute-loop trip count still shows up as a diff here.
+    has no kernel name to anchor on, so it is anchored on the OP instead. arith.subi now appears
+    TWICE in core_fn -- split-K's seg_unmasked clamp is the other one (`arith.subi(mask_len,
+    seg_lo)`) -- but only TOTAL's use has a fresh CONSTANT as its first operand, which is what the
+    match requires, so the anchor still picks out exactly one line. Only the constant TOTAL is
+    stripped; the muli's own PER_SPLIT operand and the nsplits value being subtracted from are
+    untouched, so a broken segment-loop trip count still shows up as a diff here. TOTAL's use sits
+    TWO lines below its definition rather than one -- an unrelated `arith.muli` (consuming a
+    DIFFERENT, invariant PER_SPLIT constant) sits in between -- so this rule looks one line further
+    than (1) and (2) do.
 
     (3) is TRANSITIONAL, not a permanent carve-out: it exists only because the K/V-cache fill still
-    streams the full built window (N_KV_CHUNKS tiles) regardless of `chunks`. Once the fill itself
-    reads a runtime length -- streaming exactly `chunks` tiles -- the drain loop this rule
-    normalizes disappears, and this rule should be deleted with it, not carried forward."""
+    streams every built segment regardless of `nsplits`. Once the fill itself reads a runtime
+    length -- streaming exactly `nsplits` segments -- the drain loop this rule normalizes
+    disappears, and this rule should be deleted with it, not carried forward.
+
+    (4) FOUND while adding attn_split to this test, not designed in advance: `%cV_TYPE_N`-style
+    constant register NAMES carry a disambiguation suffix N that is NOT purely positional --
+    Measured 2026-09-11, two attn_split=128 builds differing only in max_seq (1024 vs 4096) produce
+    core bodies identical in every operation but ONE register suffix (73 vs 74), with no textual
+    difference anywhere before it (confirmed via a full-file diff against the un-normalized MLIR,
+    first divergence inside `aie.core`'s own body, not in any preceding shared declaration).
+    So the disambiguation counter depends on something outside the printed region -- unidentified,
+    and out of scope to chase here. Every constant name of this shape is stripped to its base (the
+    literal digits and the optional `_TYPE` word, dropping the trailing `_N`) -- safe because this
+    generated code always defines a constant immediately before its single use (verified against
+    the emitted MLIR throughout this design), so no result name is read across the boundary a
+    collapsed suffix could blur. This is NOT anchored to the drain loop like (1)-(3); it is a
+    blanket textual pass, because the suffix drift itself is not proven to originate from split-K
+    or from the drain specifically."""
     lines = region.split("\n")
     out, i = [], 0
     while i < len(lines):
@@ -110,6 +131,14 @@ def _normalize_core_region(region):
                 out.append(re.sub(rf"%{re.escape(m.group(2))}\b", "%NKVCHUNKS", lines[i + 1]))
                 i += 2
                 continue
+        if (m and i + 2 < len(lines) and not re.search(rf"%{re.escape(m.group(2))}\b", lines[i + 1])
+                and re.search(rf"%{re.escape(m.group(2))}\b", lines[i + 2])
+                and _SUBI_DRAIN_RE.match(lines[i + 2])):
+            out.append(f"{m.group(1)}%NKVCHUNKS = arith.constant NKVCHUNKS : i32")
+            out.append(lines[i + 1])
+            out.append(re.sub(rf"%{re.escape(m.group(2))}\b", "%NKVCHUNKS", lines[i + 2]))
+            i += 3
+            continue
         out.append(lines[i])
         i += 1
     text = "\n".join(out)
@@ -121,10 +150,11 @@ def _normalize_core_region(region):
         r"\(i32, i32, i32, i32, memref<\d+xbf16>, memref<)\d+(xbf16>, memref<\d+xf32>\) -> \(\))",
     ):
         text = re.sub(pat, r"\1SROW\2", text)
-    return re.sub(
+    text = re.sub(
         r"(func\.call @\w*softmax_bf16\([^)]*\) : \(memref<)\d+(xbf16>, memref<)\d+(xbf16>, i32\) -> \(\))",
         r"\1SROW\2SROW\3", text,
     )
+    return re.sub(r"%(c\d+(?:_[a-zA-Z][a-zA-Z0-9]*)?)_\d+\b", r"%\1", text)
 
 
 def _extract_scf_for_blocks(region):
@@ -167,48 +197,85 @@ def _drain_block_fifo(body):
 
 
 def _chunks_ssa_for_bound(region, bound_operand):
-    """`bound_operand` is a compute loop's `to %X`. On a windowed build X is `arith.index_cast`
-    off the i32 `chunks` value read from the scratchpad parameter -- return that i32 SSA name.
+    """`bound_operand` is a loop's `to %X`. On a windowed build X is `arith.index_cast` off the
+    i32 `chunks`/`nsplits` value read from the scratchpad parameter -- return that i32 SSA name.
     None on a compile-time build, where the operand is a bare index constant instead."""
     m = re.search(rf"%{re.escape(bound_operand)} = arith\.index_cast %(\S+) : i32 to index", region)
     return m.group(1) if m else None
 
 
-def _drain_literal_for_bound(region, bound_operand, chunks_ssa):
-    """`bound_operand` is a drain loop's `to %X`. Confirms X traces through `arith.index_cast` off
-    an `arith.subi <LITERAL>, <chunks_ssa>` that names the SAME chunks value the sibling compute
-    loop's own bound traced to -- the identity that makes `compute + drain == LITERAL` hold for
-    every runtime value of chunks, not just the one this particular build happens to carry. Returns
-    the literal read out of the IR text, or None if the shape does not match."""
+def _all_scf_for_spans(region):
+    """Every `scf.for` in `region`, brace-matched, as (start, end, bound-operand, body-text,
+    nesting-depth) -- unlike `_extract_scf_for_blocks`, this keeps WRAPPER loops (a body containing
+    another `scf.for`) rather than dropping them. Split-K nests one level deeper than the pre-split
+    design did (see test_dynamic_window_drain_conserves_stream_acquires): the segment loop IS a
+    wrapper now, and its own bound is exactly the runtime trip count this file exists to check."""
+    spans = []
+    for m in re.finditer(r"scf\.for %\S+ = %\S+ to %(\S+) step %\S+ \{", region):
+        brace = region.index("{", m.start())
+        depth, i = 0, brace
+        while True:
+            if region[i] == "{":
+                depth += 1
+            elif region[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        spans.append((m.start(), i, m.group(1), region[brace + 1:i]))
+    return [(s, e, b, body, sum(1 for s2, e2, *_ in spans if s2 < s and e < e2))
+            for s, e, b, body in spans]
+
+
+def _drain_total_and_per_split(region, bound_operand, chunks_ssa):
+    """`bound_operand` is the drain loop's `to %X`. Confirms X traces through `arith.index_cast`
+    off `arith.subi(TOTAL, arith.muli(chunks_ssa, PER_SPLIT))`, where `chunks_ssa` is the SAME
+    value the sibling segment loop's own bound traced to -- the identity that makes
+    `segment_acquires + drain_acquires == TOTAL` hold for every runtime value of `nsplits`, not
+    just the one this particular build happens to carry. Returns (TOTAL, PER_SPLIT) read out of
+    the IR text, or None if the shape does not match."""
     m = re.search(rf"%{re.escape(bound_operand)} = arith\.index_cast %(\S+) : i32 to index", region)
     if not m:
         return None
     m2 = re.search(rf"%{re.escape(m.group(1))} = arith\.subi %(\S+), %(\S+) : i32", region)
-    if not m2 or m2.group(2) != chunks_ssa:
+    if not m2:
         return None
-    m3 = re.search(rf"%{re.escape(m2.group(1))} = arith\.constant (\d+) : i32\b", region)
-    return int(m3.group(1)) if m3 else None
+    m3 = re.search(rf"%{re.escape(m2.group(2))} = arith\.muli %(\S+), %(\S+) : i32", region)
+    if not m3 or m3.group(1) != chunks_ssa:
+        return None
+    m4 = re.search(rf"%{re.escape(m2.group(1))} = arith\.constant (\d+) : i32\b", region)
+    m5 = re.search(rf"%{re.escape(m3.group(2))} = arith\.constant (\d+) : i32\b", region)
+    return (int(m4.group(1)), int(m5.group(1))) if (m4 and m5) else None
 
 
 def test_dynamic_window_drain_conserves_stream_acquires(tmp_path):
-    """The fill streams N_KV_CHUNKS tiles into `stream_c` regardless of `chunks` (design.py's
-    drain_remainder comment); step 6 and step 8 must each acquire exactly that many between their
-    compute loop and their drain loop, for every value `chunks` could take at runtime -- not just
-    the one this build's dispatch would carry, which this test never runs. Proved algebraically
-    from the IR text: the compute loop's bound and the drain loop's bound both trace back to the
-    SAME i32 SSA value, and the drain's is `arith.subi(LITERAL, that value)` -- so the two bounds
-    sum to LITERAL by construction, whatever `chunks` is. LITERAL is then checked against
-    N_KV_CHUNKS = S // rpc so a wrong constant (not just a wrong split) is still caught.
+    """The fill streams every built segment's (K, V) tiles into `stream_c` regardless of
+    `nsplits` (design.py's drain_remainder comment); the segment loop and the ONE drain loop that
+    follows it must together acquire exactly that many, for every value `nsplits` could take at
+    runtime -- not just the one this build's dispatch would carry, which this test never runs.
+
+    Split-K nests one level deeper than the pre-split design: the runtime trip count now lives on
+    the SEGMENT loop (`for sp in range_(nsplits)`, a WRAPPER around the two per-marker loops), not
+    on the sc_matvec/taccum_rows loops directly -- their own bound, SPLIT_CHUNKS, is a build-time
+    literal by construction, since attn_split is fixed at build time. Proved algebraically from the
+    IR text: the segment loop's bound and the ONE combined drain loop's bound both trace back to
+    the SAME i32 SSA value (nsplits), and the drain's is
+    `arith.subi(TOTAL, arith.muli(nsplits, PER_SPLIT))` -- so the two bounds sum to TOTAL by
+    construction, whatever `nsplits` is. TOTAL is checked against 2 * N_KV_CHUNKS (N_KV_CHUNKS =
+    S // rpc, doubled because one drain now covers BOTH caches the pre-split design drained
+    separately) and PER_SPLIT against 2 * SPLIT_CHUNKS (SPLIT_CHUNKS = rpc at this test's S, since
+    the window fits L1 in one segment and attn_split derives to S itself).
 
     Control: a window_parameter=None build must contain NO acquire-only/release-only loop at all
-    (`_drain_block_fifo` finds none) -- the compute loop's own bound is already the build-time
-    literal, so nothing is left over to drain. Manually verified this control is not vacuous: with
+    (`_drain_block_fifo` finds none) -- the compute loops' own bounds are already build-time
+    literals, so nothing is left over to drain. Manually verified this control is not vacuous: with
     `drain_remainder()`'s two call sites deleted from design.py, this same assertion on the SAME
     "attn_window" build fails with "expected exactly one drain loop ... found 0" instead of passing.
     """
     D, HD, Hq, Hkv, S, tsi = 1024, 128, 16, 8, 1024, 4
     rpc = (tsi * D) // HD               # TILE_ELEMS // HD, design.py's own derivation
     n_kv_chunks = S // rpc
+    split_chunks = rpc                  # S=1024 fits L1 in one segment: attn_split derives to S
 
     from iron.common import AIEContext
     from iron.operators.attn_block_dp.op import AttnBlockDataParallel
@@ -225,27 +292,57 @@ def test_dynamic_window_drain_conserves_stream_acquires(tmp_path):
     on_regions = core_regions("attn_window")
     assert len(on_regions) == 8
     for region in on_regions:
-        blocks = _extract_scf_for_blocks(region)
-        for marker in ("sc_matvec_vectorized_bf16_bf16", "taccum_rows_bf16_f32"):
-            compute = [(i, b, body) for i, (b, body) in enumerate(blocks) if marker in body]
-            assert len(compute) == 1, f"expected exactly one {marker} loop, found {len(compute)}"
-            idx, compute_bound, compute_body = compute[0]
-            chunks_ssa = _chunks_ssa_for_bound(region, compute_bound)
-            assert chunks_ssa is not None, f"{marker} loop's trip count is not runtime-derived"
+        spans = _all_scf_for_spans(region)
+        # The segment loop: a WRAPPER whose DIRECT children (depth+1) include a LEAF (no further
+        # nested scf.for) containing each marker -- "in body" alone is not enough, since the outer
+        # Worker dispatch loop also transitively contains both markers in ITS body text and would
+        # otherwise false-match here too.
+        segment = [(s, e, b, body, d) for s, e, b, body, d in spans
+                   if all(any(s2 > s and e2 < e and d2 == d + 1 and marker in body2
+                              and "scf.for " not in body2
+                              for s2, e2, _, body2, d2 in spans)
+                          for marker in ("sc_matvec_vectorized_bf16_bf16", "taccum_rows_bf16_f32"))]
+        assert len(segment) == 1, f"expected exactly one segment loop, found {len(segment)}"
+        seg_s, seg_e, seg_bound, _, seg_depth = segment[0]
+        chunks_ssa = _chunks_ssa_for_bound(region, seg_bound)
+        assert chunks_ssa is not None, "segment loop's trip count is not runtime-derived"
 
-            fifo = re.search(r"aie\.objectfifo\.acquire @(\S+)\(Consume, 1\)", compute_body).group(1)
-            # the NEXT block specifically -- stream_c is reused by every step, K- and V-cache
-            # included, so scanning the rest of the list for any @stream_c drain would match the
-            # OTHER cache's drain loop too and silently accept a missing one here.
-            assert idx + 1 < len(blocks), f"no loop follows the {marker} loop to drain {fifo}"
-            drain_bound, drain_body = blocks[idx + 1]
-            assert _drain_block_fifo(drain_body) == fifo, (
-                f"loop after the {marker} loop is not a pure {fifo} drain: {drain_body!r}")
-            literal = _drain_literal_for_bound(region, drain_bound, chunks_ssa)
-            assert literal is not None, (
-                f"{fifo} drain loop bound does not trace to arith.subi(N_KV_CHUNKS, chunks)")
-            assert literal == n_kv_chunks, (
-                f"compute + drain trip counts sum to {literal}, expected N_KV_CHUNKS={n_kv_chunks}")
+        fifo = None
+        for marker in ("sc_matvec_vectorized_bf16_bf16", "taccum_rows_bf16_f32"):
+            inner = [(s, e, b, body) for s, e, b, body, d in spans
+                     if d == seg_depth + 1 and s > seg_s and e < seg_e and marker in body]
+            assert len(inner) == 1, (
+                f"expected exactly one {marker} loop inside the segment loop, found {len(inner)}")
+            inner_bound, inner_body = inner[0][2], inner[0][3]
+            assert _chunks_ssa_for_bound(region, inner_bound) is None, (
+                f"{marker} loop's own bound is runtime-derived -- SPLIT_CHUNKS should be a "
+                "build-time literal now that the segment loop carries the runtime trip count")
+            # Both marker loops acquire the SAME `stream_c` fifo (K for scores, V for context,
+            # interleaved on one objectFifo) -- read its actual generated name here rather than
+            # assume it matches design.py's `stream_c` Python variable name.
+            m = re.search(r"aie\.objectfifo\.acquire @(\S+)\(Consume, 1\)", inner_body)
+            assert m, f"{marker} loop has no objectfifo acquire: {inner_body!r}"
+            assert fifo is None or fifo == m.group(1), (
+                f"scores and context loops acquire DIFFERENT fifos ({fifo} vs {m.group(1)})")
+            fifo = m.group(1)
+
+        # The ONE drain loop: the sibling `scf.for` immediately after the segment loop closes, at
+        # the SAME nesting depth -- draining BOTH caches' leftover tiles together (design.py's
+        # drain_remainder comment), unlike the pre-split design's two separate per-marker drains.
+        siblings = sorted((s, e, b, body) for s, e, b, body, d in spans if d == seg_depth)
+        idx = next(i for i, (s, e, b, body) in enumerate(siblings) if s == seg_s)
+        assert idx + 1 < len(siblings), f"no loop follows the segment loop to drain {fifo}"
+        drain_bound, drain_body = siblings[idx + 1][2], siblings[idx + 1][3]
+        assert _drain_block_fifo(drain_body) == fifo, (
+            f"loop after the segment loop is not a pure {fifo} drain: {drain_body!r}")
+        totals = _drain_total_and_per_split(region, drain_bound, chunks_ssa)
+        assert totals is not None, (
+            "drain loop bound does not trace to arith.subi(TOTAL, arith.muli(nsplits, PER_SPLIT))")
+        total, per_split = totals
+        assert total == 2 * n_kv_chunks, (
+            f"segment + drain trip counts sum to {total}, expected 2*N_KV_CHUNKS={2 * n_kv_chunks}")
+        assert per_split == 2 * split_chunks, (
+            f"drain PER_SPLIT is {per_split}, expected 2*SPLIT_CHUNKS={2 * split_chunks}")
 
     off_regions = core_regions(None)
     assert len(off_regions) == 8
@@ -256,24 +353,36 @@ def test_dynamic_window_drain_conserves_stream_acquires(tmp_path):
 
 def test_dynamic_window_makes_the_core_trip_count_independent(tmp_path):
     """The whole point: with the trip count read at runtime, two windows must compile to the SAME
-    core PROGRAM. This test's predecessor compared whole core ELFs and was vacuous: two OTHER terms
-    scale with max_seq regardless of the trip count -- the sc/sw buffer size and the row-length
-    literal handed to mask_k/softmax_k/tr_k (see design.py step 7/8) -- so it would have passed with
-    the runtime-trip-count mechanism absent, present, or broken (it did fail, but for the wrong
-    reason: those two terms, not the trip count). This instead diffs the `aie.core` MLIR text with
-    `_normalize_core_region`'s terms stripped out, so what remains is the trip count alone (a third,
-    the drain loop's N_KV_CHUNKS, joined the first two once the fill's own leftover needed draining
-    -- see that function's docstring for why it is transitional rather than a fourth permanent term).
+    core PROGRAM -- AT A SHARED attn_split. Two different max_seq no longer share a program on
+    their own: attn_split=None DERIVES the split from max_seq, and NSPLIT/SPLIT_CHUNKS become baked
+    loop-nesting structure rather than a stripped constant, so two capacities can legitimately
+    place different programs (same .text SIZE, different immediate operands -- a real regression
+    this test caught: identical size is not identical program). Passing the SAME explicit
+    attn_split to both builds is what the production rung ladder relies on (one_design_rung_ladder
+    needs exactly this), and it is what restores the test's original point.
+
+    This test's predecessor compared whole core ELFs and was vacuous: two OTHER terms scale with
+    max_seq regardless of the trip count -- the sc/sw buffer size and the row-length literal handed
+    to mask_k/softmax_k/tr_k -- so it would have passed with the runtime-trip-count mechanism
+    absent, present, or broken. This instead diffs the `aie.core` MLIR text with
+    `_normalize_core_region`'s terms stripped out, so what remains is the trip count alone (a
+    fourth term, the drain loop's TOTAL literal, joined the first three once split-K's fill needed
+    draining across segments -- see that function's docstring for why it is transitional).
 
     Second half is the negative control -- reverting to window_parameter=None must still differ
     under the SAME normalisation, or this gate is exactly as vacuous as its predecessor."""
     from iron.common import AIEContext
     from iron.operators.attn_block_dp.op import AttnBlockDataParallel
 
+    # A multiple of lcm(rpc=32, kv_block_size=128, FLASH_SM_VEC_LEN=64) = 128 that divides both
+    # 1024 and 4096 -- design.py's own attn_split legality rule (see derive_attn_split).
+    ATTN_SPLIT = 128
+
     def core_regions(S, window_parameter):
         op = AttnBlockDataParallel(
             D=1024, HD=128, Hq=16, Hkv=8, max_seq=S, num_aie_columns=8, tile_size_input=4,
             kv_alloc=4096, kv_block_size=128, window_parameter=window_parameter,
+            attn_split=ATTN_SPLIT if window_parameter else None,
             context=AIEContext(build_dir=tmp_path / f"S{S}_{window_parameter}"))
         op.compile()
         mlir_text = Path(op.xclbin_artifact.mlir_input.filename).read_text()

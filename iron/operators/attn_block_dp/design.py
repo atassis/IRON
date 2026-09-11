@@ -99,6 +99,7 @@ import aie.dialects.index as index
 import aie.extras.dialects.arith as arith
 from aie.dialects.aie import T
 from ml_dtypes import bfloat16
+import math
 import numpy as np
 
 from aie.helpers.dialects.scf import _for as range_
@@ -112,6 +113,7 @@ BF16 = bfloat16
 
 # AIE2P core-tile local memory. Stated, not derived: the Python bindings expose no accessor
 # (AIETargetModel::getLocalMemorySize() is C++ only).
+FLASH_SM_VEC_LEN = 64   # mirrors aie_kernels/aie2p/flash_contract.h; a mismatch drops a tail
 L1_BYTES = 65536
 
 
@@ -122,9 +124,14 @@ def _flat_tap(total, size, offset=0):
     return TensorAccessPattern((1, total), offset, [1, 1, 1, size], [0, 0, 0, 1])
 
 
-def l1_footprint_bytes(D, HD, gqa, S, tile_elems, weight_depth, stack_size):
+def l1_footprint_bytes(D, HD, gqa, L, tile_elems, weight_depth, stack_size):
     """Bytes this design places in one core's L1, by term. Computed rather than assumed -- the
-    same check qkv_head_dp and swiglu_mlp_dp carry, and the term that grows with S is new here."""
+    same check qkv_head_dp and swiglu_mlp_dp carry.
+
+    `L` is the SPLIT length in positions, not the window. Since split-K landed, max_seq does not
+    enter this budget at all: sc/sw are sized to one segment and the running max/sum carry the
+    result across segments. Before that this argument was max_seq and capped the window at 4544.
+    """
     misc = 3 * (HD * 2)                 # depth 3: n_qn, n_kn and ang are held together
     stream = weight_depth * (tile_elems * 2)
     out = 2 * (HD * 2)
@@ -132,10 +139,30 @@ def l1_footprint_bytes(D, HD, gqa, S, tile_elems, weight_depth, stack_size):
         3 * (D * 2)                     # cur, n_in, hn
         + 2 * (HD * 2)                  # raw, nrm
         + gqa * (HD * 2)                # the RoPE'd query heads, which never leave L1
-        + 2 * gqa * (S * 2)             # sc and sw -- the terms S drives
+        + 2 * gqa * (L * 2)             # sc and sw -- sized to one SPLIT, not to the window
         + gqa * (HD * 4)                # the f32 context accumulators
+        + gqa * (3 * 4)                 # {running max, running sum, correction} f32, per group
     )
     return misc + stream + out + persistent + stack_size
+
+
+def derive_attn_split(D, HD, gqa, S, tile_elems, weight_depth, stack_size, kv_block_size=None,
+                      tile_size_input=4):
+    """The largest legal segment length for window `S`, or `S` itself when the window fits L1.
+
+    ONE owner for the rule, because `decode_layer_dp`'s construction check and this file's own
+    build both need it and a second copy would drift. A window at or below the L1 bound returns
+    `S`, which is the pre-split design byte for byte -- so a rung ladder spanning widths either
+    side of the cap needs no per-rung configuration.
+    """
+    rpc = (tile_size_input * D) // HD
+    gran = math.lcm(rpc, kv_block_size or S, FLASH_SM_VEC_LEN)
+    if l1_footprint_bytes(D, HD, gqa, S, tile_elems, weight_depth, stack_size) <= L1_BYTES:
+        return S
+    fixed = l1_footprint_bytes(D, HD, gqa, 0, tile_elems, weight_depth, stack_size)
+    per = l1_footprint_bytes(D, HD, gqa, 1, tile_elems, weight_depth, stack_size) - fixed
+    cap = (L1_BYTES - fixed) // per
+    return max((d for d in range(gran, min(cap, S) + 1, gran) if S % d == 0), default=0)
 
 
 def attn_block_dp(
@@ -145,6 +172,7 @@ def attn_block_dp(
     Hq,
     Hkv,
     max_seq,
+    attn_split=None,
     epsilon=1e-6,
     tile_size_input=4,
     stack_size=0xD00,
@@ -152,7 +180,7 @@ def attn_block_dp(
     n_aie_cols=8,
     kv_offset_parameter="kv_off",
     mask_parameter="sm_mask",
-    window_parameter=None,   # None: N_KV_CHUNKS stays a build constant. A name: read at runtime.
+    window_parameter=None,   # None: the segment count stays a build constant. A name: read at runtime.
     trace_size=0,
     weight_depth=2,
     wqkv_head_major=False,
@@ -211,17 +239,51 @@ def attn_block_dp(
         f"max_seq ({S}) must divide by the cache rows per stream tile ({rpc}), which "
         f"tile_size_input={tsi} and head_dim={HD} fix at tsi*D/HD"
     )
-    N_KV_CHUNKS = S // rpc
 
-    used = l1_footprint_bytes(D, HD, gqa, S, TILE_ELEMS, weight_depth, stack_size)
+    # THE SPLIT. sc/sw are sized to L positions and the softmax carries a running max/sum across
+    # segments, so L1 stops depending on the window entirely. attn_split=None keeps L == max_seq,
+    # which is one segment and therefore byte-for-byte the pre-split design.
+    # attn_split=None DERIVES the split instead of meaning "one segment", which is what lets a
+    # window RUNG LADDER span widths that straddle the L1 cap without its caller knowing where the
+    # cap is. A window that already fits keeps L == S and is byte-for-byte the pre-split design --
+    # so every rung at or below 4542 positions is untouched, and only the wide ones segment.
+    #
+    # Derived rather than global for a concrete reason: gen_llm_decode builds each rung with the
+    # SAME attn_split, and the shipped ladder carries rungs at 256 and 512. A global 1024 fails
+    # `S % L` on both. The split is a property of the window, not of the build.
+    if attn_split is not None:
+        L = attn_split
+    else:
+        L = derive_attn_split(D, HD, gqa, S, TILE_ELEMS, weight_depth, stack_size,
+                              kv_block_size, tsi)
+        if not L:
+            raise ValueError(
+                f"no legal attn_split for max_seq={S}: need a divisor of {S} that is a multiple "
+                f"of lcm(stream-tile rows={rpc}, kv block={kv_block_size or S}, softmax vector="
+                f"{FLASH_SM_VEC_LEN}) and within the L1 bound. Pick a max_seq with one, or pass "
+                f"attn_split explicitly."
+            )
+    assert S % L == 0, f"attn_split ({L}) must divide max_seq ({S})"
+    assert L % rpc == 0, (
+        f"attn_split ({L}) must be a whole number of stream tiles (rpc={rpc})"
+    )
+    assert L % FLASH_SM_VEC_LEN == 0, (
+        f"attn_split ({L}) must be a whole number of softmax vectors ({FLASH_SM_VEC_LEN}): the "
+        f"kernel's loops have no scalar tail, so a remainder is dropped silently"
+    )
+    NSPLIT = S // L
+    SPLIT_CHUNKS = L // rpc
+
+    used = l1_footprint_bytes(D, HD, gqa, L, TILE_ELEMS, weight_depth, stack_size)
     assert used <= L1_BYTES, (
-        f"estimated L1 use {used} B exceeds {L1_BYTES} B at tsi={tsi} max_seq={S} gqa={gqa}. "
-        f"sc+sw alone are {2 * gqa * S * 2} B and are the terms max_seq drives -- shrinking "
-        f"tile_size_input frees {weight_depth * TILE_ELEMS} B per step and cannot reach a large S."
+        f"estimated L1 use {used} B exceeds {L1_BYTES} B at tsi={tsi} attn_split={L} gqa={gqa}. "
+        f"sc+sw alone are {2 * gqa * L * 2} B and are the terms the SPLIT drives (max_seq={S} no "
+        f"longer enters) -- lower attn_split, or shrink tile_size_input to free "
+        f"{weight_depth * TILE_ELEMS} B per step."
     )
 
     # KV CAPACITY, separate from the WINDOW (S=max_seq, above -- unchanged, still what sizes sc/sw
-    # and N_KV_CHUNKS). `kv_alloc` is None by default, which keeps capacity == window, byte for
+    # and the segment count). `kv_alloc` is None by default, which keeps capacity == window, byte for
     # byte. `kv_block_size` blocks that capacity the way gemv/tmatvec's `block_size` blocks theirs.
     # iron.common.kv_layout.KVLayout is the single owner of the offset/stride arithmetic this needs
     # -- gemv/tmatvec's own block_size branches predate that module and restate the formula by
@@ -270,6 +332,19 @@ def attn_block_dp(
             strides=[0, kv_layout.block_stride, _kv_blk_lo, 1],
         )
 
+    def _kv_split_tap(head_base, split):
+        """Segment `split` of this head's window: the same walk _kv_read_tap does, over L positions
+        instead of S. With attn_split=None there is one segment and this IS _kv_read_tap."""
+        if not kv_blocked:
+            return _flat_tap(kv_layout.total_elems, L * HD, head_base + split * L * HD)
+        blocks_per_split = L // _KVT
+        return TensorAccessPattern(
+            tensor_dims=(kv_layout.total_elems,),
+            offset=head_base + split * blocks_per_split * kv_layout.block_stride,
+            sizes=[1, blocks_per_split, _kv_blk_hi, _kv_blk_lo],
+            strides=[0, kv_layout.block_stride, _kv_blk_lo, 1],
+        )
+
     kv_off_param = (ScratchpadParameter(kv_offset_parameter, np.int32)
                     if kv_offset_parameter is not None else None)
     mask_param = ScratchpadParameter(mask_parameter, np.int32)
@@ -282,7 +357,8 @@ def attn_block_dp(
     D_ty = np.ndarray[(D,), np.dtype[BF16]]
     HD_ty = np.ndarray[(HD,), np.dtype[BF16]]
     TILE_ty = np.ndarray[(TILE_ELEMS,), np.dtype[BF16]]
-    SROW_ty = np.ndarray[(S,), np.dtype[BF16]]
+    SROW_ty = np.ndarray[(L,), np.dtype[BF16]]      # one SPLIT's scores, not the window
+    ST_ty = np.ndarray[(3,), np.dtype[np.float32]]  # {running max, running sum, correction}
     ACC_ty = np.ndarray[(HD,), np.dtype[np.float32]]
     W_L3_ty = np.ndarray[(TOT * D,), np.dtype[BF16]]
     # PACKED NORM GAINS. n_in, n_qn and n_kn are three STATIC weight vectors; `ang` is not (the
@@ -336,7 +412,17 @@ def attn_block_dp(
         [np.int32, np.int32, np.int32, np.int32, TILE_ty, SROW_ty, ACC_ty],
     )
     tf_kernel = Kernel(
-        f"{func_prefix}taccum_finish_bf16", CORE_ARCHIVE, [np.int32, ACC_ty, HD_ty]
+        f"{func_prefix}taccum_finish_scaled_bf16", CORE_ARCHIVE, [np.int32, ST_ty, ACC_ty, HD_ty]
+    )
+    # Split-K's three. `softmax_kernel` above stays bound but unused on this path -- removing it is
+    # a separate cleanup, and leaving it keeps one concern per change.
+    psm_kernel = Kernel(
+        f"{func_prefix}partial_softmax_f32state_bf16", CORE_ARCHIVE,
+        [SROW_ty, SROW_ty, ST_ty, np.int32],
+    )
+    sinit_kernel = Kernel(f"{func_prefix}flash_state_init", CORE_ARCHIVE, [ST_ty])
+    acc_rescale_kernel = Kernel(
+        f"{func_prefix}acc_rescale_f32", CORE_ARCHIVE, [np.int32, ST_ty, ACC_ty]
     )
 
     misc_of = ObjectFifo(HD_ty, name=f"{fifo_prefix}misc", depth=3)
@@ -347,34 +433,39 @@ def attn_block_dp(
 
     def core_fn(misc_c, stream_c, out_p, mask_src, win_src, barrier,
                 cur_buf, nin_buf, hn_buf, raw_buf, nrm_buf, qh_bufs, sc_bufs, sw_bufs, acc_bufs,
+                st_bufs,
                 copy_k, wnorm_d_k, wnorm_hd_k, mv_k, rope_k,
-                sc_mv_k, mask_k, softmax_k, tz_k, tr_k, tf_k):
+                sc_mv_k, mask_k, softmax_k, tz_k, tr_k, tf_k,
+                psm_k, sinit_k, acc_rescale_k):
         # Read AFTER wait_for_value(1), never before: the sequence calls sync_parameters() and only
         # then sets the barrier, so a read here sees THIS dispatch's value. Read earlier and it
         # samples the PREVIOUS dispatch's -- corruption with no clean recurrence.
         barrier.wait_for_value(1)
         mask_len = mask_src.read()
         win_len = win_src.read() if win_src is not None else None
-        # chunks is the trip count for the scores/context loops below. win_len is a LENGTH in
-        # positions (see win_param above), so arith.divsi converts it to a chunk count -- never
-        # Python `//` on an SSA value, which emits arith.floordivsi instead of the intended op.
-        chunks = (arith.divsi(win_len, arith.constant(rpc, T.i32()))
-                  if win_src is not None else N_KV_CHUNKS)
-        # row_len is win_len itself (not divided): the row length mask_k/softmax_k need to touch,
-        # vs S the BUILT buffer width. Falls back to S, byte-identical to today, when the window
-        # is a build constant -- same one-value-one-meaning discipline as win_param's own comment.
-        row_len = win_len if win_src is not None else S
+        # nsplits is the SEGMENT trip count. CEIL, not floor: a window that is not a whole number
+        # of segments still has to attend its tail, and floor would silently drop up to L-1
+        # positions. Built with arith on the SSA value -- never Python `//`, which emits
+        # arith.floordivsi instead of the intended op.
+        nsplits = (arith.divsi(arith.addi(win_len, arith.constant(L - 1, T.i32())),
+                               arith.constant(L, T.i32()))
+                   if win_src is not None else NSPLIT)
 
-        # The K/V-cache fills stream N_KV_CHUNKS tiles into `stream_c` no matter what `chunks`
-        # is -- the fill side has no scratchpad parameter to shrink its own trip count by. A tile
-        # this core does not acquire here is not discarded, it is what the NEXT dispatch's first
-        # acquire returns: draining spends the bytes the fill already moved, not the MACs, which
-        # is the split window_parameter exists to measure. Guarded in Python, not emitted as an
-        # `scf.if`, because N_KV_CHUNKS - chunks is 0 on the constant-trip-count path and a
-        # zero-trip loop is still a loop the unwindowed core program must not contain.
+        # The fill streams every built segment no matter what `nsplits` is -- the fill side has no
+        # scratchpad parameter to shrink its own trip count by. A tile this core does not acquire
+        # is not discarded, it is what the NEXT dispatch's first acquire returns: draining spends
+        # the bytes the fill already moved, not the MACs. Guarded in Python, not emitted as an
+        # `scf.if`, because the remainder is 0 on the constant-trip-count path and a zero-trip loop
+        # is still a loop the unwindowed core program must not contain.
         def drain_remainder():
+            # The fill always streams NSPLIT (K, V) segment pairs; a shorter runtime window
+            # consumes fewer, and the unconsumed ones sit CONTIGUOUSLY at the tail because K and V
+            # are interleaved per segment. So one drain at the end replaces the pre-split design's
+            # two, and it counts tiles: SPLIT_CHUNKS per segment per cache, two caches.
             if win_src is not None:
-                for _ in range_(arith.subi(arith.constant(N_KV_CHUNKS, T.i32()), chunks)):
+                per_split = arith.constant(SPLIT_CHUNKS * 2, T.i32())
+                total = arith.constant(NSPLIT * SPLIT_CHUNKS * 2, T.i32())
+                for _ in range_(arith.subi(total, arith.muli(nsplits, per_split))):
                     stream_c.acquire(1)
                     stream_c.release(1)
 
@@ -425,40 +516,60 @@ def attn_block_dp(
         out_p.release(1)
         misc_c.release(3)
 
-        # step 6: scores. One A tile serves BOTH query heads out of L1 -- the group reuse that
-        # gemv's batch_group buys with an access pattern is free here, because the two heads that
-        # share this kv head are on the same core.
-        for i in range_(chunks):
-            row_off = index.casts(T.i32(), i) * rpc
-            at = stream_c.acquire(1)
-            for g in range(gqa):
-                sc_mv_k(rpc, row_off, at, qh_bufs[g], sc_bufs[g])
-            stream_c.release(1)
-        drain_remainder()
-
-        # step 7: softmax over a row this core produced. No exchange: the crossbar that forced
-        # sc/sw through DDR existed only because scores and softmax disagreed about columns.
-        for g in range(gqa):
-            mask_k(sc_bufs[g], mask_len, row_len)
-            softmax_k(sc_bufs[g], sw_bufs[g], row_len)
-
-        # step 8: context, transposed-A over this core's V head.
+        # steps 6-8, now ONE loop over window segments. sc/sw are L-wide, and what carries the
+        # result across segments is the running {max, sum} in st_bufs plus a rescale of the f32
+        # accumulator -- so nothing in this core's L1 scales with the window any more.
         for g in range(gqa):
             tz_k(1, acc_bufs[g])
-        for i in range_(chunks):
-            w_off = index.casts(T.i32(), i) * rpc
-            at = stream_c.acquire(1)
+            sinit_k(st_bufs[g])
+
+        for sp in range_(nsplits):
+            seg_lo = index.casts(T.i32(), sp) * L
+
+            # scores for this segment. One A tile still serves BOTH query heads out of L1 -- the
+            # group reuse gemv's batch_group buys with an access pattern is free here, because the
+            # two heads sharing this kv head are on the same core.
+            for i in range_(SPLIT_CHUNKS):
+                row_off = index.casts(T.i32(), i) * rpc
+                at = stream_c.acquire(1)
+                for g in range(gqa):
+                    sc_mv_k(rpc, row_off, at, qh_bufs[g], sc_bufs[g])
+                stream_c.release(1)
+
+            # This segment's valid width, clamped into [0, L]. CLAMPED AT ZERO DELIBERATELY:
+            # mask_bf16 loops `for i = unmasked_size; i < total_size` with no lower guard, so a
+            # negative width -- which a segment wholly past n_past produces -- would write -inf
+            # BEFORE the buffer. A wholly masked segment is a real case on the build-constant
+            # window path, where nsplits is NSPLIT regardless of how few positions n_past has.
+            seg_unmasked = arith.maxsi(
+                arith.minsi(arith.subi(mask_len, seg_lo), arith.constant(L, T.i32())),
+                arith.constant(0, T.i32()),
+            )
+
             for g in range(gqa):
-                # tr_k's 3rd arg is w_stride (mv_taccum.cc: w_in + g*w_stride + w_off), the
-                # spacing between GROUPS in a packed w buffer -- not a row length. groups=1 here
-                # makes it dead (g is always 0), but it is buffer geometry, not an element count
-                # to shrink, so it stays S rather than following mask_k/softmax_k onto row_len.
-                tr_k(rpc, 1, S, w_off, at, sw_bufs[g], acc_bufs[g])
-            stream_c.release(1)
+                mask_k(sc_bufs[g], seg_unmasked, L)
+                # Unnormalised exp2 out; the running {max, sum} and this segment's correction all
+                # land in st_bufs, because an IRON Kernel call discards its result and cannot hand
+                # a scalar to the next kernel. The divide is deferred to tf_k -- the denominator is
+                # not known until the last segment has been seen.
+                psm_k(sc_bufs[g], sw_bufs[g], st_bufs[g], L)
+                acc_rescale_k(HD, st_bufs[g], acc_bufs[g])
+
+            # context for this segment, transposed-A over this core's V head.
+            for i in range_(SPLIT_CHUNKS):
+                w_off = index.casts(T.i32(), i) * rpc
+                at = stream_c.acquire(1)
+                for g in range(gqa):
+                    # tr_k's 3rd arg is w_stride (mv_taccum.cc: w_in + g*w_stride + w_off), the
+                    # spacing between GROUPS in a packed w buffer -- not a row length. groups=1
+                    # makes it dead, but it is buffer geometry, so it follows sw's width to L.
+                    tr_k(rpc, 1, L, w_off, at, sw_bufs[g], acc_bufs[g])
+                stream_c.release(1)
+
         drain_remainder()
         for g in range(gqa):
             ct = out_p.acquire(1)
-            tf_k(1, acc_bufs[g], ct)
+            tf_k(1, st_bufs[g], acc_bufs[g], ct)
             out_p.release(1)
 
     workers = []
@@ -476,8 +587,10 @@ def attn_block_dp(
                     [Buffer(SROW_ty, name=f"{fifo_prefix}sc_{c}_{g}") for g in range(gqa)],
                     [Buffer(SROW_ty, name=f"{fifo_prefix}sw_{c}_{g}") for g in range(gqa)],
                     [Buffer(ACC_ty, name=f"{fifo_prefix}acc_{c}_{g}") for g in range(gqa)],
+                    [Buffer(ST_ty, name=f"{fifo_prefix}st_{c}_{g}") for g in range(gqa)],
                     copy_kernel, wnorm_d_kernel, wnorm_hd_kernel, mv_kernel, rope_kernel,
                     sc_mv_kernel, mask_kernel, softmax_kernel, tz_kernel, tr_kernel, tf_kernel,
+                    psm_kernel, sinit_kernel, acc_rescale_kernel,
                 ],
                 stack_size=stack_size,
             )
@@ -542,12 +655,32 @@ def attn_block_dp(
                 )
         tg2.finish()
 
+        # ONE TASK GROUP PER SEGMENT, and the group count is a BD-budget constraint rather than a
+        # style choice. A shim tile carries 16 simultaneously active buffer descriptors; this
+        # design places its 8 cores in 2 COLUMNS, so one shim serves 4 of them, and a single group
+        # holding every segment's fills would ask for 4 cores x NSPLIT x 2 caches -- 32 at
+        # NSPLIT=4, which aiecc rejects with "Too many simultaneously active buffer descriptors on
+        # tile (1,0)". Per segment it is 4 x 2 = 8, flat in NSPLIT, so a 16-segment window costs no
+        # more descriptors than a 1-segment one.
+        #
+        # The (K, V) PAIRING inside a segment is what the core's loop requires: it reads segment
+        # s's K, softmaxes, then reads segment s's V. A fill order that did not match is a wrong
+        # answer rather than a deadlock, because both carry the same element count on one fifo.
+        for sp in range(NSPLIT):
+            tg = TaskGroup()
+            for c in range(N):
+                for cache in (kc, vc):
+                    stream_ps[c].fill(
+                        cache, _kv_split_tap(kv_layout.head_base(c), sp), wait=True, group=tg
+                    )
+            tg.finish()
+
+        # The context drains get their own group, AFTER every segment. That satisfies the
+        # one-directional invariant this block's header states -- the core produces cx only after
+        # consuming the last segment, so every task here is reachable using only earlier groups --
+        # and it keeps the final group off the 16-BD edge that folding it into the last segment's
+        # group would sit exactly on (8 fills + 8 drains per shim).
         tg3 = TaskGroup()
-        for c in range(N):
-            for cache in (kc, vc):
-                stream_ps[c].fill(
-                    cache, _kv_read_tap(kv_layout.head_base(c)), wait=True, group=tg3
-                )
         for c in range(N):
             for g in range(gqa):
                 out_cs[c].drain(

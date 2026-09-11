@@ -108,13 +108,18 @@ class DecodeLayerDataParallel(MLIROperator):
     # INSTRUMENT (see swiglu_mlp_dp/design.py): chop the gh drain group into k groups. Moves ONLY
     # the sync-point count, +(k-1) per layer, at identical bytes/tasks/BDs/configures/designs.
     split_gh: int = field(default=1, repr=False)
+    # SPLIT-K. The attention window is processed in segments of `attn_split` positions with the
+    # softmax carrying a running max/sum across them, so sc/sw are sized to a SEGMENT and this
+    # class's L1 check below stops being a cap on `max_seq`. None (default) is one segment, byte
+    # for byte the pre-split design. Delegated straight to attn_block_dp, which owns every term.
+    attn_split: int | None = field(default=None, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
         **MLIROperator._name_aliases,
         "attn_cols": "acol", "mlp_cols": "mcol", "max_seq": "S",
         "eps_attn": "ea", "eps_mlp": "em", "tile_size_input": "tsi",
-        "attn_stack_size": "ass", "mlp_stack_size": "mss",
+        "attn_stack_size": "ass", "mlp_stack_size": "mss", "attn_split": "sp",
         "weight_depth": "wd", "tile_rows_gu": "trg", "wqkv_head_major": "hm",
         "weight_dtype": "wdt", "group_size": "g",
     }
@@ -186,16 +191,26 @@ class DecodeLayerDataParallel(MLIROperator):
 
         gqa = self.Hq // self.Hkv
         tile_elems = self.tile_size_input * self.D
-        attn_args = (self.D, self.HD, gqa, self.max_seq, tile_elems, self.weight_depth,
+        # The SPLIT, not the window: since split-K landed max_seq does not enter this budget.
+        # None DERIVES it exactly as attn_block_dp/design.py does -- a window that fits keeps
+        # L == max_seq (unchanged), a wider one segments. Re-deriving here rather than importing
+        # would be two copies of one rule; ask the half that owns it.
+        from iron.operators.attn_block_dp.design import derive_attn_split
+        attn_split = (derive_attn_split(self.D, self.HD, gqa, self.max_seq, tile_elems,
+                                        self.weight_depth, self.attn_stack_size,
+                                        self.kv_block_size)
+                      if self.attn_split is None else self.attn_split)
+        attn_args = (self.D, self.HD, gqa, attn_split, tile_elems, self.weight_depth,
                      self.attn_stack_size)
         attn_used = l1_footprint_bytes(*attn_args)
         if attn_used > L1_BYTES:
             fixed = l1_footprint_bytes(*(attn_args[:3] + (0,) + attn_args[4:]))
             per_seq = l1_footprint_bytes(*(attn_args[:3] + (1,) + attn_args[4:])) - fixed
             raise ValueError(
-                f"attention L1 use {attn_used} B exceeds {L1_BYTES} B at max_seq={self.max_seq}: "
-                f"sc+sw cost {per_seq} B per unit of max_seq and are the only terms it drives; "
-                f"largest max_seq that fits is {(L1_BYTES - fixed) // per_seq}"
+                f"attention L1 use {attn_used} B exceeds {L1_BYTES} B at attn_split="
+                f"{attn_split}: sc+sw cost {per_seq} B per unit of SPLIT and are the only terms "
+                f"it drives -- max_seq ({self.max_seq}) no longer enters this budget; largest "
+                f"attn_split that fits is {(L1_BYTES - fixed) // per_seq}"
             )
 
         # WEIGHT FORMAT. Checked here rather than left to swiglu_mlp_dp/design.py's asserts,
@@ -266,6 +281,12 @@ class DecodeLayerDataParallel(MLIROperator):
             base = f"{base}_win{self.window_parameter}"
         if self.split_gh != 1:
             base = f"{base}_sgh{self.split_gh}"
+        # repr=False like its siblings above, and the same reason: a shared build dir would let a
+        # cached attn_split=None (or a different split) ELF silently satisfy a request for another
+        # -- the same collision class already found and fixed for DYNAMIC_WINDOW in
+        # bench_layer_arms.py. attn_split=None (unsplit) keeps the pre-split name unchanged.
+        if self.attn_split is not None:
+            base = f"{base}_sp{self.attn_split}"
         return f"{base}{self._wtag}"
 
     def get_mlir_artifact(self):
@@ -291,6 +312,7 @@ class DecodeLayerDataParallel(MLIROperator):
                     "weight_dtype": self.weight_dtype,
                     "group_size": self.group_size,
                     "split_gh": self.split_gh,
+                    "attn_split": self.attn_split,
                 },
             ),
         )
