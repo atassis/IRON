@@ -131,15 +131,25 @@ class SwiGLUMLPDataParallel(MLIROperator):
         # int8, which is the only thing the WTILE_ty change alters. GROUP_SIZE is the extra flag.
         _qsrc = kdir / "generic" / ("mv.cc" if self.weight_dtype == "bf16" else "mv_quant.cc")
         _qtag = "" if self.weight_dtype == "bf16" else f"_{self.weight_dtype}g{self.group_size}"
-        # A vector chunk must not straddle a quant group, so the kernel's VEC_SIZE is capped by
-        # the group width. 64 is the native width and the only value the symmetric builds ever
-        # used (their smallest shipped group is 128); a 32-wide group -- FastFlowLM's operating
-        # point -- needs 32. It is in the object name because two objects compiled at different
-        # VEC_SIZE export the SAME symbol, which is the artifact-key collision this file already
-        # documents for the dtype axis.
-        _vec = 64 if self.weight_dtype == "bf16" else min(64, self.group_size)
+        # A vector chunk must not straddle a quant group, so VEC_SIZE is capped by the group
+        # width -- and it is ALSO capped by payload alignment, which is what
+        # max_legal_vec_size adds. The payload starts header_bytes into a row and load_v needs
+        # the pointer on its access width; at K=1024 g=128 the header is 32 B, which int4's
+        # 32-byte load clears and int8's 64-byte load does not. That is the whole reason int4
+        # was correct on device and int8 computed garbage. It is in the object NAME because two
+        # objects compiled at different VEC_SIZE export the same symbol.
+        if self.weight_dtype == "bf16":
+            _vec = 64
+        else:
+            from iron.operators.gemv.quant import max_legal_vec_size
+            _ks = [self.D, self.FF] + ([self.QD] if self.fuse_o else [])
+            _vec = max_legal_vec_size(_ks, self.group_size, self.weight_dtype)
+            # Emit ONLY this dtype's wrapper. All four instantiate otherwise, and a template's
+            # static_asserts fire on instantiation -- so one VEC_SIZE would have to be legal for
+            # every dtype, dragging int4 to int8's alignment constraint.
         _qflags = ([] if self.weight_dtype == "bf16"
-                   else [f"-DGROUP_SIZE={self.group_size}"])
+                   else [f"-DGROUP_SIZE={self.group_size}",
+                         f"-DQUANT_EMIT_{self.weight_dtype.upper()}=1"])
         mv_gu_obj = KernelObjectArtifact(
             f"gemv_{self.D}k_{_vec}vs{_qtag}.o",
             dependencies=[SourceArtifact(_qsrc)],

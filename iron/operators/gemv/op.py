@@ -138,9 +138,19 @@ class GEMV(MLIROperator):
                 raise ValueError(
                     f"K={self.K} must be a whole number of groups (group_size={self.group_size})"
                 )
+            # TWO constraints bound the dequant chunk width and only the first was checked.
+            # (a) it must never straddle a quant-group boundary, or a chunk needs two scales;
+            # (b) the payload it loads starts header_bytes into a row, and aie::load_v needs the
+            # pointer on its access width -- 32 B for int4's 256-bit load, 64 B for int8's
+            # 512-bit one. (b) is what made int8 compute garbage on device while int4 was
+            # correct, and nothing expressed it. The operator derives the widest legal value
+            # rather than making every caller know the rule; the width is in the object name, so
+            # the result is visible rather than silent.
+            from iron.operators.gemv.quant import max_legal_vec_size
+            legal = max_legal_vec_size([self.K], self.group_size, self.weight_dtype)
+            if self.kernel_vector_size > legal:
+                object.__setattr__(self, "kernel_vector_size", legal)
             if self.group_size % self.kernel_vector_size != 0:
-                # mv_quant.cc's vectorized dequant chunk (kernel_vector_size wide) must never
-                # straddle a quant-group boundary, or a chunk would need two scales.
                 raise ValueError(
                     f"group_size={self.group_size} must be a multiple of kernel_vector_size="
                     f"{self.kernel_vector_size}"
@@ -262,6 +272,10 @@ class GEMV(MLIROperator):
                         f"-DDIM_K={self.K}",
                         f"-DVEC_SIZE={self.kernel_vector_size}",
                         f"-DGROUP_SIZE={self.group_size}",
+                        # Emit only this dtype's wrapper -- all four instantiate otherwise, and
+                        # their static_asserts fire on instantiation, so one VEC_SIZE would have
+                        # to be legal for every dtype at once.
+                        f"-DQUANT_EMIT_{self.weight_dtype.upper()}=1",
                     ],
                 )
             ]

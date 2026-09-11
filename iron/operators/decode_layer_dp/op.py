@@ -360,7 +360,21 @@ class DecodeLayerDataParallel(MLIROperator):
         # name, so a -D-only difference would silently reuse the other format's object.
         qsrc = gen / ("mv.cc" if self.weight_dtype == "bf16" else "mv_quant.cc")
         qtag = self._wtag
-        qflags = [] if self.weight_dtype == "bf16" else [f"-DGROUP_SIZE={self.group_size}"]
+        # VEC_SIZE is capped by the group width AND by payload alignment -- see
+        # swiglu_mlp_dp/op.py, which builds the same three objects standalone. Both must pick the
+        # same width or the fused layer and the unfused arm compile different kernels.
+        if self.weight_dtype == "bf16":
+            qvec = 64
+        else:
+            from iron.operators.gemv.quant import max_legal_vec_size
+            qvec = max_legal_vec_size([self.D, self.FF, QD], self.group_size, self.weight_dtype)
+            # Emit ONLY this dtype's wrapper. All four instantiate otherwise, and a template's
+            # static_asserts fire on instantiation -- so one VEC_SIZE would have to be legal for
+            # every dtype, dragging int4 to int8's alignment constraint.
+        qtag = f"{qtag}_{qvec}vs" if self.weight_dtype != "bf16" else qtag
+        qflags = ([] if self.weight_dtype == "bf16"
+                  else [f"-DGROUP_SIZE={self.group_size}",
+                        f"-DQUANT_EMIT_{self.weight_dtype.upper()}=1"])
         mlp = [
             obj("mlp_add.o", gen / "add.cc", (), "mlp_"),
             obj("mlp_mul.o", gen / "mul.cc", (), "mlp_"),
@@ -368,11 +382,11 @@ class DecodeLayerDataParallel(MLIROperator):
                 [f"-DRMS_COLS={self.D}"], "mlp_"),
             obj("mlp_silu.o", a2 / "silu.cc", (), "mlp_"),
             obj(f"mlp_gemv_{self.D}k{qtag}.o", qsrc,
-                [f"-DDIM_K={self.D}", "-DVEC_SIZE=64"] + qflags, "mlp_"),
+                [f"-DDIM_K={self.D}", f"-DVEC_SIZE={qvec}"] + qflags, "mlp_"),
             obj(f"mlp_down_gemv_{self.FF}k{qtag}.o", qsrc,
-                [f"-DDIM_K={self.FF}", "-DVEC_SIZE=64"] + qflags, "mlp_down_"),
+                [f"-DDIM_K={self.FF}", f"-DVEC_SIZE={qvec}"] + qflags, "mlp_down_"),
             obj(f"mlp_o_gemv_{QD}k{qtag}.o", qsrc,
-                [f"-DDIM_K={QD}", "-DVEC_SIZE=64"] + qflags, "mlp_o_"),
+                [f"-DDIM_K={QD}", f"-DVEC_SIZE={qvec}"] + qflags, "mlp_o_"),
             obj("mlp_add_cxcopy.o", gen / "add.cc", (), "mlp_cx_"),
             obj("mlp_add_oacopy.o", gen / "add.cc", (), "mlp_oa_"),
         ]
