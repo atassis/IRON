@@ -170,7 +170,14 @@ class DecodeLayerDataParallel(MLIROperator):
         gqa = self.Hq // self.Hkv
         tile_elems = self.tile_size_input * self.D
         # The SPLIT, not the window: since split-K landed max_seq does not enter this budget.
-        attn_split = self.max_seq if self.attn_split is None else self.attn_split
+        # None DERIVES it exactly as attn_block_dp/design.py does -- a window that fits keeps
+        # L == max_seq (unchanged), a wider one segments. Re-deriving here rather than importing
+        # would be two copies of one rule; ask the half that owns it.
+        from iron.operators.attn_block_dp.design import derive_attn_split
+        attn_split = (derive_attn_split(self.D, self.HD, gqa, self.max_seq, tile_elems,
+                                        self.weight_depth, self.attn_stack_size,
+                                        self.kv_block_size)
+                      if self.attn_split is None else self.attn_split)
         attn_args = (self.D, self.HD, gqa, attn_split, tile_elems, self.weight_depth,
                      self.attn_stack_size)
         attn_used = l1_footprint_bytes(*attn_args)

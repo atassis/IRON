@@ -99,6 +99,7 @@ import aie.dialects.index as index
 import aie.extras.dialects.arith as arith
 from aie.dialects.aie import T
 from ml_dtypes import bfloat16
+import math
 import numpy as np
 
 from aie.helpers.dialects.scf import _for as range_
@@ -143,6 +144,25 @@ def l1_footprint_bytes(D, HD, gqa, L, tile_elems, weight_depth, stack_size):
         + gqa * (3 * 4)                 # {running max, running sum, correction} f32, per group
     )
     return misc + stream + out + persistent + stack_size
+
+
+def derive_attn_split(D, HD, gqa, S, tile_elems, weight_depth, stack_size, kv_block_size=None,
+                      tile_size_input=4):
+    """The largest legal segment length for window `S`, or `S` itself when the window fits L1.
+
+    ONE owner for the rule, because `decode_layer_dp`'s construction check and this file's own
+    build both need it and a second copy would drift. A window at or below the L1 bound returns
+    `S`, which is the pre-split design byte for byte -- so a rung ladder spanning widths either
+    side of the cap needs no per-rung configuration.
+    """
+    rpc = (tile_size_input * D) // HD
+    gran = math.lcm(rpc, kv_block_size or S, FLASH_SM_VEC_LEN)
+    if l1_footprint_bytes(D, HD, gqa, S, tile_elems, weight_depth, stack_size) <= L1_BYTES:
+        return S
+    fixed = l1_footprint_bytes(D, HD, gqa, 0, tile_elems, weight_depth, stack_size)
+    per = l1_footprint_bytes(D, HD, gqa, 1, tile_elems, weight_depth, stack_size) - fixed
+    cap = (L1_BYTES - fixed) // per
+    return max((d for d in range(gran, min(cap, S) + 1, gran) if S % d == 0), default=0)
 
 
 def attn_block_dp(
@@ -223,7 +243,26 @@ def attn_block_dp(
     # THE SPLIT. sc/sw are sized to L positions and the softmax carries a running max/sum across
     # segments, so L1 stops depending on the window entirely. attn_split=None keeps L == max_seq,
     # which is one segment and therefore byte-for-byte the pre-split design.
-    L = S if attn_split is None else attn_split
+    # attn_split=None DERIVES the split instead of meaning "one segment", which is what lets a
+    # window RUNG LADDER span widths that straddle the L1 cap without its caller knowing where the
+    # cap is. A window that already fits keeps L == S and is byte-for-byte the pre-split design --
+    # so every rung at or below 4542 positions is untouched, and only the wide ones segment.
+    #
+    # Derived rather than global for a concrete reason: gen_llm_decode builds each rung with the
+    # SAME attn_split, and the shipped ladder carries rungs at 256 and 512. A global 1024 fails
+    # `S % L` on both. The split is a property of the window, not of the build.
+    if attn_split is not None:
+        L = attn_split
+    else:
+        L = derive_attn_split(D, HD, gqa, S, TILE_ELEMS, weight_depth, stack_size,
+                              kv_block_size, tsi)
+        if not L:
+            raise ValueError(
+                f"no legal attn_split for max_seq={S}: need a divisor of {S} that is a multiple "
+                f"of lcm(stream-tile rows={rpc}, kv block={kv_block_size or S}, softmax vector="
+                f"{FLASH_SM_VEC_LEN}) and within the L1 bound. Pick a max_seq with one, or pass "
+                f"attn_split explicitly."
+            )
     assert S % L == 0, f"attn_split ({L}) must divide max_seq ({S})"
     assert L % rpc == 0, (
         f"attn_split ({L}) must be a whole number of stream tiles (rpc={rpc})"
