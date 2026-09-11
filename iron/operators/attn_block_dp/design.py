@@ -500,13 +500,13 @@ def attn_block_dp(
                     stream_c.release(1)
 
         # step 1: rebuild cur and n_in from D/HD chunks, then hn = weighted_RMSNorm(cur, n_in).
-        for i in range(N_MISC_CHUNKS):
+        for i in range_(N_MISC_CHUNKS):
             ch = misc_c.acquire(1)
-            copy_k(cur_buf, ch, HD, i * HD)
+            copy_k(cur_buf, ch, HD, index.casts(T.i32(), i) * HD)
             misc_c.release(1)
-        for i in range(N_MISC_CHUNKS):
+        for i in range_(N_MISC_CHUNKS):
             ch = misc_c.acquire(1)
-            copy_k(nin_buf, ch, HD, i * HD)
+            copy_k(nin_buf, ch, HD, index.casts(T.i32(), i) * HD)
             misc_c.release(1)
         wnorm_d_k(cur_buf, nin_buf, hn_buf, *rms_len(D), epsilon)
 
