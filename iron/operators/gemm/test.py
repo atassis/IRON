@@ -218,3 +218,196 @@ def test_gemm(
     print(f"Throughput: {gflops:.6e} GFLOP/s\n")
 
     assert not errors, "Test failed"
+
+
+# --------------------------------------------------------------------------------------------
+# weight_dtype: B streamed group-quantized, expanded on-core (see iron/common/quant.py's GEMM
+# section and aie_kernels/generic/mm_quant.cc).
+# --------------------------------------------------------------------------------------------
+
+
+def _quant_operator(M, K, N, m, k, n, cols, group_size, weight_dtype, ctx=None, **kw):
+    return GEMM(
+        M=M, K=K, N=N, tile_m=m, tile_k=k, tile_n=n, num_aie_columns=cols,
+        b_col_maj=True, emulate_bf16_mmul_with_bfp16=True, prio_accuracy=False,
+        weight_dtype=weight_dtype, group_size=group_size, context=ctx, **kw,
+    )
+
+
+# (M, K, N, m, k, n, cols, group_size, weight_dtype). g=32 is what Gemma-4-12B's own int8 dump
+# uses at every site but attn_o; g=64 is the other one it ships. K=3840/N=4096 is the `qkv` shape.
+_QUANT_SHAPES = [
+    (256, 3840, 4096, 64, 64, 64, 8, 32, "int8"),
+    (256, 3840, 4096, 64, 64, 64, 8, 64, "int8"),
+    (256, 3840, 2048, 64, 64, 64, 8, 32, "int8"),
+    (256, 512, 512, 64, 64, 64, 8, 32, "int8"),
+    (256, 512, 512, 64, 64, 64, 8, 64, "int4"),
+]
+
+
+def _run_on_device(operator, A_bf16, B_tensor):
+    operator.compile()
+    call = operator.get_callable()
+    out_spec = operator.get_arg_spec()[2]
+    c_buf = XRTTensor(out_spec.shape, dtype=out_spec.dtype)
+    call(XRTTensor.from_torch(A_bf16.flatten()), XRTTensor.from_torch(B_tensor), c_buf)
+    return c_buf.to_torch().reshape(operator.M, operator.N).to(torch.float32).numpy()
+
+
+@pytest.mark.parametrize("M,K,N,m,k,n,cols,group_size,weight_dtype", _QUANT_SHAPES)
+def test_gemm_quantized_weight(M, K, N, m, k, n, cols, group_size, weight_dtype, aie_context):
+    """GATE: the quantized arm must be BIT-IDENTICAL to a plain bf16 GEMM fed the same weight.
+
+    The control is the unquantized operator at the same shape with `unpack_B`'s output as a bf16 B
+    -- so the only difference between the arms is where the expansion happens, DDR-side or
+    on-core. Gating on 1:1 against it, rather than on a tolerance against an f32 golden, is what
+    makes this a correctness test at all: at K=3840 the GEMM's own bf16/bfp16 arithmetic is ~1.3e-2
+    rel-L2 with individual small outputs far worse, which swamps any layout bug a tolerance could
+    see. rel-L2 against f32 is printed as a note, never asserted tightly.
+    """
+    if cols > aie_utils.get_current_device().cols:
+        pytest.skip(f"needs {cols} columns")
+    torch.manual_seed(13)
+    A = torch.randn(M, K, dtype=torch.bfloat16) * 4
+    W = (np.random.default_rng(13).standard_normal((N, K)) * 0.5).astype(np.float32)
+
+    operator = _quant_operator(M, K, N, m, k, n, cols, group_size, weight_dtype, aie_context)
+    packed = operator.pack_B(W)
+    dequantized = operator.unpack_B(packed)
+
+    c_quant = _run_on_device(operator, A, torch.from_numpy(packed))
+    control = GEMM(M=M, K=K, N=N, tile_m=m, tile_k=k, tile_n=n, num_aie_columns=cols,
+                   b_col_maj=True, emulate_bf16_mmul_with_bfp16=True, prio_accuracy=False,
+                   context=aie_context)
+    c_control = _run_on_device(control, A, torch.from_numpy(
+        dequantized.astype(ml_dtypes.bfloat16).view(np.uint16)).view(torch.bfloat16).flatten())
+
+    golden = A.to(torch.float32).numpy() @ dequantized.T
+    rel = lambda x: float(np.linalg.norm(x - golden) / np.linalg.norm(golden))
+    print(f"\nweight bytes: bf16={N * K * 2} packed({weight_dtype},g{group_size})={packed.nbytes} "
+          f"ratio={N * K * 2 / packed.nbytes:.3f}x")
+    print(f"rel-L2 vs f32 golden: quant {rel(c_quant):.5f}  bf16 control {rel(c_control):.5f}")
+
+    assert np.array_equal(c_quant, c_control), (
+        f"on-core expansion diverges from the DMA-delivered bf16 tile: "
+        f"{np.count_nonzero(c_quant != c_control)} of {c_quant.size} outputs differ, "
+        f"rel-L2 {float(np.linalg.norm(c_quant - c_control) / np.linalg.norm(c_control)):.3e}")
+    assert rel(c_quant) < 0.05, "both arms agree but are far from the f32 golden"
+
+
+@pytest.mark.parametrize("tile_k,tile_n,group_size,weight_dtype",
+                         [(64, 64, 32, "int8"), (64, 64, 64, "int8"), (64, 32, 32, "int8"),
+                          (64, 64, 64, "int4"), (128, 64, 32, "int8")])
+def test_gemm_pack_is_the_layout_mm_quant_reads(tile_k, tile_n, group_size, weight_dtype):
+    """The byte contract, checked on the host: a slab walked the way mm_quant.cc walks it must
+    reproduce the bf16 tile gemm/design.py's `dims_to_stream` would have delivered.
+
+    The kernel's loop nest is re-derived here rather than reusing `gemm_tile_permutation`, so this
+    is a cross-check of the two sides and not a restatement of one of them. It is the check that
+    would have caught a scale indexed by the wrong row -- the failure class this tree pays for on
+    device (see the doctrine's seam rule).
+    """
+    from iron.common.quant import (gemm_tile_permutation, gemm_tile_scale_region_bytes,
+                                   gemm_tile_slab_bytes, pack_gemm_weight, unpack_gemm_weight)
+
+    s, t, cols = 8, 8, 3
+    N, K = tile_n * cols, tile_k * 2
+    rng = np.random.default_rng(7)
+    W = (rng.standard_normal((N, K)) * 4).astype(np.float32)
+    packed = pack_gemm_weight(W, tile_k, tile_n, group_size, weight_dtype, s, t, cols)
+    deq = unpack_gemm_weight(packed, N, K, tile_k, tile_n, group_size, weight_dtype, s, t, cols)
+
+    slab_bytes = gemm_tile_slab_bytes(tile_k, tile_n, group_size, weight_dtype, s, t)
+    scale_region = gemm_tile_scale_region_bytes(tile_k, tile_n, group_size, weight_dtype, s, t)
+    n_groups = tile_k // group_size
+    k_blocks = K // tile_k
+    perm = gemm_tile_permutation(tile_k, tile_n, s, t)
+    slabs = packed.view(np.uint8).reshape(-1, slab_bytes)
+
+    for kb in range(K // tile_k):
+        for nt in range(N // tile_n):
+            # Column-run order: column `nt % cols` owns a contiguous run, n-tile outer.
+            slab = slabs[(nt % cols) * (N // tile_n // cols) * k_blocks
+                         + (nt // cols) * k_blocks + kb]
+            scales = slab[:4 * tile_n * n_groups].view(np.float32).reshape(tile_n, n_groups)
+            body = slab[scale_region:]
+            if weight_dtype == "int4":
+                q = np.empty(tile_n * tile_k, dtype=np.int8)
+                q[0::2] = np.where((body & 0xF) >= 8, (body & 0xF).astype(np.int8) - 16,
+                                   (body & 0xF).astype(np.int8))
+                q[1::2] = np.where((body >> 4) >= 8, (body >> 4).astype(np.int8) - 16,
+                                   (body >> 4).astype(np.int8))
+            else:
+                q = body.view(np.int8)
+
+            # mm_quant.cc's own nest: j over n-blocks, gi over groups, bi over the group's
+            # t*s blocks; lane l of a block is row j*t + l//s, column (gi*g/s + bi)*s + l%s.
+            got = np.empty(tile_n * tile_k, dtype=np.float32)
+            for j in range(tile_n // t):
+                for gi in range(n_groups):
+                    sv = np.repeat(scales[j * t:(j + 1) * t, gi], s)
+                    for bi in range(group_size // s):
+                        p = (j * (tile_k // s) + gi * (group_size // s) + bi) * (t * s)
+                        got[p:p + t * s] = q[p:p + t * s].astype(np.float32) * sv
+
+            want = deq[nt * tile_n:(nt + 1) * tile_n,
+                       kb * tile_k:(kb + 1) * tile_k].reshape(-1)[perm]
+            assert np.array_equal(got, want), (
+                f"slab (kb={kb}, nt={nt}) decodes to a different tile than the DMA layout")
+
+
+@pytest.mark.parametrize("weight_dtype,group_size", [("int8", 32), ("int8", 64), ("int4", 64)])
+def test_gemm_repack_of_a_row_dump_is_the_same_bytes(weight_dtype, group_size):
+    """A weight already packed for the decode GEMV repacks into slabs with no requantization.
+
+    This is what lets one dump serve both paths; if it ever stops holding, prefill and decode are
+    multiplying different weights and nothing else would say so.
+    """
+    from iron.common.quant import pack_gemm_weight, quantize_weight, repack_gemm_weight
+
+    N, K = 192, 256
+    rng = np.random.default_rng(3)
+    W = (rng.standard_normal((N, K)) * 4).astype(np.float32)
+    row_form = quantize_weight(W, group_size, weight_dtype)
+    assert np.array_equal(
+        pack_gemm_weight(W, 64, 64, group_size, weight_dtype, 8, 8, 3),
+        repack_gemm_weight(row_form, N, K, 64, 64, group_size, weight_dtype, 8, 8, 3))
+
+
+def test_gemm_quant_group_must_not_straddle_a_k_tile():
+    """The constraint gemv has no analogue of: gemv reads a whole row, GEMM tiles K."""
+    with pytest.raises(ValueError, match="tile_k"):
+        _quant_operator(256, 512, 512, 64, 64, 64, 8, 128, "int8")
+
+
+def test_gemm_quant_needs_b_col_maj():
+    with pytest.raises(ValueError, match="b_col_maj"):
+        GEMM(M=256, K=512, N=512, tile_m=64, tile_k=64, tile_n=64, num_aie_columns=8,
+             b_col_maj=False, weight_dtype="int8", group_size=32)
+
+
+def test_gemm_quant_rejects_the_affine_dtypes_gemv_takes():
+    with pytest.raises(ValueError, match="weight_dtype"):
+        GEMM(M=256, K=512, N=512, tile_m=64, tile_k=64, tile_n=64, num_aie_columns=8,
+             b_col_maj=True, weight_dtype="int8a", group_size=32)
+
+
+def test_gemm_quant_does_not_share_an_artifact_with_the_plain_gemm():
+    """A cached plain build must not be able to satisfy a quantized op (see GEMM.name)."""
+    kw = dict(M=256, K=512, N=512, tile_m=64, tile_k=64, tile_n=64, num_aie_columns=8,
+              b_col_maj=True)
+    plain = GEMM(**kw).name
+    quant = GEMM(weight_dtype="int8", group_size=32, **kw).name
+    assert quant != plain and "wdtint8g32" in quant, quant
+    assert GEMM(weight_dtype="int8", group_size=64, **kw).name != quant
+
+
+def test_gemm_quant_b_operand_is_the_packed_byte_count():
+    from iron.common.quant import gemm_packed_bytes
+
+    op = _quant_operator(256, 3840, 4096, 64, 64, 64, 8, 32, "int8")
+    spec = op.get_arg_spec()[1]
+    assert spec.dtype is np.int8, spec.dtype
+    assert spec.shape == (gemm_packed_bytes(4096, 3840, 64, 64, 32, "int8", 8, 8),), spec.shape
+    # 4 B/group of scale over 32 elements is 1.125 B/element against bf16's 2.
+    assert spec.shape[0] == 4096 * 3840 * 9 // 8

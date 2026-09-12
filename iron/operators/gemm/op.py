@@ -58,6 +58,11 @@ class GEMM(MLIROperator):
     round_conv_even: bool = field(default=True, repr=False)
     dtype_in: str = field(default="bf16", repr=False)
     dtype_out: str = field(default="bf16", repr=False)
+    # gemv's `weight_dtype` axis (gemv/op.py:64-73) on GEMM's weight, which is B and is tiled in K
+    # -- so the slab differs: iron/common/quant.py's GEMM section owns the layout,
+    # aie_kernels/generic/mm_quant.cc expands it on-core. A and C stay bf16.
+    weight_dtype: str = field(default="bf16", repr=False)
+    group_size: int = field(default=0, repr=False)
     use_scalar: bool = field(default=False, repr=False)
     separate_c_tiles: bool = field(default=False, repr=False)
     context: object = field(default=None, repr=False)
@@ -128,7 +133,66 @@ class GEMM(MLIROperator):
                     f"{nm} ({stride}) is narrower than the operand it strides ({dense}); it is the "
                     f"row pitch of the buffer the slice lives in, not the slice's own width")
 
+        self._validate_weight_dtype()
         MLIROperator.__init__(self, context=self.context)
+
+    def _validate_weight_dtype(self):
+        """Mirrors gemv/op.py:123-161, plus the constraints only a K-TILED operand has."""
+        if self.weight_dtype not in ("bf16", "int4", "int8"):
+            raise ValueError(
+                f"unknown weight_dtype {self.weight_dtype!r} (expected 'bf16', 'int4' or 'int8'); "
+                f"the affine 'int4a'/'int8a' that gemv takes fold their per-group min into a sum "
+                f"of the OTHER operand, which is a GEMV factorisation -- at M>1 it is a rank-1 "
+                f"update on the C tile that mm_quant.cc does not implement")
+        if self.weight_dtype == "bf16":
+            return
+        if self.dtype_in != "bf16":
+            raise NotImplementedError(
+                f"weight_dtype={self.weight_dtype!r} dequantizes to bf16, so dtype_in must be "
+                f"'bf16' (got {self.dtype_in!r})")
+        if not self.b_col_maj:
+            raise ValueError(
+                "a quantized weight needs b_col_maj=True: the quant group runs along K, so a "
+                "packed row is one OUTPUT feature's K values and B is [N, K]")
+        if self.use_scalar:
+            raise NotImplementedError("weight_dtype != 'bf16' has no scalar matmul path")
+        if self.b_block_rows is not None:
+            raise NotImplementedError(
+                "b_block_rows addresses the LOGICAL [N, K] matrix; a packed weight is stored as "
+                "tile slabs, so the two layouts cannot both describe one buffer")
+        if self.group_size <= 0:
+            raise ValueError("weight_dtype != 'bf16' needs an explicit group_size > 0")
+        if self.K % self.group_size:
+            raise ValueError(
+                f"K={self.K} must be a whole number of groups (group_size={self.group_size})")
+        # NEW vs gemv, which has no tile_k: GEMM tiles the reduction dimension, so a quant group
+        # that straddles a k-tile boundary would need two scales in one slab.
+        if self.tile_k % self.group_size:
+            raise ValueError(
+                f"tile_k={self.tile_k} must be a whole number of groups "
+                f"(group_size={self.group_size}): a group may not straddle a k-tile")
+        _, s, t = self._mmul_rst
+        if self.group_size % s:
+            raise ValueError(
+                f"group_size={self.group_size} must be a multiple of the mmul's s={s}: one "
+                f"{t}x{s} destination block carries one scale")
+        # Raises if the slab cannot be laid out; keeps every byte-offset rule in quant.py.
+        from iron.common.quant import gemm_column_run_bytes
+
+        gemm_column_run_bytes(self.N, self.K, self.tile_k, self.tile_n, self.group_size,
+                              self.weight_dtype, s, t, self.num_aie_columns)
+
+    @property
+    def _mmul_rst(self):
+        """The microkernel's (r, s, t), which the packed layout is cut to. Resolved lazily: it
+        reads the bound device, and an unquantized GEMM must stay constructible without one."""
+        from iron.operators.gemm.design import microkernel_mac_dim_map
+
+        dev_name = aie_utils.get_current_device().resolve().name
+        dims = microkernel_mac_dim_map[dev_name][self.dtype_in]
+        if dev_name == "npu2" and self.dtype_in == "bf16":
+            return dims[self.emulate_bf16_mmul_with_bfp16]
+        return dims
 
     @property
     def a_elems(self):
@@ -163,10 +227,15 @@ class GEMM(MLIROperator):
 
     @property
     def name(self):
-        # epilogue is repr=False so an unfused GEMM keeps the name it has always had; a fused one
-        # must NOT share that artifact, because the design and the linked object both differ.
+        # epilogue and weight_dtype are repr=False so a plain GEMM keeps the name it has always
+        # had; a variant must NOT share that artifact, because the design and the linked object
+        # both differ and in a shared build dir a cached plain build would satisfy it silently.
         base = super().name
-        return base if self.epilogue == "none" else f"{base}_epi{self.epilogue}"
+        if self.epilogue != "none":
+            base = f"{base}_epi{self.epilogue}"
+        if self.weight_dtype != "bf16":
+            base = f"{base}_wdt{self.weight_dtype}g{self.group_size}"
+        return base
 
     @property
     def _kernel_flags_suffix(self):
@@ -203,6 +272,8 @@ class GEMM(MLIROperator):
                     "separate_c_tiles": int(self.separate_c_tiles),
                     "epilogue": self.epilogue,
                     "epilogue_elems": self.epilogue_elems,
+                    "weight_dtype": self.weight_dtype,
+                    "group_size": self.group_size,
                     "trace_size": 0,
                     "generate_taps": False,
                     "kernel_object": self._kernel_link_file,
@@ -216,11 +287,23 @@ class GEMM(MLIROperator):
                 f"_{int(self.b_col_maj)}_{int(self.c_col_maj)}{self._kernel_flags_suffix}.o")
 
     @property
+    def _dequant_object(self):
+        _, s, t = self._mmul_rst
+        return (f"gemm_dq_{self.weight_dtype}g{self.group_size}"
+                f"_{self.tile_k}x{self.tile_n}_{s}x{t}.o")
+
+    @property
     def _kernel_link_file(self):
-        """With an epilogue the core links two kernels, so the object becomes an archive."""
-        if self.epilogue == "none":
+        """With an epilogue or a quantized weight the core links more than one kernel, so the
+        object becomes an archive."""
+        extra = []
+        if self.epilogue != "none":
+            extra.append(self.epilogue)
+        if self.weight_dtype != "bf16":
+            extra.append(f"dq{self.weight_dtype}g{self.group_size}")
+        if not extra:
             return self._mm_object
-        return self._mm_object[:-2] + f"_{self.epilogue}_kernels.a"
+        return self._mm_object[:-2] + "_" + "_".join(extra) + "_kernels.a"
 
     def get_kernel_artifacts(self):
         base_dir = self.context.base_dir
@@ -248,20 +331,40 @@ class GEMM(MLIROperator):
             extra_flags=kernel_flags,
             dependencies=[SourceArtifact(base_dir / "aie_kernels" / kernel_dir / "mm.cc")],
         )
+        archive_deps = [mm_obj]
         if self.epilogue != "none":
             # Both epilogue kernels live under aie2p/, so a fused epilogue is NPU2-only.
             if kernel_dir != "aie2p":
                 raise NotImplementedError(
                     f"GEMM {self.epilogue} epilogue is only available on NPU2 (aie2p); "
                     f"current kernel dir is {kernel_dir!r}")
-            mm_obj = KernelArchiveArtifact(
-                self._kernel_link_file,
-                dependencies=[mm_obj, KernelObjectArtifact(
-                    f"{self.epilogue}.o",
-                    dependencies=[SourceArtifact(
-                        base_dir / "aie_kernels" / "aie2p" / f"{self.epilogue}.cc")],
-                )],
-            )
+            archive_deps.append(KernelObjectArtifact(
+                f"{self.epilogue}.o",
+                dependencies=[SourceArtifact(
+                    base_dir / "aie_kernels" / "aie2p" / f"{self.epilogue}.cc")],
+            ))
+        if self.weight_dtype != "bf16":
+            from iron.common.quant import gemm_tile_scale_region_bytes
+
+            _, s, t = self._mmul_rst
+            archive_deps.append(KernelObjectArtifact(
+                self._dequant_object,
+                dependencies=[SourceArtifact(
+                    base_dir / "aie_kernels" / "generic" / "mm_quant.cc")],
+                extra_flags=[
+                    f"-DDIM_K={self.tile_k}",
+                    f"-DDIM_N={self.tile_n}",
+                    f"-DGROUP_SIZE={self.group_size}",
+                    f"-DMMUL_S={s}",
+                    f"-DMMUL_T={t}",
+                    # quant.py owns the payload offset; the kernel static_asserts it.
+                    f"-DSCALE_REGION_BYTES="
+                    f"{gemm_tile_scale_region_bytes(self.tile_k, self.tile_n, self.group_size, self.weight_dtype, s, t)}",
+                    f"-DQUANT_EMIT_{self.weight_dtype.upper()}=1",
+                ],
+            ))
+        if len(archive_deps) > 1:
+            mm_obj = KernelArchiveArtifact(self._kernel_link_file, dependencies=archive_deps)
         return [
             mm_obj,
             KernelObjectArtifact(
@@ -275,28 +378,79 @@ class GEMM(MLIROperator):
         ]
 
     def get_arg_spec(self):
-        return [
-            AIERuntimeArgSpec(  # input A
-                "in", (self.a_elems,) if self.a_row_stride is not None else (self.M, self.K)),
+        if self.weight_dtype != "bf16":
+            # Flat byte buffer of tile slabs (int8-typed so the emitted shim BDs type as `i8`,
+            # matching decode_ddr_bytes.py's parser); layout in iron/common/quant.py.
+            b_spec = AIERuntimeArgSpec("in", (self._packed_b_bytes,), dtype=np.int8)
+        else:
             # input B (weights). Blocked, B's extent is not K*N and it is not 2-D contiguous
             # either, so it is declared as the flat run the descriptor actually addresses; flat, the
             # shape is left exactly as it was so no existing sequence sees a changed spec.
-            AIERuntimeArgSpec(
+            b_spec = AIERuntimeArgSpec(
                 "in",
                 (self.b_elems,)
                 if self.b_block_rows is not None
                 else ((self.N, self.K) if self.b_col_maj else (self.K, self.N)),
-            ),
+            )
+        return [
+            AIERuntimeArgSpec(  # input A
+                "in", (self.a_elems,) if self.a_row_stride is not None else (self.M, self.K)),
+            b_spec,
             AIERuntimeArgSpec(  # output C
                 "out",
                 (self.c_elems,) if self.c_row_stride is not None
                 else ((self.M, self.N) if not self.c_col_maj else (self.N, self.M))),
         ]
 
+    @property
+    def _packed_b_bytes(self):
+        from iron.common.quant import gemm_packed_bytes
+
+        _, s, t = self._mmul_rst
+        return gemm_packed_bytes(self.N, self.K, self.tile_k, self.tile_n, self.group_size,
+                                 self.weight_dtype, s, t)
+
+
+    def pack_B(self, W, **quantize_kwargs):
+        """Quantize + lay out a [N, K] weight for this operator's `weight_dtype`/tiling.
+
+        The only supported way to produce this operator's B buffer: the slab geometry follows
+        tile_k/tile_n AND the microkernel's (s, t), so a caller must not assemble it by hand.
+        """
+        if self.weight_dtype == "bf16":
+            raise ValueError("pack_B is for weight_dtype != 'bf16'; a bf16 B needs no packing")
+        from iron.common.quant import pack_gemm_weight
+
+        _, s, t = self._mmul_rst
+        return pack_gemm_weight(W, self.tile_k, self.tile_n, self.group_size, self.weight_dtype,
+                                s, t, self.num_aie_columns, **quantize_kwargs)
+
+    def unpack_B(self, packed):
+        """The [N, K] weight the device will actually multiply, as float32, for a CPU golden.
+
+        Narrowed the way mm_quant.cc narrows: it reads the f32 scale through a bf16 cast and
+        stores q*s as bf16, so a golden that keeps f32 is a different weight (see quant.py's
+        `emulate_kernel_scale_cast`, the same divergence mv_quant.cc has).
+        """
+        import ml_dtypes
+        from iron.common.quant import unpack_gemm_weight
+
+        _, s, t = self._mmul_rst
+        W = unpack_gemm_weight(packed, self.N, self.K, self.tile_k, self.tile_n,
+                               self.group_size, self.weight_dtype, s, t, self.num_aie_columns,
+                               emulate_kernel_scale_cast=True)
+        return W.astype(ml_dtypes.bfloat16).astype(np.float32)
+
     def reference(self, A, B):
-        """CPU reference: ``C = A @ B`` honoring ``b_col_maj`` / ``c_col_maj``."""
+        """CPU reference: ``C = A @ B`` honoring ``b_col_maj`` / ``c_col_maj``.
+
+        With a quantized weight, B is the packed buffer and the reference multiplies what the
+        device reads out of it, not the pre-quantization weight.
+        """
         from iron.operators.gemm.reference import reference
 
+        if self.weight_dtype != "bf16":
+            B = self.unpack_B(B)
         return reference(A, B, self.b_col_maj, self.c_col_maj)
 
     def pad_A(self, A_np):

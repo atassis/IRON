@@ -450,3 +450,217 @@ def dequantize_weight_asymmetric_research(q: np.ndarray, scale: np.ndarray, zp: 
     n_groups = K // group_size
     W = (q - zp[:, :, None]) * scale[:, :, None]
     return W.reshape(M, K)
+
+
+# GEMM TILE-PLANAR layout -- the same quantizer, a different SLAB, because GEMM tiles K.
+#
+# The row layout above is a GEMV format: GEMV reads a whole row, so `[header][payload]` is one
+# run. A GEMM tile's scales sit `4*k0/g` into the row and its payload at `header + k0` -- two
+# disjoint runs, and a core has no third DMA channel for them. So a GEMM weight is one slab per
+# (k-block, n-tile), planar inside -- the fix mv_quant.cc names and cannot take:
+#
+#     [ tile_n x n_groups f32 scales, row-major ][ pad ][ payload in MMUL destination order ]
+#
+# Payload order is `gemm_tile_permutation`'s, so the on-core expansion streams. Slabs sit PER
+# COLUMN in consumption order, making B one LINEAR descriptor; see `gemm_column_run_bytes`.
+# Values come from `quantize_weight`; only bytes move.
+
+_GEMM_SYMMETRIC_ONLY = ("int4", "int8")
+
+
+def gemm_tile_permutation(tile_k: int, tile_n: int, mmul_s: int, mmul_t: int) -> np.ndarray:
+    """Destination-order source indices into a row-major [tile_n, tile_k] tile.
+
+    `dst[p]` is the flat tile index the p-th payload element holds. This is the SAME order
+    gemm/design.py streams a bf16 B tile in under `b_col_maj` -- its `dims_to_stream`
+    `[(n//t, t*k), (k//s, s), (t, k), (s, 1)]` walks (j, i, r, c) and emits tile element
+    `(j*t + r, i*s + c)` -- so a packed tile and a bf16 tile land in L1 in one layout.
+    """
+    if tile_n % mmul_t or tile_k % mmul_s:
+        raise ValueError(f"tile ({tile_n}, {tile_k}) must divide by the mmul's (t, s) = "
+                         f"({mmul_t}, {mmul_s})")
+    return (np.arange(tile_n * tile_k)
+            .reshape(tile_n // mmul_t, mmul_t, tile_k // mmul_s, mmul_s)
+            .transpose(0, 2, 1, 3)
+            .reshape(-1))
+
+
+def gemm_tile_block_bytes(weight_dtype: str, mmul_s: int, mmul_t: int) -> int:
+    """Payload bytes of one t*s destination block -- the kernel's vector load width."""
+    if weight_dtype not in _GEMM_SYMMETRIC_ONLY:
+        raise ValueError(f"unknown GEMM weight_dtype {weight_dtype!r} "
+                         f"(expected {' or '.join(_GEMM_SYMMETRIC_ONLY)})")
+    elems = mmul_s * mmul_t
+    return elems // 2 if weight_dtype == "int4" else elems
+
+
+def gemm_tile_scale_region_bytes(tile_k: int, tile_n: int, group_size: int, weight_dtype: str,
+                                 mmul_s: int, mmul_t: int, scale_dtype: str = "f32") -> int:
+    """Bytes before the payload, rounded UP to the block load width.
+
+    `aie::load_v` treats a pointer that is not on its access width as undefined behaviour, and the
+    payload starts here, so the round-up is the alignment guarantee -- see `max_legal_vec_size`
+    for what the un-padded row layout has to do instead.
+    """
+    if tile_k % group_size:
+        raise ValueError(f"tile_k={tile_k} must be a whole number of groups "
+                         f"(group_size={group_size})")
+    raw = _scale_header_bytes(tile_n * (tile_k // group_size), scale_dtype)
+    blk = gemm_tile_block_bytes(weight_dtype, mmul_s, mmul_t)
+    return ((raw + blk - 1) // blk) * blk
+
+
+def gemm_tile_slab_bytes(tile_k: int, tile_n: int, group_size: int, weight_dtype: str,
+                         mmul_s: int, mmul_t: int, scale_dtype: str = "f32") -> int:
+    payload = tile_n * tile_k
+    if weight_dtype == "int4":
+        payload //= 2
+    return gemm_tile_scale_region_bytes(tile_k, tile_n, group_size, weight_dtype, mmul_s, mmul_t,
+                                        scale_dtype) + payload
+
+
+def gemm_packed_bytes(N: int, K: int, tile_k: int, tile_n: int, group_size: int,
+                      weight_dtype: str, mmul_s: int, mmul_t: int,
+                      scale_dtype: str = "f32") -> int:
+    if N % tile_n or K % tile_k:
+        raise ValueError(f"({N}, {K}) must tile evenly by (tile_n={tile_n}, tile_k={tile_k})")
+    return (N // tile_n) * (K // tile_k) * gemm_tile_slab_bytes(
+        tile_k, tile_n, group_size, weight_dtype, mmul_s, mmul_t, scale_dtype)
+
+
+def gemm_column_run_bytes(N: int, K: int, tile_k: int, tile_n: int, group_size: int,
+                          weight_dtype: str, mmul_s: int, mmul_t: int, n_aie_cols: int,
+                          scale_dtype: str = "f32") -> int:
+    """Bytes one AIE column reads, contiguously, at `col * this` -- B's whole descriptor."""
+    if (N // tile_n) % n_aie_cols:
+        raise ValueError(
+            f"N//tile_n ({N // tile_n}) must divide by n_aie_cols ({n_aie_cols}): each column "
+            f"owns an equal, contiguous run of slabs")
+    return gemm_packed_bytes(N, K, tile_k, tile_n, group_size, weight_dtype, mmul_s, mmul_t,
+                             scale_dtype) // n_aie_cols
+
+
+def _nibbles_to_values(payload: np.ndarray, tile_k: int) -> np.ndarray:
+    """[tile_n, tile_k/2] packed bytes -> [tile_n, tile_k] low-4-bit values (low nibble first)."""
+    out = np.empty((payload.shape[0], tile_k), dtype=np.uint8)
+    out[:, 0::2] = payload & 0x0F
+    out[:, 1::2] = (payload >> 4) & 0x0F
+    return out
+
+
+def _values_to_nibbles(values: np.ndarray) -> np.ndarray:
+    return (values[:, 0::2] | (values[:, 1::2] << 4)).astype(np.uint8)
+
+
+def _gemm_layout_dims(N, K, tile_k, tile_n, group_size, weight_dtype, mmul_s, mmul_t, n_aie_cols,
+                      scale_dtype):
+    if weight_dtype not in _GEMM_SYMMETRIC_ONLY:
+        raise ValueError(
+            f"GEMM weight_dtype {weight_dtype!r} is not supported (expected "
+            f"{' or '.join(_GEMM_SYMMETRIC_ONLY)}); the affine dtypes fold their per-group min "
+            f"into a per-row sum of the OTHER operand, which is a GEMV factorisation -- at M>1 it "
+            f"is a rank-1 update on the C tile that mm_quant.cc does not implement")
+    if N % tile_n or K % tile_k:
+        raise ValueError(f"({N}, {K}) must tile evenly by (tile_n={tile_n}, tile_k={tile_k})")
+    if scale_dtype != "f32":
+        raise NotImplementedError("mm_quant.cc reads an f32 scale header")
+    gemm_column_run_bytes(N, K, tile_k, tile_n, group_size, weight_dtype, mmul_s, mmul_t,
+                          n_aie_cols, scale_dtype)
+    return (N // tile_n, K // tile_k, tile_k // group_size,
+            _scale_header_bytes(K // group_size, scale_dtype),
+            gemm_tile_scale_region_bytes(tile_k, tile_n, group_size, weight_dtype, mmul_s,
+                                         mmul_t, scale_dtype),
+            gemm_tile_slab_bytes(tile_k, tile_n, group_size, weight_dtype, mmul_s, mmul_t,
+                                 scale_dtype),
+            gemm_tile_permutation(tile_k, tile_n, mmul_s, mmul_t))
+
+
+def pack_gemm_weight(W: np.ndarray, tile_k: int, tile_n: int, group_size: int, weight_dtype: str,
+                     mmul_s: int, mmul_t: int, n_aie_cols: int, *, scale_dtype: str = "f32",
+                     **quantize_kwargs) -> np.ndarray:
+    """W: [N, K] float-ish (OUTPUT-major, i.e. GEMM's `b_col_maj` B). Returns a flat np.int8 array.
+
+    `int8` dtype is the same convention as `quantize_weight`: opaque on-wire bytes, never values.
+    """
+    N, K = W.shape
+    rows = quantize_weight(W, group_size, weight_dtype, scale_dtype=scale_dtype,
+                           **quantize_kwargs)
+    return repack_gemm_weight(rows, N, K, tile_k, tile_n, group_size, weight_dtype, mmul_s,
+                              mmul_t, n_aie_cols, scale_dtype=scale_dtype)
+
+
+def repack_gemm_weight(row_packed: np.ndarray, N: int, K: int, tile_k: int, tile_n: int,
+                       group_size: int, weight_dtype: str, mmul_s: int, mmul_t: int,
+                       n_aie_cols: int, *, scale_dtype: str = "f32") -> np.ndarray:
+    """Byte-permute an already row-packed [N, K] weight (`quantize_weight`'s layout) into slabs.
+
+    NOTHING is requantized: a quant group never straddles a k-tile, so every scale and every q
+    survives byte-for-byte. So one dumped weight serves both paths -- the decode GEMV reads the
+    row form, prefill's GEMM reads this permutation of it.
+    """
+    n_tiles, k_blocks, n_g, hdr_full, scale_region, slab, perm = _gemm_layout_dims(
+        N, K, tile_k, tile_n, group_size, weight_dtype, mmul_s, mmul_t, n_aie_cols, scale_dtype)
+    rstride = row_stride_bytes(K, group_size, weight_dtype, scale_dtype)
+    rows = np.asarray(row_packed).view(np.uint8).reshape(N, rstride)
+
+    out = np.zeros((k_blocks, n_tiles, slab), dtype=np.uint8)
+    scale_bytes = _SCALE_BYTES[scale_dtype]
+    out[:, :, :tile_n * n_g * scale_bytes] = (
+        rows[:, :hdr_full]
+        .reshape(n_tiles, tile_n, k_blocks, n_g * scale_bytes)
+        .transpose(2, 0, 1, 3)
+        .reshape(k_blocks, n_tiles, -1))
+
+    payload = rows[:, hdr_full:]
+    if weight_dtype == "int4":
+        payload = _nibbles_to_values(payload, K)
+    tiled = (payload.reshape(n_tiles, tile_n, k_blocks, tile_k)
+             .transpose(2, 0, 1, 3)
+             .reshape(k_blocks, n_tiles, tile_n * tile_k)[:, :, perm])
+    out[:, :, scale_region:] = (_values_to_nibbles(tiled.reshape(-1, tile_n * tile_k))
+                                .reshape(k_blocks, n_tiles, -1)
+                                if weight_dtype == "int4" else tiled)
+    # [kb][nt] -> [col][i][kb], nt = i*cols + col: one contiguous run per column.
+    return (out.reshape(k_blocks, n_tiles // n_aie_cols, n_aie_cols, slab)
+            .transpose(2, 1, 0, 3)
+            .reshape(-1)
+            .view(np.int8))
+
+
+def unpack_gemm_weight(packed: np.ndarray, N: int, K: int, tile_k: int, tile_n: int,
+                       group_size: int, weight_dtype: str, mmul_s: int, mmul_t: int,
+                       n_aie_cols: int, *, scale_dtype: str = "f32",
+                       emulate_kernel_scale_cast: bool = False) -> np.ndarray:
+    """Inverse of `pack_gemm_weight`, for a CPU golden. Returns [N, K] float32.
+
+    Goes back through the row layout and `dequantize_weight`, so a golden built here cannot drift
+    from the one the GEMV path uses.
+    """
+    n_tiles, k_blocks, n_g, hdr_full, scale_region, slab, perm = _gemm_layout_dims(
+        N, K, tile_k, tile_n, group_size, weight_dtype, mmul_s, mmul_t, n_aie_cols, scale_dtype)
+    inv = np.empty_like(perm)
+    inv[perm] = np.arange(perm.size)
+    rstride = row_stride_bytes(K, group_size, weight_dtype, scale_dtype)
+    slabs = (np.asarray(packed).view(np.uint8)
+             .reshape(n_aie_cols, n_tiles // n_aie_cols, k_blocks, slab)
+             .transpose(2, 1, 0, 3)
+             .reshape(k_blocks, n_tiles, slab))
+
+    rows = np.empty((N, rstride), dtype=np.uint8)
+    scale_bytes = _SCALE_BYTES[scale_dtype]
+    rows[:, :hdr_full] = (slabs[:, :, :tile_n * n_g * scale_bytes]
+                          .reshape(k_blocks, n_tiles, tile_n, n_g * scale_bytes)
+                          .transpose(1, 2, 0, 3)
+                          .reshape(N, hdr_full))
+    body = slabs[:, :, scale_region:]
+    if weight_dtype == "int4":
+        body = _nibbles_to_values(np.ascontiguousarray(body).reshape(-1, tile_n * tile_k // 2),
+                                  tile_n * tile_k)
+    tiled = (body.reshape(k_blocks, n_tiles, tile_n * tile_k)[:, :, inv]
+             .reshape(k_blocks, n_tiles, tile_n, tile_k)
+             .transpose(1, 2, 0, 3)
+             .reshape(N, K))
+    rows[:, hdr_full:] = _values_to_nibbles(tiled) if weight_dtype == "int4" else tiled
+    return dequantize_weight(rows.reshape(-1).view(np.int8), N, K, group_size, weight_dtype,
+                             scale_dtype=scale_dtype,
+                             emulate_kernel_scale_cast=emulate_kernel_scale_cast)

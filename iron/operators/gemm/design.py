@@ -155,6 +155,8 @@ def my_matmul(
     c_row_stride=None,
     epilogue="none",
     epilogue_elems=None,
+    weight_dtype="bf16",
+    group_size=0,
 ):
     n_aie_rows = 4
 
@@ -297,13 +299,32 @@ def my_matmul(
         if b_block_rows is None
         else (b_rows // b_block_rows - 1) * b_block_stride + b_block_rows * b_row_width
     )
-    B_ty = np.ndarray[(b_elems,), np.dtype[dtype_in]]
+    # Quantized B: the operand is a flat run of tile SLABS, one per (k-block, n-tile), and the
+    # core expands each into `B_l1_dq_ty` -- the same bf16 tile the bf16 path's DMA delivers. See
+    # iron/common/quant.py's GEMM section for the slab and aie_kernels/generic/mm_quant.cc for the
+    # expansion; neither the layout nor the mmul order is re-derived here.
+    quantized_b = weight_dtype != "bf16"
+    if quantized_b:
+        from iron.common.quant import (gemm_column_run_bytes, gemm_packed_bytes,
+                                       gemm_tile_slab_bytes)
+
+        if not b_col_maj:
+            raise ValueError("a quantized weight is stored output-major; b_col_maj must be set")
+        if b_block_rows is not None:
+            raise ValueError("b_block_rows cannot describe a slab-packed weight")
+        slab_bytes = gemm_tile_slab_bytes(k, n, group_size, weight_dtype, s, t)
+        b_col_run = gemm_column_run_bytes(N, K, k, n, group_size, weight_dtype, s, t, n_aie_cols)
+        b_elems = gemm_packed_bytes(N, K, k, n, group_size, weight_dtype, s, t)
+    B_ty = np.ndarray[(b_elems,), np.dtype[np.int8 if quantized_b else dtype_in]]
     C_ty = np.ndarray[(c_elems,), np.dtype[dtype_out]]
     A_l2_ty = np.ndarray[(mem_tile_m_A * k,), np.dtype[dtype_in]]
-    B_l2_ty = np.ndarray[(k * n,), np.dtype[dtype_in]]
+    B_l2_ty = (np.ndarray[(slab_bytes,), np.dtype[np.int8]] if quantized_b
+               else np.ndarray[(k * n,), np.dtype[dtype_in]])
     C_l2_ty = np.ndarray[(mem_tile_m_C * n,), np.dtype[dtype_out]]
     A_l1_ty = np.ndarray[(m, k), np.dtype[dtype_in]]
-    B_l1_ty = np.ndarray[(k, n), np.dtype[dtype_in]]
+    B_l1_ty = (np.ndarray[(slab_bytes,), np.dtype[np.int8]] if quantized_b
+               else np.ndarray[(k, n), np.dtype[dtype_in]])
+    B_l1_dq_ty = np.ndarray[(k, n), np.dtype[dtype_in]]
     C_l1_ty = np.ndarray[(m, n), np.dtype[dtype_out]]
 
     # AIE Core Function declarations
@@ -335,7 +356,7 @@ def my_matmul(
         matmul_kernel = Kernel(
             matmul_func_name,
             gemm_object,
-            [A_l1_ty, B_l1_ty, C_l1_ty_internal],
+            [A_l1_ty, B_l1_dq_ty, C_l1_ty_internal],
         )
     else:
         # No need to use separate buffers for accumulation and transfer to L2, so
@@ -352,7 +373,15 @@ def my_matmul(
         matmul_kernel = Kernel(
             matmul_func_name,
             gemm_object,
-            [A_l1_ty, B_l1_ty, C_l1_ty],
+            [A_l1_ty, B_l1_dq_ty, C_l1_ty],
+        )
+
+    dequant_kernel = None
+    if quantized_b:
+        dequant_kernel = Kernel(
+            f"{func_prefix}dequant_b_{weight_dtype}_bf16",
+            gemm_object,
+            [B_l1_ty, B_l1_dq_ty],
         )
 
     # A kernel run over the finished C tile before it leaves L1, so the stage after this GEMM is
@@ -445,7 +474,11 @@ def my_matmul(
     # Input B
     for col in range(n_aie_cols):
         B_l3l2_fifos[col] = ObjectFifo(B_l2_ty, name=f"B_L3L2_{col}", depth=fifo_depth)
-        if b_col_maj:
+        if quantized_b:
+            # The slab is already in the mmul's destination order, so nothing re-tiles it on the
+            # way in -- and nothing could: these are packed bytes, not elements.
+            dims_to_stream = None
+        elif b_col_maj:
             dims_to_stream = [(n // t, t * k), (k // s, s), (t, k), (s, 1)]
         else:
             dims_to_stream = [(k // s, s * n), (n // t, t), (s, n), (t, 1)]
@@ -500,6 +533,8 @@ def my_matmul(
         barrier,
         elem_out_internal,
         epi=None,
+        dequant=None,
+        b_dq=None,
     ):
         barrier.wait_for_value(1)
         rtp_K_div_k = my_rtp[0]
@@ -515,7 +550,11 @@ def my_matmul(
             for _ in range_(rtp_K_div_k):
                 elem_in_a = in_a.acquire(1)
                 elem_in_b = in_b.acquire(1)
-                matmul(elem_in_a, elem_in_b, elem_out_internal)
+                if dequant is not None:
+                    dequant(elem_in_b, b_dq)
+                    matmul(elem_in_a, b_dq, elem_out_internal)
+                else:
+                    matmul(elem_in_a, elem_in_b, elem_out_internal)
                 in_a.release(1)
                 in_b.release(1)
 
@@ -540,6 +579,8 @@ def my_matmul(
                 acc_buffer = Buffer(
                     type=C_l1_ty_internal, name=f"acc_buffer_{row}_{col}"
                 )
+            dq_buffer = (Buffer(type=B_l1_dq_ty, name=f"b_dq_{row}_{col}")
+                         if quantized_b else None)
 
             workers.append(
                 Worker(
@@ -555,6 +596,8 @@ def my_matmul(
                         workerBarriers[row][col],
                         acc_buffer,
                         epi_kernel,
+                        dequant_kernel,
+                        dq_buffer,
                     ],
                     tile=Tile(tile_col, tile_row),
                     stack_size=0xD00,
@@ -589,7 +632,16 @@ def my_matmul(
             off, sizes, strides = restride_rows(t.offset, t.sizes, t.strides, K, a_row_stride)
             restrided.append(TensorAccessPattern((a_elems,), off, sizes, strides))
         A_tiles = restrided
-    if b_col_maj:
+    if quantized_b:
+        # quant.py stores each column's slabs contiguously, already in the order core_fn consumes
+        # them (n-tile outer, k-block inner), so B is a LINEAR transfer and needs no tiler.
+        assert b_col_run == n_c_col_tiles_per_core * K_div_k * slab_bytes
+        B_tiles = [
+            TensorAccessPattern((b_elems,), offset=col * b_col_run,
+                                sizes=[b_col_run], strides=[1])
+            for col in range(n_aie_cols)
+        ]
+    elif b_col_maj:
         B_tiles = TensorTiler2D.step_tiler(
             (N, K),  # Size of B matrix
             (n, k),  # Size of B tile
