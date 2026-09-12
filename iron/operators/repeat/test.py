@@ -23,6 +23,10 @@ def get_params():
         pytest.param(4, 1024, 2, None),
         pytest.param(4, 2048, 2, None, marks=[pytest.mark.extensive]),
         pytest.param(8, 2048 * 64, 4, 64, marks=[pytest.mark.extensive]),
+        # gemma-4-12b's kv_heads=1, head_dim=512 arm at max_seq=2048: cols=2**20, just
+        # past what a single two-level BD split can address (1023**2 < 2**20). Needs
+        # the n_chunks row split (here: 4 chunks of cols=2**18) to be exercised at all.
+        pytest.param(1, 2**20, 4, 512, marks=[pytest.mark.extensive]),
     ]
 
 
