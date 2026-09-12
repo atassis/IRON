@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import dataclasses
 import time
 
 import numpy as np
@@ -276,9 +277,9 @@ def test_gemm_quantized_weight(M, K, N, m, k, n, cols, group_size, weight_dtype,
     dequantized = operator.unpack_B(packed)
 
     c_quant = _run_on_device(operator, A, torch.from_numpy(packed))
-    control = GEMM(M=M, K=K, N=N, tile_m=m, tile_k=k, tile_n=n, num_aie_columns=cols,
-                   b_col_maj=True, emulate_bf16_mmul_with_bfp16=True, prio_accuracy=False,
-                   context=aie_context)
+    # Every arithmetic field copied off the operator: a control that differs in one of them
+    # measures the mmul's accuracy settings instead of the expansion.
+    control = dataclasses.replace(operator, weight_dtype="bf16", group_size=0)
     c_control = _run_on_device(control, A, torch.from_numpy(
         dequantized.astype(ml_dtypes.bfloat16).view(np.uint16)).view(torch.bfloat16).flatten())
 
