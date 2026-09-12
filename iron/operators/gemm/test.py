@@ -235,14 +235,24 @@ def _quant_operator(M, K, N, m, k, n, cols, group_size, weight_dtype, ctx=None, 
     )
 
 
-# (M, K, N, m, k, n, cols, group_size, weight_dtype). g=32 is what Gemma-4-12B's own int8 dump
-# uses at every site but attn_o; g=64 is the other one it ships. K=3840/N=4096 is the `qkv` shape.
+# (label, M, K, N, m, k, n, cols, group_size, weight_dtype).
+#
+# The gemma4-12b rows carry that model's REAL per-site (K, N) -- read off the dumped weights, not
+# assumed -- with the tile the prefill registry swept for that exact shape. K and N invert between
+# q/kv and o: q_proj is [4096, 3840] so the GEMM is K=3840, N=4096, while o_proj is [3840, 4096]
+# and the GEMM is K=4096, N=3840. N=3840 does not admit tile_n=64 at 8 columns (N % (n*cols) != 0,
+# the same bound the bf16 path asserts), which is why o and down carry their own tiling.
 _QUANT_SHAPES = [
-    (256, 3840, 4096, 64, 64, 64, 8, 32, "int8"),
-    (256, 3840, 4096, 64, 64, 64, 8, 64, "int8"),
-    (256, 3840, 2048, 64, 64, 64, 8, 32, "int8"),
-    (256, 512, 512, 64, 64, 64, 8, 32, "int8"),
-    (256, 512, 512, 64, 64, 64, 8, 64, "int4"),
+    # label                  M     K      N    m    k   n  cols   g  dtype
+    ("g4-qkv-g32",          256, 3840, 4096,  64,  64, 64,   8,  32, "int8"),
+    ("g4-qkv-g64",          256, 3840, 4096,  64,  64, 64,   8,  64, "int8"),
+    ("g4-kv-g32",           256, 3840, 2048,  64,  64, 64,   8,  32, "int8"),
+    ("g4-o-g64",            256, 4096, 3840,  32,  64, 32,   8,  64, "int8"),
+    ("g4-o-g32",            256, 4096, 3840,  32,  64, 32,   8,  32, "int8"),
+    ("g4-down-k3840of4",    256, 3840, 3840,  32,  64, 32,   8,  32, "int8"),
+    ("g4-down-full",        256, 15360, 3840, 32, 128, 16,   8,  32, "int8"),
+    ("small-int8",          256,  512,  512,  64,  64, 64,   8,  32, "int8"),
+    ("small-int4",          256,  512,  512,  64,  64, 64,   8,  64, "int4"),
 ]
 
 
@@ -255,7 +265,10 @@ def _run_on_device(operator, A_bf16, B_tensor):
     return c_buf.to_torch().reshape(operator.M, operator.N).to(torch.float32).numpy()
 
 
-@pytest.mark.parametrize("M,K,N,m,k,n,cols,group_size,weight_dtype", _QUANT_SHAPES)
+@pytest.mark.parametrize(
+    "M,K,N,m,k,n,cols,group_size,weight_dtype",
+    [pytest.param(*p[1:], id=p[0]) for p in _QUANT_SHAPES],
+)
 def test_gemm_quantized_weight(M, K, N, m, k, n, cols, group_size, weight_dtype, aie_context):
     """GATE: the quantized arm must be BIT-IDENTICAL to a plain bf16 GEMM fed the same weight.
 
@@ -270,7 +283,7 @@ def test_gemm_quantized_weight(M, K, N, m, k, n, cols, group_size, weight_dtype,
         pytest.skip(f"needs {cols} columns")
     torch.manual_seed(13)
     A = torch.randn(M, K, dtype=torch.bfloat16) * 4
-    W = (np.random.default_rng(13).standard_normal((N, K)) * 0.5).astype(np.float32)
+    W = (np.random.default_rng(13).standard_normal((N, K), dtype=np.float32) * 0.5)
 
     operator = _quant_operator(M, K, N, m, k, n, cols, group_size, weight_dtype, aie_context)
     packed = operator.pack_B(W)
@@ -298,6 +311,7 @@ def test_gemm_quantized_weight(M, K, N, m, k, n, cols, group_size, weight_dtype,
 
 @pytest.mark.parametrize("tile_k,tile_n,group_size,weight_dtype",
                          [(64, 64, 32, "int8"), (64, 64, 64, "int8"), (64, 32, 32, "int8"),
+                          (64, 32, 64, "int8"), (128, 16, 32, "int8"),
                           (64, 64, 64, "int4"), (128, 64, 32, "int8")])
 def test_gemm_pack_is_the_layout_mm_quant_reads(tile_k, tile_n, group_size, weight_dtype):
     """The byte contract, checked on the host: a slab walked the way mm_quant.cc walks it must
@@ -373,6 +387,22 @@ def test_gemm_repack_of_a_row_dump_is_the_same_bytes(weight_dtype, group_size):
     assert np.array_equal(
         pack_gemm_weight(W, 64, 64, group_size, weight_dtype, 8, 8, 3),
         repack_gemm_weight(row_form, N, K, 64, 64, group_size, weight_dtype, 8, 8, 3))
+
+
+@pytest.mark.parametrize("K,N,m,k,n", [(4096, 3840, 32, 64, 32), (3840, 3840, 32, 64, 32),
+                                       (15360, 3840, 32, 128, 16)])
+def test_gemm_quant_takes_the_registry_tile_for_an_n3840_site(K, N, m, k, n):
+    """gemma4-12b's o_proj and down_proj have N=3840, which tile_n=64 at 8 columns cannot tile.
+
+    Not a quantized-path restriction: GEMM's own `min_N = tile_n * num_aie_columns` already
+    refuses it for a bf16 B. The point here is that the packed layout carries the SAME bound
+    (`gemm_column_run_bytes` needs N//tile_n divisible by the column count), so a weight can never
+    be packed for a geometry the design would reject later.
+    """
+    with pytest.raises(ValueError, match="must be a multiple of 512"):
+        _quant_operator(256, K, N, 64, 64, 64, 8, 32, "int8")
+    op = _quant_operator(256, K, N, m, k, n, 8, 32, "int8")     # the swept tile builds
+    assert (N // n) % 8 == 0 and op._packed_b_bytes % 8 == 0
 
 
 def test_gemm_quant_group_must_not_straddle_a_k_tile():
