@@ -88,6 +88,9 @@ def get_quant_params():
         (256, 1024, 1, 4, 256, 128, "int4"),
         (256, 1024, 1, 4, 256, 128, "int8"),
         (256, 1024, 8, 4, 32, 64, "int4"),
+        # int8/g32: Gemma-4-12B's actually-served decode config (weights_int8g32/quant.json),
+        # untested until now -- none of the three params above match it.
+        (256, 1024, 1, 4, 256, 32, "int8"),
     ]
     params = []
     for p in params_list:
