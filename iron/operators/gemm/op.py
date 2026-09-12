@@ -410,6 +410,40 @@ class GEMM(MLIROperator):
         return gemm_packed_bytes(self.N, self.K, self.tile_k, self.tile_n, self.group_size,
                                  self.weight_dtype, s, t)
 
+    def _check_packed_b(self, buf):
+        """Refuse a packed B that was not built for THIS operator.
+
+        A slab's geometry follows tile_k, tile_n, group_size and the microkernel's (s, t), and
+        gemma4-12b needs more than one of those in a single model -- the registry gives o and down
+        a different tile from qkv. A buffer packed for one handed to an operator built for another
+        reads the wrong bytes and returns a plausible answer, which nothing downstream would
+        catch. SIZE IS NECESSARY, NOT SUFFICIENT: two geometries can agree on bytes and disagree
+        on layout (tile_n 64 vs 32 at one shape does exactly that), so this bounds the damage
+        rather than closing it. The complete fix is a layout tag in the buffer, which costs wire
+        bytes on every operator and is a wiring decision, not this one.
+        """
+        want = self._packed_b_bytes
+        got = getattr(buf, "nbytes", None)
+        if not isinstance(got, int) or got == want:
+            return          # unmeasurable buffer: leave it to the runtime, do not guess
+        _, s, t = self._mmul_rst
+        raise ValueError(
+            f"packed B is {got} bytes, but this GEMM wants {want}: it was built for "
+            f"tile_k={self.tile_k}, tile_n={self.tile_n}, group_size={self.group_size}, "
+            f"{self.weight_dtype}, {self.num_aie_columns} columns (mmul s={s}, t={t}). "
+            f"Build the operand with THIS operator's pack_B().")
+
+    def get_callable(self):
+        call = super().get_callable()
+        if self.weight_dtype == "bf16":
+            return call
+
+        def checked_call(*args):
+            if len(args) > 1:
+                self._check_packed_b(args[1])
+            return call(*args)
+
+        return checked_call
 
     def pack_B(self, W, **quantize_kwargs):
         """Quantize + lay out a [N, K] weight for this operator's `weight_dtype`/tiling.

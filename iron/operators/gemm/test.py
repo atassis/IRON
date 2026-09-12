@@ -265,6 +265,26 @@ def _run_on_device(operator, A_bf16, B_tensor):
     return c_buf.to_torch().reshape(operator.M, operator.N).to(torch.float32).numpy()
 
 
+def test_gemm_quant_guard_is_wired_into_the_real_callable(aie_context):
+    """The predicate is tested on its own above; this is the wiring.
+
+    `get_callable()` is where a packed B reaches the device, so the check has to sit inside what
+    it returns -- and the mismatch has to raise BEFORE the runtime sees the operand.
+    """
+    shape = dict(M=256, K=512, N=512, m=64, k=64, n=64, cols=8)
+    op = _quant_operator(**shape, group_size=64, weight_dtype="int8", ctx=aie_context)
+    wrong = _quant_operator(**shape, group_size=32, weight_dtype="int8", ctx=aie_context)
+    W = (np.random.default_rng(4).standard_normal((512, 512), dtype=np.float32) * 0.5)
+    op.compile()
+    call = op.get_callable()
+
+    a = XRTTensor.from_torch((torch.randn(256, 512, dtype=torch.bfloat16)).flatten())
+    c = XRTTensor(op.get_arg_spec()[2].shape, dtype=op.get_arg_spec()[2].dtype)
+    with pytest.raises(ValueError, match="packed B is"):
+        call(a, XRTTensor.from_torch(torch.from_numpy(wrong.pack_B(W))), c)
+    call(a, XRTTensor.from_torch(torch.from_numpy(op.pack_B(W))), c)   # matched still runs
+
+
 @pytest.mark.parametrize(
     "M,K,N,m,k,n,cols,group_size,weight_dtype",
     [pytest.param(*p[1:], id=p[0]) for p in _QUANT_SHAPES],
@@ -369,6 +389,37 @@ def test_gemm_pack_is_the_layout_mm_quant_reads(tile_k, tile_n, group_size, weig
                        kb * tile_k:(kb + 1) * tile_k].reshape(-1)[perm]
             assert np.array_equal(got, want), (
                 f"slab (kb={kb}, nt={nt}) decodes to a different tile than the DMA layout")
+
+
+def test_gemm_quant_refuses_a_b_packed_for_another_geometry():
+    """gemma4-12b runs g=32 at most sites and g=64 at attn_o, so mixing them up is the live
+    mistake. The wrong buffer must fail loudly at the call, not read wrong bytes on device."""
+    shape = dict(M=256, K=512, N=512, m=64, k=64, n=64, cols=8)
+    g32 = _quant_operator(**shape, group_size=32, weight_dtype="int8")
+    g64 = _quant_operator(**shape, group_size=64, weight_dtype="int8")
+    W = (np.random.default_rng(2).standard_normal((512, 512), dtype=np.float32) * 0.5)
+
+    g32._check_packed_b(XRTTensor.from_torch(torch.from_numpy(g32.pack_B(W))))   # matched: silent
+    with pytest.raises(ValueError, match="group_size=64"):
+        g64._check_packed_b(XRTTensor.from_torch(torch.from_numpy(g32.pack_B(W))))
+    # An unmeasurable operand is left to the runtime rather than guessed at.
+    g64._check_packed_b(object())
+
+
+def test_gemm_quant_buffer_check_cannot_see_an_equal_sized_relayout():
+    """The guard's KNOWN limit, pinned so nobody reads it as a layout check.
+
+    tile_n 64 and 32 at this shape pack to exactly the same byte count and a different layout: the
+    slab halves and the slab count doubles. Only a layout tag in the buffer closes this, which
+    costs wire bytes on every operator -- a wiring decision, not this operator's.
+    """
+    a = _quant_operator(M=256, K=512, N=512, m=64, k=64, n=64, cols=8,
+                        group_size=32, weight_dtype="int8")
+    b = _quant_operator(M=256, K=512, N=512, m=64, k=64, n=32, cols=8,
+                        group_size=32, weight_dtype="int8")
+    assert a._packed_b_bytes == b._packed_b_bytes
+    b._check_packed_b(XRTTensor.from_torch(torch.from_numpy(
+        a.pack_B((np.random.default_rng(2).standard_normal((512, 512), dtype=np.float32))))))
 
 
 @pytest.mark.parametrize("weight_dtype,group_size", [("int8", 32), ("int8", 64), ("int4", 64)])
