@@ -353,7 +353,11 @@ class DecodeLayerDataParallel(MLIROperator):
             # aliased to the scores' name -- unless SCORES_ROWBATCH is on, whose template takes K
             # at compile time and so needs its own object. GEMV_ROWBATCH rides in the NAME because
             # the archive is keyed by name and a -D-only difference would silently reuse the other.
-            obj("attn_gemv.o", gen / "mv.cc",
+            # This object's own GEMV_ALIAS_SC is exactly that -D-only difference, so it needs the
+            # same treatment: unsuffixed, a cache built under _rb==1 (alias present) silently
+            # reused its stale .o under _rb>1 (alias absent), and vice versa -- a real duplicate
+            # export in one archive member, not just a compile skipped.
+            obj(f"attn_gemv{_rb_tag}.o", gen / "mv.cc",
                 [f"-DDIM_K={self.D}", f"-DVEC_SIZE={GEMV_VEC_SIZE}"]
                 + (["-DGEMV_ALIAS_SC"] if _rb == 1 else []), "attn_"),
         ] + ([] if _rb == 1 else [
