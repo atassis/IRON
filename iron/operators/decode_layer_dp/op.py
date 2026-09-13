@@ -30,6 +30,13 @@ def _scores_rowbatch():
     return int(os.environ.get("SCORES_ROWBATCH", "1"))
 
 
+def _scores_rowbatch_tag():
+    """`_rb{n}` for n>1, else "". Single source for the tag so `.name` and the kernel archive
+    cannot drift -- a build differing only here must not share its artifact name with rb=1."""
+    _rb = _scores_rowbatch()
+    return f"_rb{_rb}" if _rb > 1 else ""
+
+
 def _mlp_l1_footprint_bytes(D, FF, mlp_cols, QD, tile_rows_gu, weight_depth, stack_size,
                             weight_dtype="bf16", group_size=0):
     """The MLP half's per-core L1 use at fuse_o=True (decode_layer_dp's only call shape).
@@ -295,6 +302,11 @@ class DecodeLayerDataParallel(MLIROperator):
         # bench_layer_arms.py. attn_split=None (unsplit) keeps the pre-split name unchanged.
         if self.attn_split is not None:
             base = f"{base}_sp{self.attn_split}"
+        # SCORES_ROWBATCH changes the scores gemv's kernel object and symbol (see
+        # get_kernel_artifacts below) but was absent here entirely, so an rb=1 and an rb=4 build
+        # shared this name -- the exact collision this property exists to prevent for its other
+        # fields. Not repr=False-gated like them: it is a module env read, not a dataclass field.
+        base = f"{base}{_scores_rowbatch_tag()}"
         return f"{base}{self._wtag}"
 
     def get_mlir_artifact(self):
@@ -332,7 +344,7 @@ class DecodeLayerDataParallel(MLIROperator):
         gen, a2 = kdir / "generic", kdir / arch
 
         _rb = _scores_rowbatch()
-        _rb_tag = f"_rb{_rb}" if _rb > 1 else ""
+        _rb_tag = _scores_rowbatch_tag()
 
         def obj(name, src, flags=(), prefix=None):
             return KernelObjectArtifact(name, dependencies=[SourceArtifact(src)],
