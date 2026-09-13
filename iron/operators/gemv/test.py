@@ -120,7 +120,9 @@ def test_gemv_quantized_weight(
     B = (torch.randn(K, dtype=torch.bfloat16) * 4)
 
     packed = quantize_weight(A_f32, group_size, weight_dtype)
-    a_dequant = dequantize_weight(packed, M, K, group_size, weight_dtype)
+    # emulate_kernel_scale_cast: GEMV always builds mv_quant.cc with SCALE_BF16=0 (see there).
+    a_dequant = dequantize_weight(packed, M, K, group_size, weight_dtype,
+                                  emulate_kernel_scale_cast=True)
     c_golden = torch.from_numpy(a_dequant).to(torch.bfloat16) @ B
 
     operator = GEMV(
