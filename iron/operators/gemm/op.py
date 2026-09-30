@@ -65,6 +65,24 @@ class GEMM(MLIROperator):
     group_size: int = field(default=0, repr=False)
     use_scalar: bool = field(default=False, repr=False)
     separate_c_tiles: bool = field(default=False, repr=False)
+    # Per-core buffer allocation strategy ('basic-sequential' or 'bank-aware'), forwarded to each
+    # Worker. None leaves the compiler default (bank-aware first, falling back to basic-sequential
+    # on failure) -- see Worker.__init__. Measured 2026-09-13 on a batched-prefill build: GEMM
+    # cores with large tile buffers fail bank-aware 100% of the time (5/5 shapes, 160/160 core
+    # instances observed), so the fallback runs unconditionally anyway; skipping straight to
+    # basic-sequential for GEMM avoids the wasted attempt and its diagnostic cost with no loss --
+    # the tile ends up on the same scheme either way. repr=False: doesn't change what the op
+    # computes, only how its buffers are addressed.
+    allocation_scheme: str | None = field(default=None, repr=False)
+    # OPT-IN: hold A resident in its MemTile across the N loop (one L3 fill per row-group instead
+    # of one per output column-tile) via a two-hop fifo whose second hop carries repeat_count --
+    # see design.py. Falls back to today's per-column-tile re-read, visibly, when the resident
+    # tile would not fit the MemTile or the row is split across shims (n_aie_cols < 4). Defaults
+    # False: this must never change what an existing caller builds.
+    a_resident: bool = field(default=False, repr=False)
+    # OPT-IN: design.py's runtime_rows (see its own comment). Requires a_resident=True. This flag
+    # gives a compile-time R_g; "dispatch" makes M the capacity and R_g a scratchpad value.
+    runtime_rows: bool | str = field(default=False, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -235,6 +253,10 @@ class GEMM(MLIROperator):
             base = f"{base}_epi{self.epilogue}"
         if self.weight_dtype != "bf16":
             base = f"{base}_wdt{self.weight_dtype}g{self.group_size}"
+        if self.a_resident:
+            base = f"{base}_ares"
+        if self.runtime_rows:
+            base = f"{base}_rtrows" + ("d" if self.runtime_rows == "dispatch" else "")
         return base
 
     @property
@@ -274,6 +296,9 @@ class GEMM(MLIROperator):
                     "epilogue_elems": self.epilogue_elems,
                     "weight_dtype": self.weight_dtype,
                     "group_size": self.group_size,
+                    "allocation_scheme": self.allocation_scheme,
+                    "a_resident": self.a_resident,
+                    "runtime_rows": self.runtime_rows,
                     "trace_size": 0,
                     "generate_taps": False,
                     "kernel_object": self._kernel_link_file,

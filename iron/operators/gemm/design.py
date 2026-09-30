@@ -14,12 +14,18 @@ from aie.iron import (
     Program,
     Buffer,
     Runtime,
+    ScratchpadParameter,
     TaskGroup,
     Worker,
     WorkerRuntimeBarrier,
     str_to_dtype,
 )
 from aie.iron.device import NPU1Col1, NPU1Col2, NPU1, NPU2, Tile
+from aie.dialects.aie import get_target_model
+from aie.ir import IntegerAttr, IntegerType
+from aie.iron.runtime._context import active_sequence
+from aie.dialects.aiex import (dma_free_task, npu_load_pdi, npu_maskwrite32, npu_sync,
+                               npu_update_from_scratchpad, shim_dma_single_bd_task)
 from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D, TensorAccessPattern
 from aie.iron.controlflow import range_
 from iron.common.kv_layout import blocked_access_pattern, restride_rows
@@ -157,6 +163,9 @@ def my_matmul(
     epilogue_elems=None,
     weight_dtype="bf16",
     group_size=0,
+    allocation_scheme=None,
+    a_resident=False,
+    runtime_rows=False,
 ):
     n_aie_rows = 4
 
@@ -180,6 +189,13 @@ def my_matmul(
     mem_tile_m_A = m * n_A_tiles_per_shim
     mem_tile_m_C = m * n_aie_rows
     mem_tile_n = n * n_aie_cols
+    # Needed early to decide A residency below, before any fifo is built.
+    K_div_k = K // k
+    n_c_col_tiles_per_core = N // mem_tile_n
+    # Needed early for runtime_rows: B's forward repeat_count is set at fifo-construction time,
+    # before the row-group count is otherwise computed (design.py's default path only needs it
+    # much later, at the sequence()-building RTP section).
+    n_c_row_tiles_per_core = M // mem_tile_m_C
 
     if prio_accuracy:
         assert (
@@ -315,9 +331,31 @@ def my_matmul(
         slab_bytes = gemm_tile_slab_bytes(k, n, group_size, weight_dtype, s, t)
         b_col_run = gemm_column_run_bytes(N, K, k, n, group_size, weight_dtype, s, t, n_aie_cols)
         b_elems = gemm_packed_bytes(N, K, k, n, group_size, weight_dtype, s, t)
+
+    # runtime_rows="dispatch": M is the capacity and R_g = scratchpad `rg1` + 1 (E2b).
+    rt_dispatch = runtime_rows == "dispatch"
+    if runtime_rows not in (False, True, "dispatch"):
+        raise ValueError(f"runtime_rows must be False, True or 'dispatch', got {runtime_rows!r}")
+    if runtime_rows:
+        # design note 2026-09-27-runtime-rows-gemm-design.md, option (a'). Scoped to the shape it
+        # was proven against: a_resident A, slab-packed quantized B.
+        if not a_resident:
+            raise ValueError("runtime_rows requires a_resident=True")
+        if not quantized_b:
+            raise ValueError("runtime_rows is scoped to a quantized (slab-packed) B")
+        if n_shim_mem_A != n_aie_rows:
+            raise ValueError(
+                f"runtime_rows needs n_shim_mem_A == n_aie_rows (n_aie_cols={n_aie_cols} < 4 "
+                "splits a row across shims, which the resident A path does not address)"
+            )
+        if K_div_k * slab_bytes * n_c_col_tiles_per_core != b_col_run:
+            raise ValueError("b_col_run does not decompose into n_c_col_tiles_per_core equal slices")
+
     B_ty = np.ndarray[(b_elems,), np.dtype[np.int8 if quantized_b else dtype_in]]
     C_ty = np.ndarray[(c_elems,), np.dtype[dtype_out]]
     A_l2_ty = np.ndarray[(mem_tile_m_A * k,), np.dtype[dtype_in]]
+    # a_resident path only -- see the gate below.
+    A_l2_resident_ty = np.ndarray[(mem_tile_m_A * K,), np.dtype[dtype_in]]
     B_l2_ty = (np.ndarray[(slab_bytes,), np.dtype[np.int8]] if quantized_b
                else np.ndarray[(k * n,), np.dtype[dtype_in]])
     C_l2_ty = np.ndarray[(mem_tile_m_C * n,), np.dtype[dtype_out]]
@@ -375,6 +413,70 @@ def my_matmul(
             gemm_object,
             [A_l1_ty, B_l1_dq_ty, C_l1_ty],
         )
+
+    # A operand residency (opt-in, gemm/op.py's `a_resident`): hold each row-group's full
+    # [mem_tile_m_A, K] slice in its MemTile across the N loop, instead of re-reading it from L3
+    # once per output column-tile (today's `pattern_repeat=n_c_col_tiles_per_core` below). Needs
+    # n_A_tiles_per_shim == 1 (n_aie_cols >= 4, so a shim already owns one whole compute row and
+    # there is no row-split left to combine with the K-tile decomposition), and the resident A
+    # buffer to fit the MemTile ALONGSIDE the B and C buffers that share the same MemTile column
+    # (Tile(2*i, 1) for A hosts B_L3L2/C_L2L3 of that same column too) -- both checked here against
+    # the actual shape, never assumed. Falls back to today's behavior, visibly, otherwise.
+    # a_resident_l2_depth: see its own comment at the "Input A" fifo construction below.
+    # runtime_rows refills A once per C tile, so it double-buffers the refill instead of replaying.
+    a_resident_l2_depth = 2 if runtime_rows else 1
+    a_resident_reason = None
+    if a_resident:
+        if n_A_tiles_per_shim != 1:
+            a_resident_reason = (
+                f"n_A_tiles_per_shim={n_A_tiles_per_shim} (n_aie_cols={n_aie_cols} < 4): a row is "
+                f"split across shims, which the two-hop resident fifo does not address")
+        elif n_c_col_tiles_per_core <= 1:
+            a_resident_reason = (
+                f"n_c_col_tiles_per_core={n_c_col_tiles_per_core}: no N-loop re-read to eliminate")
+        else:
+            target_model = get_target_model(dev_ty.resolve())
+            mem_tile_budget = target_model.get_mem_tile_size()
+            a_bytes = mem_tile_m_A * K * np.dtype(dtype_in).itemsize * a_resident_l2_depth
+            b_obj_bytes = slab_bytes if quantized_b else k * n * np.dtype(dtype_in).itemsize
+            b_bytes = b_obj_bytes * fifo_depth
+            c_bytes = mem_tile_m_C * n * np.dtype(dtype_out).itemsize * fifo_depth_out
+            resident_bytes = a_bytes + b_bytes + c_bytes
+            if resident_bytes > mem_tile_budget:
+                a_resident_reason = (
+                    f"A {a_bytes}B + B {b_bytes}B + C {c_bytes}B = {resident_bytes}B resident on "
+                    f"one MemTile column > byte budget {mem_tile_budget}B (A alone: "
+                    f"{mem_tile_m_A}x{K}x{np.dtype(dtype_in).itemsize}B, depth {a_resident_l2_depth})")
+            else:
+                # BD budget, separate from bytes (npu-resource-budgets.md: 48 BDs/MemTile,
+                # AIE2TargetModel::getNumBDs). A merged link-pool's MemTile-DMA body carries a
+                # FILL chain (depth blocks, one BD per buffer, count=repeat folded into the LOCK
+                # value not the block count) and a DRAIN chain (depth*copies blocks, copies=1
+                # only when depth==1 -- AIEObjectFifoLowerDMAs.cpp's repeatInHardware -- else
+                # copies=repeat_count). C's join gives each of its n_aie_rows segments its own
+                # FILL channel (depth blocks each) plus one DRAIN channel over all of them
+                # (depth*n_aie_rows blocks). Calibrated against the actual failing build: this
+                # gives A 32 (depth=2 pre-fix) + B 4 + C 16 = 52, matching its own "more than 48
+                # blocks" exactly; with the depth=1 fix above, A drops to 2 (22 total).
+                a_hop2_repeat = 1 if runtime_rows else n_c_col_tiles_per_core
+                a_copies = 1 if a_resident_l2_depth == 1 else a_hop2_repeat
+                a_bds = a_resident_l2_depth + a_resident_l2_depth * a_copies
+                b_bds = 2 * fifo_depth  # plain forward link, no repeat_count: FILL + DRAIN
+                c_bds = 2 * n_aie_rows * fifo_depth_out  # join: n_aie_rows FILL chans + 1 DRAIN
+                # row 1 is every MemTile's row in this design (A/B/C's Tile(col, 1)); the BD
+                # budget is a per-target-model constant, not per-coordinate, so col 0 answers for all.
+                mem_tile_bd_budget = target_model.get_num_bds(0, 1)
+                resident_bds = a_bds + b_bds + c_bds
+                if resident_bds > mem_tile_bd_budget:
+                    a_resident_reason = (
+                        f"A {a_bds} + B {b_bds} + C {c_bds} = {resident_bds} BDs resident on one "
+                        f"MemTile column > BD budget {mem_tile_bd_budget} (a_resident_l2_depth="
+                        f"{a_resident_l2_depth}, n_c_col_tiles_per_core={n_c_col_tiles_per_core})")
+    a_resident_effective = a_resident and a_resident_reason is None
+    if runtime_rows and not a_resident_effective:
+        raise ValueError(f"runtime_rows needs the resident A path: {a_resident_reason}")
+    if a_resident and not a_resident_effective:
+        print(f"[gemm a_resident] falling back to per-column-tile A re-read: {a_resident_reason}")
 
     dequant_kernel = None
     if quantized_b:
@@ -438,6 +540,39 @@ def my_matmul(
 
     # Input A
     for i in range(n_shim_mem_A):
+        mem_tile = Tile(
+            2 * i if n_aie_cols == 8 else i, 1
+        )  # alternate columns in full 4x8 NPU2 case
+        if a_resident_effective:
+            # Hop 1: L3 -> MemTile. This fifo alone sizes the merged pool -- createLinkPools
+            # takes the pool depth from the link's INPUT side -- and the drain unrolls
+            # depth*repeat_count BDs, so this is what the 48-BD budget above is spent on.
+            A_l3l2_fifos[i] = ObjectFifo(
+                A_l2_resident_ty, name=f"A_L3L2_{i}", depth=a_resident_l2_depth
+            )
+            # Hop 2: MemTile -> L1, replaying that object once per output column tile. Its depth
+            # is only the per-core L1 pool, i.e. each core's ping-pong: one core BD, no MemTile BD.
+            # dispatch: the shim streams each row group row-major; rebuild (kb, m, k) here.
+            a_from = [(m, k), (K_div_k, m * k), (k, 1)] if rt_dispatch else None
+            A_l2l1_fifos[i] = (
+                A_l3l2_fifos[i]
+                .cons(dims_from_stream=a_from)
+                .forward(
+                    tile=mem_tile,
+                    obj_type=A_l1_ty,
+                    depth=fifo_depth,
+                    name=f"A_L2L1_{i}",
+                    # fix-a-resident-forward-retiling: match the non-resident split's own mmul
+                    # re-tiling (design.py's default split, below) -- without it cores get the
+                    # resident buffer's raw row-major (m, k) layout instead.
+                    dims_to_stream=[(m // r, r * k), (k // s, s), (r, k), (s, 1)],
+                    # Counts replays of the whole (m, K) object, not of (m, k) chunks.
+                    # runtime_rows consumes each fill once.
+                    repeat_count=(None if runtime_rows else n_c_col_tiles_per_core),
+                )
+            )
+            continue
+
         A_l3l2_fifos[i] = ObjectFifo(A_l2_ty, name=f"A_L3L2_{i}", depth=fifo_depth)
         # If n_shim_mem_A == n_rows, n_A_tiles_per_shim is 1 and
         # this simply links a_l3l2_fifos[i] to a_l2l1_fifos[i] directly,
@@ -462,9 +597,7 @@ def my_matmul(
                 obj_types=[A_l1_ty] * (stop_row - start_row),
                 names=[f"A_L2L1_{row}" for row in range(start_row, stop_row)],
                 dims_to_stream=dims_to_stream,
-                tile=Tile(
-                    2 * i if n_aie_cols == 8 else i, 1
-                ),  # alternate columns in full 4x8 NPU2 case
+                tile=mem_tile,
             )
         )
 
@@ -490,6 +623,9 @@ def my_matmul(
                 name=f"B_L2L1_{col}",
                 dims_to_stream=dims_to_stream,
                 tile=Tile(col, 1),
+                # E2a scope: B is refetched per (n-tile, row-group), same as A -- proving the
+                # loop-order/core change first. A dispatch-time hardware replay of B (avoiding the
+                # re-read) is E2b/E2c's mechanism, not this stage's.
             )
         )
 
@@ -539,6 +675,10 @@ def my_matmul(
         barrier.wait_for_value(1)
         rtp_K_div_k = my_rtp[0]
         rtp_n_tiles_per_core = my_rtp[1]
+        # K027: move the lock off 1 now, before any output, so a later dispatch on this same
+        # core (one hardware context, repeated invocation) waits for its own RTP write instead
+        # of reading this run's stale values.
+        barrier.release_with_value(1)
         loop = range(1)  # Workaround for issue #1547
         if rtp_n_tiles_per_core > 1:
             loop = range_(rtp_n_tiles_per_core)
@@ -569,6 +709,36 @@ def my_matmul(
                     epi(epi_n, elem_out_internal)
                 out_c.release(1)
 
+    # runtime_rows (E2 design note (a')): "cores lose their RTP" -- one C tile per while_true
+    # body, paced by objectFifo backpressure alone. No barrier, no RTP buffers, no K027 release:
+    # there is nothing stale to release a lock against, since nothing is read once and kept.
+    def core_fn_rt(
+        in_a,
+        in_b,
+        out_c,
+        zero,
+        matmul,
+        elem_out_internal,
+        epi=None,
+        dequant=None,
+        b_dq=None,
+    ):
+        elem_out_internal = out_c.acquire(1)
+        zero(elem_out_internal)
+        for _ in range_(K_div_k):
+            elem_in_a = in_a.acquire(1)
+            elem_in_b = in_b.acquire(1)
+            if dequant is not None:
+                dequant(elem_in_b, b_dq)
+                matmul(elem_in_a, b_dq, elem_out_internal)
+            else:
+                matmul(elem_in_a, elem_in_b, elem_out_internal)
+            in_a.release(1)
+            in_b.release(1)
+        if epi is not None:
+            epi(epi_n, elem_out_internal)
+        out_c.release(1)
+
     # Set up compute tiles
     workers = []
     for row in range(n_aie_rows):
@@ -581,6 +751,29 @@ def my_matmul(
                 )
             dq_buffer = (Buffer(type=B_l1_dq_ty, name=f"b_dq_{row}_{col}")
                          if quantized_b else None)
+
+            if runtime_rows:
+                assert not use_larger_internal_buffer, "runtime_rows core_fn_rt has no acc_buffer path"
+                workers.append(
+                    Worker(
+                        core_fn_rt,
+                        [
+                            A_l2l1_fifos[row].cons(),
+                            B_l2l1_fifos[col].cons(),
+                            C_l1l2_fifos[row][col].prod(),
+                            zero_kernel,
+                            matmul_kernel,
+                            acc_buffer,
+                            epi_kernel,
+                            dequant_kernel,
+                            dq_buffer,
+                        ],
+                        tile=Tile(tile_col, tile_row),
+                        stack_size=0xD00,
+                        allocation_scheme=allocation_scheme,
+                    )
+                )
+                continue
 
             workers.append(
                 Worker(
@@ -601,13 +794,13 @@ def my_matmul(
                     ],
                     tile=Tile(tile_col, tile_row),
                     stack_size=0xD00,
+                    allocation_scheme=allocation_scheme,
                 )
             )
 
     # Calculate RTP values for the reduction loop and total C tiles
-    K_div_k = K // k
-    n_c_col_tiles_per_core = N // mem_tile_n
-    n_c_row_tiles_per_core = M // mem_tile_m_C
+    # (n_c_row_tiles_per_core computed earlier, before fifo construction -- runtime_rows needs it
+    # for B's forward repeat_count).
 
     # We are limited in the number of BDs. After synchronizing, we can reuse BDs.
     # We only transfer 6 rows of tiles at once before starting a new transfer block.
@@ -619,8 +812,8 @@ def my_matmul(
         (M, K),  # Size of A matrix
         (mem_tile_m_A, k),  # Size of A (smallest) tile
         (1, K_div_k),  # Size of "group" of tiles
-        # Repeat data so can distribute across whole column
-        pattern_repeat=n_c_col_tiles_per_core,
+        # See the a_resident gate above: repeat_count there takes over this job on-chip.
+        pattern_repeat=1 if a_resident_effective else n_c_col_tiles_per_core,
         prune_step=False,
     )
     if a_row_stride is not None:
@@ -702,6 +895,99 @@ def my_matmul(
                 )
             )
         B_tiles = blocked_tiles
+
+    # E2a: R_g fixed at compile time (no scratchpad, no hand-emitted aiex ops). B is refetched per
+    # (n-tile, row-group), same as A -- a dispatch-time hardware replay of B is E2b/E2c's addition.
+    def sequence_rt(A, B, C, A_prods, B_prods, C_conses):
+        R_g = n_c_row_tiles_per_core
+        n_iters = n_c_col_tiles_per_core * R_g
+        it = 0
+        tg = TaskGroup()
+        for n_tile in range(n_c_col_tiles_per_core):
+            for rg in range(R_g):
+                for col in range(n_aie_cols):
+                    if col < n_shim_mem_A:
+                        a_tile = A_tiles[rg * n_shim_mem_A + col]
+                        A_prods[col].fill(A, tap=a_tile, group=tg)
+                        A_taps.append(a_tile)
+                    b_off = col * b_col_run + n_tile * K_div_k * slab_bytes
+                    b_tap = TensorAccessPattern(
+                        (b_elems,), offset=b_off, sizes=[K_div_k * slab_bytes], strides=[1]
+                    )
+                    B_prods[col].fill(B, tap=b_tap, group=tg)
+                    B_taps.append(b_tap)
+                    C_row_offset = rg * mem_tile_m_C * N
+                    C_col_offset = n_tile * mem_tile_n + col * n
+                    c_tap = TensorAccessPattern(
+                        (M, N),
+                        offset=C_row_offset + C_col_offset,
+                        sizes=[mem_tile_m_C, n],
+                        strides=[N, 1],
+                    )
+                    C_conses[col].drain(C, tap=c_tap, wait=True, group=tg)
+                    C_taps.append(c_tap)
+                # Sync boundary between row-groups (see E2a log note for the corruption this
+                # is diagnosing: correct up to a fixed n_tile boundary, wrong after, independent
+                # of host-side sync granularity -- narrowed to NOT be a TaskGroup race).
+                it += 1
+                tg.finish()
+                if it < n_iters:
+                    tg = TaskGroup()
+
+    # E2b: one control stream for any R_g <= R_max = n_c_row_tiles_per_core. A and C are one
+    # length_parameter BD each (d2 = row groups); B needs each n-tile slab R_g times in a row,
+    # which only a runtime task-queue repeat gives (a raw update_from_scratchpad push, P1b).
+    # AIEGenerateColumnControlOverlay's shim controller_id at this pin (input_with_addresses.mlir).
+    shim_ctrl_pkt_id = 15
+    b_slots = [0, 4, 8, 12]  # the push clears start_bd[1:0]
+    mm2s0_ctrl, mm2s0_queue = 0x1D210, 0x1D214
+
+    def sequence_rtd(A, B, C, A_prods, B_prods, C_conses):
+        # Queue word add (R_g - 1) << 16. Core-kind (no DMA reads it), so the host writes it >> 2.
+        b_rep = ScratchpadParameter("b_rep", np.int32)  # idx 0
+        rt._scratchpad_parameters.append(b_rep)  # no fill() references it
+        rg1 = ScratchpadParameter("rg1", np.int32)  # R_g - 1, idx 1
+        npu_load_pdi(device_ref="main")
+        b_run = K_div_k * slab_bytes
+        b_tasks = [[None] * n_c_col_tiles_per_core for _ in range(n_aie_cols)]
+
+        def push_b(col, j):
+            t = shim_dma_single_bd_task(
+                B_prods[col].name, B.op, offset=col * b_col_run + j * b_run,
+                sizes=[1, 1, 1, b_run], strides=[0, 0, 0, 1])
+            next(iter(t.body.blocks[0].operations)).attributes["bd_id"] = (
+                IntegerAttr.get(IntegerType.get_signless(32), b_slots[j % len(b_slots)]))
+            npu_update_from_scratchpad(
+                0, mm2s0_queue, func_arg=(1 << 31) | b_slots[j % len(b_slots)], column=col, row=0)
+            b_tasks[col][j] = t
+
+        for col in range(n_aie_cols):
+            active_sequence().note_fifo(B_prods[col])
+            npu_maskwrite32(mm2s0_ctrl, shim_ctrl_pkt_id << 8, 0x1F00, column=col, row=0)
+            for j in range(min(len(b_slots), n_c_col_tiles_per_core)):
+                push_b(col, j)
+        tg = TaskGroup()
+        for i in range(n_shim_mem_A):
+            A_prods[i].fill(
+                A, sizes=[n_c_col_tiles_per_core, 1, m * K // k, k],
+                strides=[0, n_aie_rows * m * K, k, 1], offset=i * m * K, transfer_len=m * K,
+                length_parameter=rg1, length_granule=m * K, group=tg)
+        for col in range(n_aie_cols):
+            C_conses[col].drain(
+                C, sizes=[n_c_col_tiles_per_core, 1, mem_tile_m_C, n],
+                strides=[mem_tile_n, mem_tile_m_C * N, N, 1], offset=col * n,
+                transfer_len=mem_tile_m_C * n, length_parameter=rg1,
+                length_granule=mem_tile_m_C * n, wait=True, group=tg)
+        for j in range(len(b_slots), n_c_col_tiles_per_core):
+            for col in range(n_aie_cols):
+                npu_sync(col, 0, 1, 0)
+                dma_free_task(b_tasks[col][j - len(b_slots)])
+                push_b(col, j)
+        tg.finish()
+        for col in range(n_aie_cols):
+            for j in range(max(0, n_c_col_tiles_per_core - len(b_slots)), n_c_col_tiles_per_core):
+                npu_sync(col, 0, 1, 0)
+                dma_free_task(b_tasks[col][j])
 
     # Runtime operations to move data to/from the AIE-array
     def sequence(A, B, C, A_prods, B_prods, C_conses):
@@ -907,20 +1193,17 @@ def my_matmul(
                     tg = TaskGroup()
         tg.finish()
 
-    rt = Runtime(
-        sequence,
-        [
-            A_ty,
-            B_ty,
-            C_ty,
-            [
-                f.prod(tile=Tile(2 * c if n_aie_cols == 8 else c, 0))
-                for c, f in enumerate(A_l3l2_fifos)
-            ],
-            [f.prod(tile=Tile(c, 0)) for c, f in enumerate(B_l3l2_fifos)],
-            [f.cons(tile=Tile(c, 0)) for c, f in enumerate(C_l2l3_fifos)],
-        ],
-    )
+    a_prods = [
+        f.prod(tile=Tile(2 * c if n_aie_cols == 8 else c, 0))
+        for c, f in enumerate(A_l3l2_fifos)
+    ]
+    # sequence_rtd pushes B through MM2S_0's queue register; channel 1's pair partner would be
+    # S2MM_STATUS_0 (write-1-to-clear).
+    b_prods = [f.prod(tile=Tile(c, 0), channel=0 if rt_dispatch else None)
+               for c, f in enumerate(B_l3l2_fifos)]
+    c_conses = [f.cons(tile=Tile(c, 0)) for c, f in enumerate(C_l2l3_fifos)]
+    rt = Runtime(sequence_rtd if rt_dispatch else sequence_rt if runtime_rows else sequence,
+                 [A_ty, B_ty, C_ty, a_prods, b_prods, c_conses])
 
     # Create the program from the device type and runtime
     my_program = Program(dev_ty, rt, workers=workers)
