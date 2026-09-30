@@ -6,10 +6,23 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 import aie.dialects.index as index
+import aie.extras.dialects.arith as arith
 from aie.dialects.aie import T
 from aie.helpers.dialects.scf import _for as range_
+from aie.helpers.dialects.scf import if_, else_
 from aie.helpers.taplib import TensorAccessPattern
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
+from aie.iron import (
+    Buffer,
+    Kernel,
+    ObjectFifo,
+    Program,
+    Runtime,
+    ScratchpadParameter,
+    TaskGroup,
+    Worker,
+    WorkerRuntimeBarrier,
+    sync_parameters,
+)
 
 """
 Matrix-vector design
@@ -50,6 +63,96 @@ def l1_budget_bytes(dev):
     from aie.dialects.aie import get_target_model
 
     return get_target_model(int(dev.resolve())).get_local_memory_size()
+
+
+# --- shim/mem-tile BD field widths, and the coalescing verdict they decide ----------------
+# MODULE LEVEL, not local to my_matvec, because the CALLER has to know the verdict before it
+# builds: `tile_size_output` is sized against `n_vec` (every objectFIFO depth follows it, see
+# l1_footprint_bytes), and a caller choosing a flat or a blocked A layout is choosing between two
+# verdicts of `group_reuse_n_vec`. Both were re-derived outside this file until 2026-09-18 -- a
+# tiler that never saw batch_group, and prose -- which is the shape a-name-and-a-graph-need-one-
+# predicate names: a claim computed by a weaker path than the thing it claims about.
+MAX_WRAP = 1023
+# The shim NOC tile's BD step field is 20 bits -- not a convention, the hardware width:
+# `AIETargetModel.h::AIE2TargetModel::getDmaBdStepBits` returns 20 for ShimNOCTile (17 for a
+# MemTile, 13 for a core tile). But the field counts ADDRESS GRANULES, not elements:
+# `getAddressGenGranularity()` is 32 bits on AIE2/AIE2P, and `getHardwareStridesWraps` scales an
+# element stride by `elemWidth / addressGranularity` before `verifyStridesWraps` compares it.
+#
+# This bound was written in ELEMENTS and compared against the granule field width, which for
+# bf16 is exactly 2x too strict -- and its own FIXME below predicted it ("pull these shim BD
+# bounds from the MLIR-AIE target model rather than hard-coding them"). Cost, measured: the
+# decode's KV cache has a per-head stride of `alloc * head_dim` elements, so at head_dim=128 the
+# element bound caps the allocation at 8191 where the hardware allows 16383 -- one whole
+# doubling of the context a wide-allocation decode can address before its reads stop coalescing.
+MAX_STRIDE_GRANULES = (1 << 20) - 1
+GRAN_ELEMS = 2  # 4-byte shim granularity / 2-byte bf16 element
+MAX_STRIDE = MAX_STRIDE_GRANULES * GRAN_ELEMS
+
+
+def split_run(run, lim=MAX_WRAP, gran=GRAN_ELEMS):
+    """Factor a contiguous run into (hi, lo), both <= lim and lo a multiple of gran
+    (the address-granularity-aligned inner size), lo maximal. None if no such
+    split exists (caller then falls back to the per-batch path)."""
+    lo_start = (lim // gran) * gran
+    for lo in range(lo_start, 0, -gran):
+        if run % lo == 0 and (run // lo) <= lim:
+            return (run // lo, lo)
+    return None
+
+
+def coalesce_plan(M, cols, num_batches, batch_group, a_row_width, alloc_M=None, block_size=None):
+    """The A/C tap shapes and whether they coalesce, for one (flat or blocked) A layout.
+
+    Returns `(coalesce, A_split, C_split, A_bstride, C_bstride)`; `my_matvec` unpacks all five,
+    `group_reuse_n_vec` reads only the first.
+    """
+    n_matrices = num_batches // batch_group
+    _AM = M if alloc_M is None else alloc_M
+    _BLK = _AM if block_size is None else block_size
+    blocked = _BLK != _AM
+    # Under blocking the per-matrix run is no longer one `_AM`-row slab -- A is read as
+    # `num_col_blocks` separate `_BLK`-row chunks per column, so A_run/A_split (the flat-run wrap
+    # split) do not apply to A at all; only C keeps the flat run/split below. A_bstride here is the
+    # LARGEST stride A's blocked tap will actually carry -- block-to-block (`n_matrices*_BLK*
+    # a_row_width`), which bounds head-to-head (`_BLK*a_row_width`) too since n_matrices >= 1 -- so
+    # the same coalesce/MAX_STRIDE gate below still means "does this tap's widest stride fit the
+    # hardware field", just against the blocked stride instead of the flat `_AM*a_row_width` one
+    # (which is exactly the quantity blocking exists to avoid bounding by).
+    A_run = (M // cols) * a_row_width
+    A_bstride = (n_matrices * _BLK * a_row_width) if blocked else (_AM * a_row_width)
+    C_run, C_bstride = (M // cols), M
+    A_split, C_split = (None if blocked else split_run(A_run)), split_run(C_run)
+    # A_bstride steps the dim whose SIZE is `n_matrices` (coalesced_tap's A call), so at one matrix
+    # the shim never walks it and this bound refuses a tap the hardware accepts. Measured on
+    # Gemma-4's global attention (M=6912 K=512 hkv=1): 3,538,944 over the 2,097,150 bound forced
+    # the per-batch fallback, 28.31 MB of KV read per invocation against 7.08 MB unique. Blocked
+    # taps keep the check -- there A_bstride is the BLOCK step, live at any n_matrices.
+    a_bstride_live = blocked or n_matrices > 1
+    coalesce = (
+        num_batches > 1
+        and num_batches % batch_group == 0
+        and (not a_bstride_live
+             or (A_bstride <= MAX_STRIDE and A_bstride % GRAN_ELEMS == 0))
+        and C_bstride <= MAX_STRIDE
+        and C_bstride % GRAN_ELEMS == 0
+        and (blocked or A_split is not None)
+        and C_split is not None
+    )
+    return coalesce, A_split, C_split, A_bstride, C_bstride
+
+
+def group_reuse_n_vec(M, cols, num_batches, batch_group, a_row_width,
+                      alloc_M=None, block_size=None):
+    """`n_vec`: how many vectors one A delivery is reused for. 1 means no reuse.
+
+    A delivers `n_matrices` times per invocation at n_vec > 1 and `num_batches` times at 1, so
+    this is also the A-side delivery ratio between a flat and a blocked layout of the same cache.
+    """
+    if not (batch_group > 1 and batch_group <= MAX_GROUP_REUSE):
+        return 1
+    return batch_group if coalesce_plan(M, cols, num_batches, batch_group, a_row_width,
+                                        alloc_M, block_size)[0] else 1
 
 
 def l1_footprint_bytes(m_input, m_output, K, a_row_width, itemsize_in, n_vec):
@@ -136,9 +239,19 @@ def my_matvec(
     epilogue="none",
     weight_dtype="bf16",
     group_size=0,
+    scale_dtype="f32",
     alloc_M=None,
     barrier_chunk=1,
     block_size=None,
+    allocation_scheme=None,
+    vector_size_parameter=None,
+    tiles_rtp=False,
+    runtime_k=False,
+    k_max=None,
+    prologue="none",
+    prologue_capability="auto",
+    prologue_epsilon=1e-6,
+    norm_kernel_object="rms_norm.o",
 ):
     if m_output is None:
         m_output = m_input
@@ -148,6 +261,22 @@ def my_matvec(
         print(f"Matrix dimensions: M={M}, K={K}")
         print(f"Tiling: m_input={m_input}, m_output={m_output}")
         print(f"Columns: {cols}")
+
+    # RUNTIME K: the core reads K from a per-sequence RTP write instead of a compile-time
+    # -DDIM_K, so ONE kernel object (and one device body) serves several K's -- see
+    # gemma4-w-device-runtime-k-unsplit. The L1 buffers below are sized for `k_max` (the widest K
+    # any merged sequence will use); THIS instance's real K only sizes the L3 taps (the DMA moves
+    # exactly K's bytes, never k_max's) and the RTP value the core is told to use. Excludes every
+    # other axis that already has its own runtime mechanism (tiles_rtp's M, runtime_m's window,
+    # group reuse's batching) -- composing them is unbuilt, not needed by this family (down and
+    # both o_proj geometries share one M=D and one m_output/m_input already).
+    if runtime_k:
+        assert weight_dtype != "bf16", "runtime_k is for a quantized A only"
+        assert num_batches == 1 and batch_group == 1, "runtime_k is single-batch, no group reuse"
+        assert not tiles_rtp and vector_size_parameter is None, (
+            "runtime_k does not compose with tiles_rtp or runtime_m yet"
+        )
+        assert k_max is not None and k_max >= K, "runtime_k needs k_max >= K"
 
     # The reason for the following requirement is because we first acquire output rows from the C FIFO, then fill those acquiring rows of the A input.
     assert (
@@ -192,17 +321,29 @@ def my_matvec(
         assert group_size > 0, "weight_dtype != 'bf16' needs an explicit group_size"
         dtype_in = np.dtype[np.int8]
         dtype_in_str = weight_dtype
-        a_row_width = row_stride_bytes(K, group_size, weight_dtype)  # bytes/row, int8-sized
+        # bytes/row, int8-sized. scale_dtype moves this where the layout axis does not: layout
+        # reorders the same bytes, a narrower scale shrinks the row, so it reaches the L1 fit.
+        a_row_width = row_stride_bytes(K, group_size, weight_dtype, scale_dtype)
         itemsize_in = 1
+
+    # runtime_k: the L1 buffers below are ONE physical ObjectFifo shared by every merged
+    # sequence's device body (merge_devices needs the declared buffer TYPE identical across
+    # them), so they are sized for k_max -- the widest K any sequence uses -- never this
+    # instance's own K. `a_row_width`/`K` stay THIS instance's real values and size every L3
+    # (DDR) tap below unchanged: the DMA moves exactly this instance's bytes, never k_max's.
+    a_row_width_l1, K_l1 = (
+        (row_stride_bytes(k_max, group_size, weight_dtype, scale_dtype), k_max)
+        if runtime_k else (a_row_width, K)
+    )
 
     L1_A_ty = np.ndarray[
         (
             m_input,
-            a_row_width,
+            a_row_width_l1,
         ),
         dtype_in,
     ]
-    L1_B_ty = np.ndarray[(K,), dtype_b]
+    L1_B_ty = np.ndarray[(K_l1,), dtype_b]
     L1_C_ty = np.ndarray[(m_output,), dtype_out]
     # `batch_group` consecutive batches SHARE one matrix, so A holds num_batches//batch_group of
     # them, not num_batches. This is the GQA case: gqa_group query heads attend to one kv head, and
@@ -241,12 +382,23 @@ def my_matvec(
     ]
     L3_B_ty = np.ndarray[(num_batches * K,), dtype_b]
     L3_C_ty = np.ndarray[(num_batches * M,), dtype_out]
+    # Only "on" ever reads this: an "off" instance's sequence dummy-refills B's own tap instead
+    # (see sequence() below), so it never binds a Gain argument.
+    L3_Gain_ty = np.ndarray[(K,), dtype_b] if prologue == "on" else None
+    # "residual" needs three more real L3 arguments beyond (A, B=o, C): the residual stream x and
+    # both gains. x1 (the fourth) is an OUTPUT, typed further down by C's own convention.
+    L3_X_ty = np.ndarray[(K,), dtype_b] if prologue == "residual" else None
+    L3_GainA_ty = np.ndarray[(K,), dtype_b] if prologue == "residual" else None
+    L3_GainB_ty = np.ndarray[(K,), dtype_b] if prologue == "residual" else None
+    L3_X1_ty = np.ndarray[(K,), dtype_out] if prologue == "residual" else None
 
     func_type = "vectorized" if vectorized else "scalar"
     matvec = Kernel(
-        f"{func_prefix}matvec_{func_type}_{dtype_in_str}_{dtype_out_str}",
+        f"{func_prefix}matvec_{func_type}_{dtype_in_str}_{dtype_out_str}"
+        + ("_rtk" if runtime_k else ""),
         f"{func_prefix}{kernel_object}",
-        [np.int32, np.int32, L1_A_ty, L1_B_ty, L1_C_ty],
+        ([np.int32, np.int32, np.int32] if runtime_k else [np.int32, np.int32])
+        + [L1_A_ty, L1_B_ty, L1_C_ty],
     )
     # Optional fused activation over the full m_output C-tile, applied once per tile in core_body
     # (after the matvec inner-loop has filled all rows) rather than per matvec call, whose m_input
@@ -265,21 +417,44 @@ def my_matvec(
             [np.int32, L1_C_ty],
         )
 
-    MAX_WRAP = 1023
-    # The shim NOC tile's BD step field is 20 bits -- not a convention, the hardware width:
-    # `AIETargetModel.h::AIE2TargetModel::getDmaBdStepBits` returns 20 for ShimNOCTile (17 for a
-    # MemTile, 13 for a core tile). But the field counts ADDRESS GRANULES, not elements:
-    # `getAddressGenGranularity()` is 32 bits on AIE2/AIE2P, and `getHardwareStridesWraps` scales an
-    # element stride by `elemWidth / addressGranularity` before `verifyStridesWraps` compares it.
-    #
-    # This bound was written in ELEMENTS and compared against the granule field width, which for
-    # bf16 is exactly 2x too strict -- and its own FIXME below predicted it ("pull these shim BD
-    # bounds from the MLIR-AIE target model rather than hard-coding them"). Cost, measured: the
-    # decode's KV cache has a per-head stride of `alloc * head_dim` elements, so at head_dim=128 the
-    # element bound caps the allocation at 8191 where the hardware allows 16383 -- one whole
-    # doubling of the context a wide-allocation decode can address before its reads stop coalescing.
-    MAX_STRIDE_GRANULES = (1 << 20) - 1
-    GRAN_ELEMS = 2  # 4-byte shim granularity / 2-byte bf16 element
+    # PROLOGUE: an optional norm/residual-fusion on B, redundant per core (each already holds the
+    # whole B vector in L1 -- gemma4-12b-decode-map.md S6). "off"/"on"/"residual" are RUNTIME modes
+    # (an RTP word) of ONE compiled body; design_key() keys on CAPABILITY, not mode, so e.g. Wqkv
+    # ("on") and gate/up ("residual") can share a merged device once the family's capability is
+    # uniformly "residual". CAPABILITY sizes the body ("prenorm": 2 objects, Stage 1; "residual": 4
+    # objects + an x1 output, Stage 2 -- formula and layout at rms_norm_residual_add's own
+    # docstring) and must be the SAME across a merged family; a mode that needs fewer objects
+    # dummy-fills the rest from B.
+    assert prologue in ("none", "off", "on", "residual")
+    _CAP_OBJECTS = {"none": None, "prenorm": 2, "residual": 4}
+    if prologue_capability == "auto":
+        prologue_capability = {"none": "none", "off": "prenorm", "on": "prenorm",
+                               "residual": "residual"}[prologue]
+    assert prologue_capability in _CAP_OBJECTS, f"unknown prologue_capability {prologue_capability!r}"
+    assert (prologue_capability == "none") == (prologue == "none")
+    assert prologue != "residual" or prologue_capability == "residual"
+
+    norm_kernel = copy_kernel = residual_kernel = None
+    if prologue_capability != "none":
+        assert tiles_rtp, "prologue rides tiles_rtp's barrier+RTP channel for its mode word"
+        assert batch_group == 1 and num_batches == 1, (
+            "prologue is unbuilt under group reuse/batching -- gemma4-12b's merged W device is "
+            "single-vector (num_batches=1, batch_group=1), the only case this covers"
+        )
+        norm_kernel = Kernel(
+            f"{func_prefix}weighted_rms_norm", f"{func_prefix}{norm_kernel_object}",
+            [L1_B_ty, L1_B_ty, L1_B_ty, np.int32, np.float32],
+        )
+        copy_kernel = Kernel(
+            f"{func_prefix}bf16_copy_vector", f"{func_prefix}{norm_kernel_object}",
+            [L1_B_ty, L1_B_ty, np.int32],
+        )
+    if prologue_capability == "residual":
+        residual_kernel = Kernel(
+            f"{func_prefix}rms_norm_residual_add", f"{func_prefix}{norm_kernel_object}",
+            [L1_B_ty, L1_B_ty, L1_B_ty, L1_B_ty, np.int32, np.float32],
+        )
+
     # Elements per granule is a property of the ELEMENT TYPE, and this file hardcodes the bf16 ratio.
     # A quantized A is i8-typed (4 elements per granule), so the conversion would differ -- but
     # `num_batches` is asserted ==1 for a non-bf16 weight_dtype, which makes `coalesce` False and
@@ -288,45 +463,13 @@ def my_matvec(
         f"coalescing arithmetic assumes {GRAN_ELEMS} elements/granule (bf16); "
         f"dtype_in={dtype_in_str} with num_batches={num_batches} would need its own ratio"
     )
-    MAX_STRIDE = MAX_STRIDE_GRANULES * GRAN_ELEMS
-
-    def split_run(run, lim=MAX_WRAP, gran=GRAN_ELEMS):
-        """Factor a contiguous run into (hi, lo), both <= lim and lo a multiple of gran
-        (the address-granularity-aligned inner size), lo maximal. None if no such
-        split exists (caller then falls back to the per-batch path)."""
-        lo_start = (lim // gran) * gran
-        for lo in range(lo_start, 0, -gran):
-            if run % lo == 0 and (run // lo) <= lim:
-                return (run // lo, lo)
-        return None
-
-    # Under blocking the per-matrix run is no longer one `_AM`-row slab -- A is read as
-    # `num_col_blocks` separate `_BLK`-row chunks per column, so A_run/A_split (the flat-run wrap
-    # split) do not apply to A at all; only C keeps the flat run/split below. A_bstride here is the
-    # LARGEST stride A's blocked tap will actually carry -- block-to-block (`n_matrices*_BLK*
-    # a_row_width`), which bounds head-to-head (`_BLK*a_row_width`) too since n_matrices >= 1 -- so
-    # the same coalesce/MAX_STRIDE gate below still means "does this tap's widest stride fit the
-    # hardware field", just against the blocked stride instead of the flat `_AM*a_row_width` one
-    # (which is exactly the quantity blocking exists to avoid bounding by).
-    A_run = (M // cols) * a_row_width
-    A_bstride = (n_matrices * _BLK * a_row_width) if blocked else (_AM * a_row_width)
-    C_run, C_bstride = (M // cols), M
-    A_split, C_split = (None if blocked else split_run(A_run)), split_run(C_run)
+    coalesce, A_split, C_split, A_bstride, C_bstride = coalesce_plan(
+        M, cols, num_batches, batch_group, a_row_width, alloc_M, block_size)
     if blocked:
         assert (M // cols) % _BLK == 0, (
             f"blocked GEMV needs each column's share of M ({M // cols}) to be a whole number of "
             f"blocks (block_size={_BLK}) -- got M={M} cols={cols} block_size={_BLK}"
         )
-    coalesce = (
-        num_batches > 1
-        and num_batches % batch_group == 0
-        and A_bstride <= MAX_STRIDE
-        and C_bstride <= MAX_STRIDE
-        and A_bstride % GRAN_ELEMS == 0
-        and C_bstride % GRAN_ELEMS == 0
-        and (blocked or A_split is not None)
-        and C_split is not None
-    )
 
     # GROUP REUSE: consume the shared matrix ONCE and run `batch_group` vectors over it, instead of
     # re-streaming it per group member.
@@ -381,8 +524,11 @@ def my_matvec(
     # so depth >= n_vec is a precondition of the loop, and a narrower group means sub-tiling the
     # group loop rather than turning a knob.
     group_fits_bds = batch_group <= MAX_GROUP_REUSE
-    group_reuse = batch_group > 1 and coalesce and group_fits_bds
-    n_vec = batch_group if group_reuse else 1
+    # Read from the shared predicate rather than recomputed from `coalesce` here: the caller sized
+    # its tile_size_output against the same call, and a second spelling of this expression is how
+    # the two would disagree about an L1 footprint that only one of them checks.
+    n_vec = group_reuse_n_vec(M, cols, num_batches, batch_group, a_row_width, alloc_M, block_size)
+    group_reuse = n_vec > 1
     # Say so when the reuse is declined. A silent downgrade here is a per-token DDR regression that
     # nobody can attribute later without re-deriving this by hand.
     #
@@ -399,9 +545,26 @@ def my_matvec(
     # only that shapes divide evenly (the asserts at the top of this function). n_vec is FINAL
     # here -- already declined to 1 above if the BD ceiling was going to decline it -- so raise
     # rather than print: unlike that decline, an L1 miss has nothing smaller left to fall back to.
-    _msg = check_l1_fits(dev, m_input, m_output, K, a_row_width, itemsize_in, n_vec)
+    _msg = check_l1_fits(dev, m_input, m_output, K_l1, a_row_width_l1, itemsize_in, n_vec)
     if _msg is not None:
         raise ValueError(_msg)
+
+    # PROLOGUE L1: (n_obj-1) extra B objects beyond check_l1_fits' own n_vec=1 B term, plus the
+    # b_norm scratch every mode writes through, plus (residual only) the x1 output object column 0
+    # drains. check_l1_fits above priced none of these.
+    if prologue_capability != "none":
+        _n_obj = _CAP_OBJECTS[prologue_capability]
+        _prologue_extra = (_n_obj - 1) * K * 2 + K * 2
+        if prologue_capability == "residual":
+            _prologue_extra += K * 2  # x1 output, depth 1 -- one shot per dispatch, no pipelining
+        _budget = l1_budget_bytes(dev)
+        _base = l1_footprint_bytes(m_input, m_output, K, a_row_width, itemsize_in, n_vec)
+        if _base + _prologue_extra + L1_HEADROOM_BYTES > _budget:
+            raise ValueError(
+                f"GEMV+prologue does not fit L1: base {_base} B + prologue {_prologue_extra} B + "
+                f"{L1_HEADROOM_BYTES} B headroom exceeds {_budget} B at K={K} "
+                f"capability={prologue_capability!r}"
+            )
 
     if blocked and not group_reuse:
         # Scope boundary, not a hardware limit: the blocked tap below reuses d3 (the iteration
@@ -426,43 +589,191 @@ def my_matvec(
         ObjectFifo(L1_A_ty, name=f"A_L3L1_{i}", depth=2 * n_vec) for i in range(cols)
     ]
     # B and C likewise: the core holds n_vec vectors and output tiles at once. At n_vec == 1 all
-    # three are 2, 1 and 2 -- exactly as before.
+    # three are 2, 1 and 2 -- exactly as before. A prologue-capable B holds _CAP_OBJECTS[capability]
+    # objects regardless of MODE (n_vec is 1 there, asserted above), because the depth is a per-FIFO
+    # compile-time property and every merged-family member shares the same compiled core; modes
+    # that need fewer objects than the family's capability dummy-fill the rest from B itself (see
+    # the sequence below).
+    b_acquire_n = _CAP_OBJECTS[prologue_capability] if prologue_capability != "none" else n_vec
     B_L3L1_fifos = [
-        ObjectFifo(L1_B_ty, name=f"B_L3L1_{i}", depth=n_vec) for i in range(cols)
+        ObjectFifo(L1_B_ty, name=f"B_L3L1_{i}", depth=b_acquire_n) for i in range(cols)
     ]
     C_L1L3_fifos = [
         ObjectFifo(L1_C_ty, name=f"C_L1L3_{i}", depth=2 * n_vec) for i in range(cols)
     ]
 
-    def core_body(A_L3L1_fifo, B_L3L1_fifo, C_L1L3_fifo, matvec, gelu_kernel=None):
-        one_idx = index.constant(1)
-        for _ in range_(0xFFFFFFFF):  # batch dim handled as part of this loop
-            b = B_L3L1_fifo.acquire(n_vec)
-            # The kernel function computes m output rows; each core is responsible for (M/cols) output rows, so we need to call the kernel (M/cols)/m times.
-            for i_idx in range_(M // m_output // cols):
-                c = C_L1L3_fifo.acquire(n_vec)
-                i_i32 = index.casts(T.i32(), i_idx)
-                for j_idx in range_(m_output // m_input):
-                    j_i32 = index.casts(T.i32(), j_idx)
-                    output_row_offset = j_i32 * m_input
-                    a = A_L3L1_fifo.acquire(1)
-                    # The A tile is acquired ONCE and every vector in the group runs over it. The
-                    # group is a python-level unroll because batch_group is a build constant, and
-                    # because `b`/`c` are indexable views only when more than one was acquired.
-                    if n_vec == 1:
-                        matvec(m_input, output_row_offset, a, b, c)
-                    else:
-                        for g in range(n_vec):
-                            matvec(m_input, output_row_offset, a, b[g], c[g])
-                    A_L3L1_fifo.release(1)
-                if gelu_kernel is not None:
-                    if n_vec == 1:
-                        gelu_kernel(m_output, c)
-                    else:
-                        for g in range(n_vec):
-                            gelu_kernel(m_output, c[g])
-                C_L1L3_fifo.release(n_vec)
-            B_L3L1_fifo.release(n_vec)
+    # RUNTIME ROW EXTENT -- the one explanation; tmatvec/design.py and both op.py files point here.
+    # `M` stays the ALLOCATED and streamed extent, because a shim BD length is a static field on
+    # the binary TXN target; the core computes only the rows below `vector_size` and drains the
+    # rest untouched. So this buys CORE TIME, never bytes.
+    #
+    # Skipping is EXACT where the consumer overwrites the skipped rows -- decode attention's
+    # softmax writes -inf over everything past its own mask before any exp2. A caller whose
+    # consumer READS those rows must not use this.
+    #
+    # Rows split across columns CONTIGUOUSLY, so a short dispatch idles the later columns rather
+    # than sharing the work: cost is min(vector_size, M/cols), not vector_size/cols.
+    runtime_m = vector_size_parameter is not None
+    # TILE COUNT FROM THE SEQUENCE: each core computes as many output tiles as its own RTP says, and
+    # the sequence streams exactly that many. The core program then carries no M, so designs that
+    # differ only in M have identical bodies and can share one device with one named sequence each.
+    assert not (tiles_rtp and runtime_m), "tiles_rtp and vector_size_parameter are exclusive"
+    assert not tiles_rtp or num_batches == 1, "tiles_rtp is single-batch"
+    # PROLOGUE MODE rides in tiles_rtp[1] -- a second RTP word under the SAME barrier, rather than
+    # a barrier of its own, because the two are always set together by this design's own sequence
+    # (see below) and a second WorkerRuntimeBarrier would be a second lock/BD for no new capability.
+    _rtp_words = 2 if prologue_capability != "none" else 1
+    tiles_rtps = ([Buffer(np.ndarray[(_rtp_words,), np.dtype[np.int32]], name=f"tiles_rtp_{i}",
+                          use_write_rtp=True) for i in range(cols)] if tiles_rtp else [])
+    b_norm_bufs = ([Buffer(type=L1_B_ty, name=f"B_norm_{i}") for i in range(cols)]
+                  if prologue_capability != "none" else [])
+    # Column 0 only (see the PROLOGUE comment above): one output object, no pipelining needed --
+    # this drains once per dispatch, not once per output tile the way C does.
+    X1_L1L3_fifo = (ObjectFifo(L1_B_ty, name="X1_L1L3", depth=1)
+                    if prologue_capability == "residual" else None)
+    vs_param = (
+        ScratchpadParameter(vector_size_parameter, np.int32) if runtime_m else None
+    )
+    # K FROM THE SEQUENCE, same idiom as tiles_rtp's tile count: each core reads which K this
+    # dispatch is for from a write-RTP the sequence sets before it runs, so the core program
+    # carries no K and can share a device across several K's -- see the runtime_k assertions above.
+    k_rtps = ([Buffer(np.ndarray[(1,), np.dtype[np.int32]], name=f"k_rtp_{i}",
+                      use_write_rtp=True) for i in range(cols)] if runtime_k else [])
+    n_tiles = M // m_output // cols
+
+    n_j = m_output // m_input
+
+    def _ceil_clamp(rem, gran, hi):
+        up = arith.addi(rem, arith.constant(gran - 1, T.i32()))
+        return arith.maxsi(
+            arith.minsi(arith.divsi(up, arith.constant(gran, T.i32())),
+                        arith.constant(hi, T.i32())),
+            arith.constant(0, T.i32()),
+        )
+
+    def active_tiles(width, col):
+        """Output tiles this column must compute for `width` rows, CEIL, clamped to [0, n_tiles]."""
+        return _ceil_clamp(
+            arith.subi(width, arith.constant(col * (M // cols), T.i32())), m_output, n_tiles
+        )
+
+    def active_calls(width, col, i_i32):
+        """Kernel calls inside tile `i`. Narrowing ONLY the tile loop is not enough: gemv_tile_output
+        picks the largest legal C tile, and at the decode scores shape that is the whole per-column
+        slab (n_tiles == 1), so the outer bound can only ever be 0 or everything."""
+        base = arith.addi(arith.constant(col * (M // cols), T.i32()),
+                          arith.muli(i_i32, arith.constant(m_output, T.i32())))
+        return _ceil_clamp(arith.subi(width, base), m_input, n_j)
+
+    def make_core_body(col):
+        # `*rest` rather than defaulted names: both tails are optional and independent, so a fixed
+        # positional order binds the wrong one for one of the four combinations. Unpacked in the
+        # SAME order worker_args builds them.
+        def core_body(A_L3L1_fifo, B_L3L1_fifo, C_L1L3_fifo, matvec, *rest):
+            rest = list(rest)
+            gelu_kernel = rest.pop(0) if epilogue != "none" else None
+            vs_src, barrier = ((rest.pop(0), rest.pop(0)) if (runtime_m or tiles_rtp or runtime_k)
+                               else (None, None))
+            norm_k = copy_k = res_k = b_norm = x1_fifo = None
+            if prologue_capability != "none":
+                norm_k, copy_k, b_norm = rest.pop(0), rest.pop(0), rest.pop(0)
+            if prologue_capability == "residual":
+                res_k = rest.pop(0)
+                if col == 0:
+                    x1_fifo = rest.pop(0)
+            one_idx = index.constant(1)
+            k_val = None
+            for _ in range_(0xFFFFFFFF):  # batch dim handled as part of this loop
+                if runtime_m:
+                    # Read AFTER the barrier, never before: the sequence syncs the scratchpad and only
+                    # then sets it, so a read here sees THIS dispatch's value.
+                    barrier.wait_for_value(1)
+                    vs = vs_src.read()
+                    n_active = active_tiles(vs, col)
+                elif tiles_rtp:
+                    barrier.wait_for_value(1)
+                    n_active = vs_src[0]
+                    if prologue_capability != "none":
+                        mode = vs_src[1]
+                    # Acquire does not consume the lock: move it off 1 now, before any output, so the
+                    # next run waits for its own sequence's count instead of reusing this one.
+                    barrier.release_with_value(1)
+                elif runtime_k:
+                    barrier.wait_for_value(1)
+                    k_val = vs_src[0]
+                    barrier.release_with_value(1)
+                b = B_L3L1_fifo.acquire(b_acquire_n)
+                if prologue_capability == "residual":
+                    # b[0]=o, b[1]=x, b[2]=gain_a, b[3]=gain_b under mode 2 (or the sequence's own
+                    # dummy re-fills under mode 0/1 -- see my_matvec's sequence()). Every branch
+                    # leaves the shared row-tile loop below reading ONE buffer, b_norm.
+                    with if_(mode == 2) as is_res:
+                        res_k(b[0], b[2], b[1], b[0], K, prologue_epsilon)  # x1 -> b[0], in place
+                        norm_k(b[0], b[3], b_norm, K, prologue_epsilon)     # h -> b_norm
+                        if col == 0:
+                            x1o = x1_fifo.acquire(1)
+                            copy_k(b[0], x1o, K)
+                            x1_fifo.release(1)
+                    with else_(is_res):
+                        with if_(mode == 1) as is_rms:
+                            norm_k(b[0], b[1], b_norm, K, prologue_epsilon)
+                        with else_(is_rms):
+                            copy_k(b[0], b_norm, K)
+                    b = b_norm
+                elif prologue_capability != "none":
+                    # b[0] is the activation, b[1] the gain (or, in "off" mode, the sequence's own
+                    # dummy re-fill of b[0] -- see my_matvec's sequence()). Either branch leaves the
+                    # shared row-tile loop below reading ONE buffer, b_norm, regardless of mode.
+                    with if_(mode == 1) as is_rms:
+                        norm_k(b[0], b[1], b_norm, K, prologue_epsilon)
+                    with else_(is_rms):
+                        copy_k(b[0], b_norm, K)
+                    b = b_norm
+                # The kernel function computes m output rows; each core is responsible for (M/cols) output rows, so we need to call the kernel (M/cols)/m times.
+                for i_idx in range_(n_active if (runtime_m or tiles_rtp) else n_tiles):
+                    c = C_L1L3_fifo.acquire(n_vec)
+                    i_i32 = index.casts(T.i32(), i_idx)
+                    if runtime_m:
+                        n_j_active = active_calls(vs, col, i_i32)
+                    for j_idx in range_(n_j_active if runtime_m else n_j):
+                        j_i32 = index.casts(T.i32(), j_idx)
+                        output_row_offset = j_i32 * m_input
+                        a = A_L3L1_fifo.acquire(1)
+                        # The A tile is acquired ONCE and every vector in the group runs over it. The
+                        # group is a python-level unroll because batch_group is a build constant, and
+                        # because `b`/`c` are indexable views only when more than one was acquired.
+                        if n_vec == 1:
+                            if runtime_k:
+                                matvec(m_input, output_row_offset, k_val, a, b, c)
+                            else:
+                                matvec(m_input, output_row_offset, a, b, c)
+                        else:
+                            for g in range(n_vec):
+                                matvec(m_input, output_row_offset, a, b[g], c[g])
+                        A_L3L1_fifo.release(1)
+                    if runtime_m:
+                        for _ in range_(arith.subi(arith.constant(n_j, T.i32()), n_j_active)):
+                            A_L3L1_fifo.acquire(1)
+                            A_L3L1_fifo.release(1)
+                    if gelu_kernel is not None:
+                        if n_vec == 1:
+                            gelu_kernel(m_output, c)
+                        else:
+                            for g in range(n_vec):
+                                gelu_kernel(m_output, c[g])
+                    C_L1L3_fifo.release(n_vec)
+                if runtime_m:
+                    # The fill and the drain are both sized to n_tiles, so the surplus has to move
+                    # through the fifos anyway; what is saved is the MACs, not the bytes.
+                    for _ in range_(arith.subi(arith.constant(n_tiles, T.i32()), n_active)):
+                        C_L1L3_fifo.acquire(n_vec)
+                        for _j in range_(n_j):
+                            A_L3L1_fifo.acquire(1)
+                            A_L3L1_fifo.release(1)
+                        C_L1L3_fifo.release(n_vec)
+                B_L3L1_fifo.release(b_acquire_n)
+
+        return core_body
 
     # STACK. The bf16 and symmetric paths take the device default (1024 B) and are left alone --
     # raising it would move every existing build's L1 layout. The AFFINE kernels keep one float
@@ -476,16 +787,26 @@ def my_matvec(
         _bsum = 4 * (K // group_size)
         _stack_kw["stack_size"] = 1024 + -(-_bsum // 64) * 64
 
+    barriers = ([WorkerRuntimeBarrier() for _ in range(cols)]
+                if (runtime_m or tiles_rtp or runtime_k) else [])
+
     workers = [
         Worker(
-            core_body,
+            make_core_body(i),
             [
                 A_L3L1_fifos[i].cons(),
                 B_L3L1_fifos[i].cons(),
                 C_L1L3_fifos[i].prod(),
                 matvec,
             ]
-            + ([gelu_kernel] if epilogue != "none" else []),
+            + ([gelu_kernel] if epilogue != "none" else [])
+            + ([vs_param, barriers[i]] if runtime_m else [])
+            + ([tiles_rtps[i], barriers[i]] if tiles_rtp else [])
+            + ([k_rtps[i], barriers[i]] if runtime_k else [])
+            + ([norm_kernel, copy_kernel, b_norm_bufs[i]] if prologue_capability != "none" else [])
+            + ([residual_kernel] if prologue_capability == "residual" else [])
+            + ([X1_L1L3_fifo.prod()] if (prologue_capability == "residual" and i == 0) else []),
+            allocation_scheme=allocation_scheme,
             **_stack_kw,
         )
         for i in range(cols)
@@ -563,6 +884,27 @@ def my_matvec(
             strides=[K, batch_group * K, k_lo, 1],
         )
 
+    # Gain tap for prologue="on": one flat K-element read, the same shape B_tap takes at
+    # batch_group==1 (asserted above, so B_tap is always that flat form when this is built).
+    Gain_tap = (
+        TensorAccessPattern(
+            tensor_dims=L3_Gain_ty.__args__[0], offset=0,
+            sizes=[1, 1, 1, K], strides=[0, 0, 0, 1],
+        )
+        if prologue == "on" else None
+    )
+
+    # Same flat K-element shape for "residual"'s three extra real inputs and its x1 output --
+    # batch_group==1 here too (asserted in the residual capability check above).
+    def _flat_k_tap(ty):
+        return TensorAccessPattern(
+            tensor_dims=ty.__args__[0], offset=0, sizes=[1, 1, 1, K], strides=[0, 0, 0, 1],
+        )
+    X_tap = _flat_k_tap(L3_X_ty) if prologue == "residual" else None
+    GainA_tap = _flat_k_tap(L3_GainA_ty) if prologue == "residual" else None
+    GainB_tap = _flat_k_tap(L3_GainB_ty) if prologue == "residual" else None
+    X1_tap = _flat_k_tap(L3_X1_ty) if prologue == "residual" else None
+
     # Collection pattern for the output vector C: each AIE core writes back its contiguous chunk of rows.
     C_taps = [
         [
@@ -622,8 +964,7 @@ def my_matvec(
         assert all(f.depth >= 2 for f in A_L3L1_fifos) and all(
             f.depth >= 2 for f in C_L1L3_fifos
         ), "coalesced GEMV wants A/C ObjectFifo depth>=2 for fill/compute overlap"
-        # With the group reused there is no repeat and no permutation: A walks its matrices and C
-        # walks its batches, both plain and both with a dead outer dim.
+        # With the group reused there is no repeat: A walks its matrices with a dead outer dim.
         if blocked:
             # BLOCKED A: the [outer=1, inner=n_matrices] shape above repurposes its dead outer dim
             # (group_reuse's A never uses it -- see coalesced_tap's call: outer_stride is always 0
@@ -655,24 +996,87 @@ def my_matvec(
                 for col in range(cols)
             ]
         else:
+            # 0, not a dead A_bstride: the step still reaches the BD's 20-bit granule field.
             A_taps_coalesced = [
-                coalesced_tap(L3_A_ty, col * (M // cols) * K, A_split, 0, A_bstride,
+                coalesced_tap(L3_A_ty, col * (M // cols) * K, A_split, 0,
+                              A_bstride if n_matrices > 1 else 0,
                               *((1, n_matrices) if group_reuse else (None, None)))
                 for col in range(cols)
             ]
-        C_taps_coalesced = [
-            coalesced_tap(L3_C_ty, col * (M // cols), C_split,
-                          0 if group_reuse else C_bstride,
-                          C_bstride if group_reuse else batch_group * C_bstride,
-                          *((1, num_batches) if group_reuse else (None, None)))
-            for col in range(cols)
-        ]
+        if group_reuse:
+            # C must follow the CORE's emission order, which is tile-major and batch-MINOR: the
+            # core acquires n_vec C objects INSIDE the tile loop and fills one per batch before
+            # advancing the tile. A batch-major tap transposes that -- object (tile t, batch b)
+            # lands where (b, t) belongs, leaving only the b == t diagonal correct.
+            # Only expressible while the GROUP dim is dead. The core loops group -> tile ->
+            # batch-in-group, so the general tap needs [n_matrices, n_tiles, n_vec, <tile>],
+            # which overflows the 4-D descriptor once a C tile itself needs a wrap split.
+            # n_matrices == 1 collapses the group dim; n_tiles == 1 makes the order moot.
+            assert n_matrices == 1 or n_tiles == 1, (
+                f"coalesced group-reuse GEMV needs batch_group == num_batches (one matrix) or a "
+                f"single C tile: got num_batches={num_batches} batch_group={batch_group} "
+                f"(n_matrices={n_matrices}) with n_tiles={n_tiles}"
+            )
+            m_split = split_run(m_output)
+            assert m_split is not None, (
+                f"coalesced group-reuse GEMV: no wrap-legal split for one C tile "
+                f"({m_output} elements)"
+            )
+            C_taps_coalesced = [
+                coalesced_tap(L3_C_ty, col * (M // cols), m_split,
+                              m_output, C_bstride, n_tiles, num_batches)
+                for col in range(cols)
+            ]
+        else:
+            C_taps_coalesced = [
+                coalesced_tap(L3_C_ty, col * (M // cols), C_split,
+                              C_bstride, batch_group * C_bstride, None, None)
+                for col in range(cols)
+            ]
 
-    def sequence(A, B, C, B_L3L1_fifos_prods, A_L3L1_fifos_prods, C_L1L3_fifos_conss):
+    _PROLOGUE_MODE = {"off": 0, "on": 1, "residual": 2}
+
+    def _sequence_body(A, B, X, GainA, GainB, C, X1, B_L3L1_fifos_prods, A_L3L1_fifos_prods,
+                       C_L1L3_fifos_conss, X1_L1L3_fifo_cons):
+        if runtime_m:
+            sync_parameters()
+            for i in range(cols):
+                barriers[i].set(1)
+        if tiles_rtp:
+            for i in range(cols):
+                tiles_rtps[i][0] = n_tiles
+                if prologue_capability != "none":
+                    tiles_rtps[i][1] = _PROLOGUE_MODE[prologue]
+                barriers[i].set(1)
+        if runtime_k:
+            for i in range(cols):
+                k_rtps[i][0] = K
+                barriers[i].set(1)
         tg_b = TaskGroup()
         for col in range(cols):
-            # Simple linear transfer of B, includes all batches in sequence
+            # Simple linear transfer of B, includes all batches in sequence. Under "residual" this
+            # slot is the ATTENTION OUTPUT (o), not the residual stream (x) -- see the object-order
+            # comment in my_matvec's PROLOGUE block.
             B_L3L1_fifos_prods[col].fill(B, B_tap, group=tg_b)
+            if prologue == "on":
+                # Second object: the gain, over the SAME channel -- a core has only 2 input DMA
+                # channels and both are already A and B (mv_quant.cc's own comment on why the
+                # quant scale rides in A rather than a 3rd fifo; this is the same budget). Any
+                # further objects up to the family's capability are dummy-refilled from B_tap.
+                B_L3L1_fifos_prods[col].fill(GainA, Gain_tap, group=tg_b)
+                for _ in range(b_acquire_n - 2):
+                    B_L3L1_fifos_prods[col].fill(B, B_tap, group=tg_b)
+            elif prologue == "off":
+                # The core still acquires the family's full object count (one compiled body,
+                # shared with "on"/"residual" instances) but its "off" branch never reads past
+                # object 0 -- refill B's own tap for every remaining object rather than add real
+                # arguments this instance has no use for.
+                for _ in range(b_acquire_n - 1):
+                    B_L3L1_fifos_prods[col].fill(B, B_tap, group=tg_b)
+            elif prologue == "residual":
+                B_L3L1_fifos_prods[col].fill(X, X_tap, group=tg_b)
+                B_L3L1_fifos_prods[col].fill(GainA, GainA_tap, group=tg_b)
+                B_L3L1_fifos_prods[col].fill(GainB, GainB_tap, group=tg_b)
         # Coalesced: one iterated BD per column covers all batches (num_waits==1, a
         # single drain wait for the whole column). Fallback (incl. num_batches==1): the
         # stock per-batch unroll (num_waits==num_batches, one wait per batch). The fills
@@ -708,16 +1112,55 @@ def my_matvec(
                     )
             tg_ac.finish()
         tg_b.finish()
+        # x1 out: one object, column 0 only, one drain per dispatch (not per output tile -- this
+        # is the residual stream, not a matvec row range).
+        if prologue == "residual":
+            tg_x1 = TaskGroup()
+            X1_L1L3_fifo_cons.drain(X1, X1_tap, group=tg_x1, wait=True)
+            tg_x1.finish()
+
+    # Extra real Program arguments are per-mode: "on" takes one gain, "residual" takes the
+    # residual stream and both its gains plus the x1 output; "off"/"none" take none (their
+    # dummy-refills need no argument at all). Three thin wrappers rather than default parameters:
+    # the Runtime's arg-type list below must match each sequence's arity exactly, and that list
+    # differs between the three cases.
+    # X1_L1L3's CONS endpoint must be bound (i.e. `.cons()` called) whenever the FIFO exists at
+    # all -- device_body's tile discovery walks every declared ObjectFifo and requires both
+    # endpoints regardless of whether a given instance's sequence ever fills/drains it -- so an
+    # "on"/"off" instance sharing "residual" capability takes the handle as a trailing arg it never
+    # touches, rather than skipping the call and leaving the fifo half-wired.
+    _x1_cons_arg = [[X1_L1L3_fifo.cons()]] if prologue_capability == "residual" else []
+    if prologue == "on":
+        def sequence(A, B, Gain, C, B_L3L1_fifos_prods, A_L3L1_fifos_prods, C_L1L3_fifos_conss,
+                    *x1_unused):
+            _sequence_body(A, B, None, Gain, None, C, None, B_L3L1_fifos_prods,
+                          A_L3L1_fifos_prods, C_L1L3_fifos_conss, None)
+    elif prologue == "residual":
+        def sequence(A, B, X, GainA, GainB, C, X1, B_L3L1_fifos_prods, A_L3L1_fifos_prods,
+                    C_L1L3_fifos_conss, X1_L1L3_fifos_conss):
+            _sequence_body(A, B, X, GainA, GainB, C, X1, B_L3L1_fifos_prods,
+                          A_L3L1_fifos_prods, C_L1L3_fifos_conss, X1_L1L3_fifos_conss[0])
+    else:
+        def sequence(A, B, C, B_L3L1_fifos_prods, A_L3L1_fifos_prods, C_L1L3_fifos_conss,
+                    *x1_unused):
+            _sequence_body(A, B, None, None, None, C, None, B_L3L1_fifos_prods,
+                          A_L3L1_fifos_prods, C_L1L3_fifos_conss, None)
 
     rt = Runtime(
         sequence,
         [
             L3_A_ty,
             L3_B_ty,
-            L3_C_ty,
+        ]
+        + ([L3_Gain_ty] if prologue == "on" else [])
+        + ([L3_X_ty, L3_GainA_ty, L3_GainB_ty] if prologue == "residual" else [])
+        + [L3_C_ty]
+        + ([L3_X1_ty] if prologue == "residual" else [])
+        + [
             [of.prod() for of in B_L3L1_fifos],
             [of.prod() for of in A_L3L1_fifos],
             [of.cons() for of in C_L1L3_fifos],
-        ],
+        ]
+        + _x1_cons_arg,
     )
     return Program(dev, rt, workers=workers).resolve_program()

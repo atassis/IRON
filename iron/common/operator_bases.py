@@ -64,6 +64,9 @@ class ChanneledUnaryOperator(MLIROperator):
     num_aie_columns: int
     num_channels: int
     tile_size: int
+    # Per-core buffer allocation strategy ('basic-sequential' or 'bank-aware'), forwarded to each
+    # Worker -- see GEMM's twin field (iron/operators/gemm/op.py) for the measurement this mirrors.
+    allocation_scheme: str | None = field(default=None, repr=False)
     context: AIEContext | None = field(default=None, repr=False)
 
     kernel_name: ClassVar[str]
@@ -134,6 +137,7 @@ class ChanneledUnaryOperator(MLIROperator):
                 self.operator_dir.parent / "channeled_unary_design.py",
                 "channeled_unary_design",
                 tuple(callback_args),
+                {"allocation_scheme": self.allocation_scheme},
             ),
         )
 
@@ -182,6 +186,9 @@ class BinaryElementwiseOperator(MLIROperator):
     size: int
     tile_size: int
     num_aie_columns: int = 8
+    # Per-core buffer allocation strategy ('basic-sequential' or 'bank-aware'), forwarded to each
+    # Worker -- see GEMM's twin field (iron/operators/gemm/op.py) for the measurement this mirrors.
+    allocation_scheme: str | None = field(default=None, repr=False)
     context: AIEContext | None = field(default=None, repr=False)
 
     kernel_name: ClassVar[str]
@@ -245,6 +252,7 @@ class BinaryElementwiseOperator(MLIROperator):
                 self.operator_dir.parent / "binary_elementwise_design.py",
                 "binary_elementwise_design",
                 tuple(callback_args),
+                {"allocation_scheme": self.allocation_scheme},
             ),
         )
 

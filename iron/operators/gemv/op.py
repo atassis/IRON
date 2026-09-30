@@ -71,6 +71,48 @@ class GEMV(MLIROperator):
     # stable, matching the epilogue field's convention.
     weight_dtype: str = field(default="bf16", repr=False)
     group_size: int = field(default=0, repr=False)
+    # Per-core buffer allocation strategy ('basic-sequential' or 'bank-aware'), forwarded to each
+    # Worker. None leaves the compiler default (bank-aware first, falling back to basic-sequential
+    # on failure) -- see GEMM's twin field for the measurement this mirrors. Not yet measured for
+    # GEMV specifically (M=1 decode shapes have a much smaller buffer footprint than batched
+    # prefill's GEMM, so bank-aware may actually succeed here) -- mechanism only, no policy change.
+    allocation_scheme: str | None = field(default=None, repr=False)
+    # Byte layout of a quantized row -- see iron/common/quant.py. "header_first" (default) is
+    # unchanged; "row_group_planar" moves the per-row scale out of the row, which is what stops
+    # g64 from being punished to a 128-bit load at K=3840 (Gemma-4-12B's shipped shape) -- see
+    # quant.max_legal_vec_size's docstring for the mechanism. Meaningless at weight_dtype="bf16".
+    layout: str = field(default="header_first", repr=False)
+    # Rows per planar block, only under layout="row_group_planar". None (default) means DERIVE:
+    # self-derived in __post_init__ against this design's own tile_size_input, per K022 -- a
+    # hand-picked value is silently over L1 (two sessions independently picked 8; every Gemma-4
+    # quantized GEMV site needs 4 and overruns at 8 by 9-28 KB), so nothing here should choose it.
+    row_group: int | None = field(default=None, repr=False)
+    # Stored width of the per-group scale. mv_quant.cc casts it to bfloat16 before the MAC either
+    # way, so "f32" spends 2 B/group the core discards -- 1 bit/weight at int4 g32. The kernel
+    # reads the narrow header only when built -DSCALE_BF16=1, so this is a design-key axis.
+    scale_dtype: str = field(default="f32", repr=False)
+    # Per-dispatch int32 ScratchpadParameter naming how many output rows to COMPUTE; None (the
+    # default) computes all M and is byte for byte the pre-existing design. Decode attention reads
+    # the `sm_mask` slot the softmax already drives. See design.py's RUNTIME ROW EXTENT block.
+    vector_size_parameter: str | None = field(default=None, repr=False)
+    # Tile count per core from an RTP the sequence writes (design.py, TILE COUNT FROM THE SEQUENCE).
+    tiles_rtp: bool = field(default=False, repr=False)
+    # Fused RMSNorm / residual-add-and-norm prologue on B, run redundantly on every core before
+    # its own row tiles (gemma4-12b-decode-map.md S6, variant B). "none" (default) leaves B
+    # untouched, byte for byte. "off"/"on"/"residual" are RUNTIME modes of ONE compiled core body
+    # sized by `prologue_capability` (see design.py's PROLOGUE block), which is what lets a device
+    # merging several GEMVs (MERGE_WEIGHT_GEMVS) mix them on ONE device: "on" needs one extra
+    # `gain` argument, "residual" needs the residual stream plus two gains and an extra x1 output
+    # ("off" dummy-refills B instead of any of them). Needs tiles_rtp=True, whose barrier/RTP
+    # channel this shares.
+    prologue: str = field(default="none", repr=False)
+    # "auto" (default) derives the compiled capability from `prologue` itself (off/on -> "prenorm",
+    # residual -> "residual"). Set explicitly to force a WIDER capability than this instance's own
+    # mode needs, so every member of a merged family compiles the same core body -- e.g. Wqkv
+    # stays prologue="on" but takes prologue_capability="residual" once any sibling in its family
+    # needs the residual prologue.
+    prologue_capability: str = field(default="auto", repr=False)
+    prologue_epsilon: float = field(default=1e-6, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -125,6 +167,22 @@ class GEMV(MLIROperator):
                 f"unknown weight_dtype {self.weight_dtype!r} (expected 'bf16', 'int4', 'int8', "
                 f"'int4a' or 'int8a')"
             )
+        if self.layout not in ("header_first", "row_group_planar"):
+            raise ValueError(
+                f"unknown layout {self.layout!r} (expected 'header_first' or 'row_group_planar')"
+            )
+        if self.layout == "row_group_planar" and self.weight_dtype == "bf16":
+            raise ValueError("layout='row_group_planar' needs weight_dtype != 'bf16'")
+        if self.layout == "header_first" and self.row_group is not None:
+            raise ValueError("row_group is only meaningful under layout='row_group_planar'")
+        if self.row_group is not None and self.row_group < 1:
+            raise ValueError(f"row_group ({self.row_group}) must be >= 1")
+        if self.scale_dtype not in ("f32", "bf16"):
+            raise ValueError(
+                f"unknown scale_dtype {self.scale_dtype!r} (expected 'f32' or 'bf16')"
+            )
+        if self.scale_dtype != "f32" and self.weight_dtype == "bf16":
+            raise ValueError("scale_dtype is only meaningful for a quantized weight_dtype")
         if self.weight_dtype != "bf16":
             if self.epilogue != "none":
                 # Untested combination, not a hardware conflict -- narrow scope until a caller
@@ -147,18 +205,58 @@ class GEMV(MLIROperator):
             # rather than making every caller know the rule; the width is in the object name, so
             # the result is visible rather than silent.
             from iron.common.quant import max_legal_vec_size
-            legal = max_legal_vec_size([self.K], self.group_size, self.weight_dtype)
+            if self.layout == "row_group_planar":
+                from iron.common.quant import derive_row_group
+                if self.row_group is None:
+                    # The provisional target is the docstring's own claim: once the row is
+                    # correctly derived, planar always reaches min(cap, group_size) -- confirmed
+                    # by the max_legal_vec_size call right below, not assumed here.
+                    from iron.common.quant import widest_chunk
+                    provisional_vec = widest_chunk(self.group_size, self.weight_dtype,
+                                                   cap=self.kernel_vector_size)
+                    object.__setattr__(self, "row_group", derive_row_group(
+                        [self.K], self.group_size, self.weight_dtype,
+                        vec_size=provisional_vec, max_rows=self.tile_size_input,
+                        scale_dtype=self.scale_dtype))
+                # K008: a planar block cannot be cut -- row i's payload and its header sit
+                # row_group*payload apart -- so the L1 tile must be a whole number of blocks.
+                if self.tile_size_input % self.row_group != 0:
+                    raise ValueError(
+                        f"row_group_planar needs tile_size_input ({self.tile_size_input}) to be "
+                        f"a multiple of row_group ({self.row_group}): raise tile_size_input to a "
+                        f"multiple of {self.row_group}, or pick a group whose row stride needs a "
+                        f"smaller block"
+                    )
+                legal = max_legal_vec_size([self.K], self.group_size, self.weight_dtype,
+                                            scale_dtype=self.scale_dtype,
+                                            layout=self.layout, row_group=self.row_group)
+            else:
+                legal = max_legal_vec_size([self.K], self.group_size, self.weight_dtype,
+                                            scale_dtype=self.scale_dtype)
             if self.kernel_vector_size > legal:
                 object.__setattr__(self, "kernel_vector_size", legal)
-            if self.group_size % self.kernel_vector_size != 0:
+            if not (self.group_size % self.kernel_vector_size == 0
+                    or self.kernel_vector_size == 2 * self.group_size):
                 raise ValueError(
-                    f"group_size={self.group_size} must be a multiple of kernel_vector_size="
-                    f"{self.kernel_vector_size}"
+                    f"kernel_vector_size={self.kernel_vector_size} must divide group_size="
+                    f"{self.group_size} or be exactly twice it"
                 )
             if self.num_batches != 1:
                 raise NotImplementedError(
                     "GEMV weight_dtype != 'bf16' does not support num_batches>1 yet"
                 )
+        if self.prologue not in ("none", "off", "on", "residual"):
+            raise ValueError(
+                f"unknown prologue {self.prologue!r} (expected 'none', 'off', 'on' or 'residual')"
+            )
+        if self.prologue_capability not in ("auto", "none", "prenorm", "residual"):
+            raise ValueError(f"unknown prologue_capability {self.prologue_capability!r}")
+        if self.prologue == "residual" and self.prologue_capability not in ("auto", "residual"):
+            raise ValueError("prologue='residual' needs prologue_capability in ('auto', 'residual')")
+        # NOT "prologue implies tiles_rtp=True" here: unify_weight_gemvs builds a family with
+        # tiles_rtp still False and turns it on afterward via dataclasses.replace, same as it
+        # already does for tile_size_input/output. design.py's my_matvec asserts it instead, once
+        # tiles_rtp is final.
 
         MLIROperator.__init__(self, context=self.context)
 
@@ -173,6 +271,10 @@ class GEMV(MLIROperator):
             base = f"{base}_epi{self.epilogue}"
         if self.weight_dtype != "bf16":
             base = f"{base}_wdt{self.weight_dtype}g{self.group_size}"
+            if self.layout == "row_group_planar":
+                base = f"{base}_planar{self.row_group}"
+            if self.scale_dtype != "f32":
+                base = f"{base}_s{self.scale_dtype}"
         # A windowed read is a DIFFERENT design from the plain GEMV of the same M: same compute
         # extent, different buffer size and per-matrix stride. Without this they collide in the
         # build dir and a cached plain build silently satisfies the windowed op. alloc_M == M is
@@ -184,7 +286,22 @@ class GEMV(MLIROperator):
             base = f"{base}_blk{self.block_size}"
         if self.barrier_chunk != 1:
             base = f"{base}_bc{self.barrier_chunk}"
+        # A different core program at the same shape.
+        if self.vector_size_parameter is not None:
+            base = f"{base}_rtm{self.vector_size_parameter}"
+        if self.tiles_rtp:
+            base = f"{base}_trtp"
+        if self.prologue != "none":
+            base = f"{base}_pro{self.prologue}_cap{self._resolved_prologue_capability}"
         return base
+
+    @property
+    def _resolved_prologue_capability(self):
+        """`prologue_capability` with "auto" resolved -- what design.py itself would derive."""
+        if self.prologue_capability != "auto":
+            return self.prologue_capability
+        return {"none": "none", "off": "prenorm", "on": "prenorm",
+               "residual": "residual"}[self.prologue]
 
     def design_key(self):
         """Every argument that reaches design.py, so two GEMVs sharing this key emit the same MLIR.
@@ -200,8 +317,14 @@ class GEMV(MLIROperator):
             self.tile_size_input, self.tile_size_output,
             self.num_batches, self.batch_group,
             self.epilogue, self.weight_dtype, self.group_size,
+            self.layout, self.row_group, self.scale_dtype,
             self.alloc_M, self.kernel_vector_size, self.barrier_chunk,
-            self.block_size,
+            self.block_size, self.vector_size_parameter, self.tiles_rtp,
+            # The resolved CAPABILITY, not the mode: "off"/"on"/"residual" under the SAME
+            # capability compile the identical core body (design.py), so instances differing only
+            # in prologue mode are the same design; different capabilities are NOT (2 vs 4 B
+            # objects), so this must distinguish them even though both have prologue != "none".
+            self._resolved_prologue_capability,
             self._kernel_link_file,
         ))
 
@@ -224,7 +347,10 @@ class GEMV(MLIROperator):
         if self.epilogue != "none":
             return f"gemv_{self.K}k_{self.kernel_vector_size}vs_{self.epilogue}_kernels.a"
         if self.weight_dtype != "bf16":
-            return f"gemv_{self.K}k_{self.kernel_vector_size}vs_{self.weight_dtype}g{self.group_size}.o"
+            suffix = f"_planar{self.row_group}" if self.layout == "row_group_planar" else ""
+            suffix += "" if self.scale_dtype == "f32" else f"_s{self.scale_dtype}"
+            return (f"gemv_{self.K}k_{self.kernel_vector_size}vs_{self.weight_dtype}"
+                    f"g{self.group_size}{suffix}.o")
         return f"gemv_{self.K}k_{self.kernel_vector_size}vs{self._rowbatch_tag}.o"
 
     def get_mlir_artifact(self):
@@ -251,16 +377,36 @@ class GEMV(MLIROperator):
                     "epilogue": self.epilogue,
                     "weight_dtype": self.weight_dtype,
                     "group_size": self.group_size,
+                    "scale_dtype": self.scale_dtype,
                     "alloc_M": self.alloc_M,
                     "barrier_chunk": self.barrier_chunk,
                     "block_size": self.block_size,
+                    "allocation_scheme": self.allocation_scheme,
+                    "vector_size_parameter": self.vector_size_parameter,
+                    "tiles_rtp": self.tiles_rtp,
+                    "prologue": self.prologue,
+                    "prologue_capability": self.prologue_capability,
+                    "prologue_epsilon": self.prologue_epsilon,
                 },
             ),
         )
 
     def get_kernel_artifacts(self):
         if self.weight_dtype != "bf16":
-            return [
+            extra_flags = [
+                f"-DDIM_K={self.K}",
+                f"-DVEC_SIZE={self.kernel_vector_size}",
+                f"-DGROUP_SIZE={self.group_size}",
+                # Emit only this dtype's wrapper -- all four instantiate otherwise, and
+                # their static_asserts fire on instantiation, so one VEC_SIZE would have
+                # to be legal for every dtype at once.
+                f"-DQUANT_EMIT_{self.weight_dtype.upper()}=1",
+            ]
+            if self.layout == "row_group_planar":
+                extra_flags += [f"-DPLANAR=1", f"-DROW_GROUP={self.row_group}"]
+            if self.scale_dtype == "bf16":
+                extra_flags.append("-DSCALE_BF16=1")
+            objs = [
                 KernelObjectArtifact(
                     self._kernel_link_file,
                     dependencies=[
@@ -268,17 +414,24 @@ class GEMV(MLIROperator):
                             self.context.base_dir / "aie_kernels" / "generic" / "mv_quant.cc"
                         )
                     ],
-                    extra_flags=[
-                        f"-DDIM_K={self.K}",
-                        f"-DVEC_SIZE={self.kernel_vector_size}",
-                        f"-DGROUP_SIZE={self.group_size}",
-                        # Emit only this dtype's wrapper -- all four instantiate otherwise, and
-                        # their static_asserts fire on instantiation, so one VEC_SIZE would have
-                        # to be legal for every dtype at once.
-                        f"-DQUANT_EMIT_{self.weight_dtype.upper()}=1",
-                    ],
+                    extra_flags=extra_flags,
                 )
             ]
+            if self.prologue != "none":
+                # A separate object, not an archive: RMSNorm's own `weighted` variant links
+                # rms_norm.o alongside mul.o the same way (op.py's get_kernel_artifacts).
+                objs.append(
+                    KernelObjectArtifact(
+                        "rms_norm.o",
+                        dependencies=[
+                            SourceArtifact(
+                                self.context.base_dir / "aie_kernels" / get_kernel_dir()
+                                / "rms_norm.cc"
+                            )
+                        ],
+                    )
+                )
+            return objs
         matvec_obj = KernelObjectArtifact(
             f"gemv_{self.K}k_{self.kernel_vector_size}vs{self._rowbatch_tag}.o",
             dependencies=[
@@ -334,16 +487,30 @@ class GEMV(MLIROperator):
         else:
             from iron.common.quant import row_stride_bytes
 
-            stride = row_stride_bytes(self.K, self.group_size, self.weight_dtype)
+            stride = row_stride_bytes(self.K, self.group_size, self.weight_dtype,
+                                      self.scale_dtype)
             # Flat byte buffer (int8-typed purely so the emitted shim BDs type as `i8`, matching
             # decode_ddr_bytes.py's parser): M rows of `stride` packed bytes each, row layout in
             # quant.py. num_batches is asserted ==1 for a non-bf16 weight_dtype in __post_init__.
             matrix_spec = AIERuntimeArgSpec("in", a_batch_dim + (self.M * stride,), dtype=np.int8)
-        return [
+        specs = [
             matrix_spec,  # matrix (A)
             AIERuntimeArgSpec("in", batch_dim + (self.K,)),  # vector (B, always bf16)
-            AIERuntimeArgSpec("out", batch_dim + (self.M,)),  # output (C, always bf16)
         ]
+        if self.prologue == "on":
+            # "off" never binds this: its sequence dummy-refills B instead (design.py).
+            specs.append(AIERuntimeArgSpec("in", (self.K,)))  # gain
+        if self.prologue == "residual":
+            # order matches design.py's Program arg list: B above is `o`, then x and both gains.
+            specs += [
+                AIERuntimeArgSpec("in", (self.K,)),  # x (residual stream)
+                AIERuntimeArgSpec("in", (self.K,)),  # gain_a (post-attn-norm)
+                AIERuntimeArgSpec("in", (self.K,)),  # gain_b (pre-ffn-norm)
+            ]
+        specs.append(AIERuntimeArgSpec("out", batch_dim + (self.M,)))  # output (C, always bf16)
+        if self.prologue == "residual":
+            specs.append(AIERuntimeArgSpec("out", (self.K,)))  # x1, column 0 only
+        return specs
 
     def reference(self, A, B):
         """CPU reference: (optionally batched) matrix-vector product."""

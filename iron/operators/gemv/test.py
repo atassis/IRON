@@ -11,6 +11,7 @@ from iron.common.quant import quantize_weight, dequantize_weight
 from iron.operators.gemv.reference import (
     generate_golden_reference,
     generate_golden_reference_batched,
+    generate_golden_reference_grouped,
     generate_golden_reference_windowed,
     gelu_tanh_approx,
 )
@@ -445,3 +446,49 @@ def test_gemv_shipped_decode_scores_shapes_fit_l1(name, K, num_batches, batch_gr
         aie_utils.get_current_device(), 8, 2048, K, 4, 256,
         num_batches=num_batches, batch_group=batch_group,
     )
+
+
+def test_runtime_extent_leaves_the_operands_alone():
+    """The parameter bounds the ROWS COMPUTED, never the allocation."""
+    plain = GEMV(M=1024, K=512, num_aie_columns=8, tile_size_input=1, tile_size_output=8)
+    rtp = GEMV(M=1024, K=512, num_aie_columns=8, tile_size_input=1, tile_size_output=8,
+               vector_size_parameter="sm_mask")
+    assert [s.shape for s in rtp.get_arg_spec()] == [s.shape for s in plain.get_arg_spec()]
+
+
+def test_runtime_extent_does_not_share_a_name_or_design_key():
+    plain = GEMV(M=1024, K=512, num_aie_columns=8, tile_size_input=1, tile_size_output=8)
+    rtp = GEMV(M=1024, K=512, num_aie_columns=8, tile_size_input=1, tile_size_output=8,
+               vector_size_parameter="sm_mask")
+    assert plain.name != rtp.name and plain.design_key() != rtp.design_key()
+    assert rtp.name.endswith("_rtmsm_mask")
+
+
+# BLOCKED storage under GROUP REUSE, against a golden. Blocking reorders the same bytes and
+# coalescing only changes how they are delivered, so both arms owe the same numbers -- which is
+# the invariant, and it had no test: no parametrization anywhere passes `block_size`, and
+# `generate_golden_reference_grouped` was written and never used.
+#
+# The shape is gemma4-12b's global decode scores GEMV (K=512, gqa=16 so num_batches=batch_group=
+# MAX_GROUP_REUSE, 8 columns) at the smallest M where blocking FLIPS coalescing on, which is what
+# the shipped `sckt` arm does: flat, the per-column A run has no wrap-legal split and coalescing
+# is off; blocked, it fits and turns on.
+@pytest.mark.parametrize("block_size", [None, 256, 512])
+def test_blocked_group_reuse_matches_the_grouped_golden(block_size, aie_context):
+    M, K, cols, num_batches, batch_group = 8192, 512, 8, MAX_GROUP_REUSE, MAX_GROUP_REUSE
+    A, B, C = generate_golden_reference_grouped(
+        M=M, K=K, num_batches=num_batches, batch_group=batch_group
+    )
+    kw = dict(M=M, K=K, num_aie_columns=cols, tile_size_input=4, tile_size_output=256,
+              num_batches=num_batches, batch_group=batch_group, context=aie_context)
+    if block_size is not None:
+        kw["block_size"] = block_size
+    operator = GEMV(**kw)
+    errors, _latency_us, _bandwidth_gbps = run_test(
+        operator,
+        {"matrix": A.flatten(), "vector": B.flatten()},
+        {"output": C.flatten()},
+        rel_tol=0.04,
+        abs_tol=1e-3,
+    )
+    assert not errors, f"blocked={block_size} GEMV disagrees with the golden: {errors}"

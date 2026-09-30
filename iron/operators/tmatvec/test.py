@@ -103,3 +103,94 @@ def test_tmatvec_reduces_down_the_rows(
     )
     print(f"\nLatency: {latency_us:.1f} us  Bandwidth: {bandwidth_gbps:.3f} GB/s\n")
     assert not errors, f"transposed matvec failed: {errors}"
+
+
+def test_m_chunk_must_divide_M():
+    with pytest.raises(ValueError, match="m_chunk"):
+        TMatVec(M=512, K=2048, num_aie_columns=1, num_batches=16, batch_group=16, m_chunk=100)
+
+
+def test_m_chunk_unblocks_the_global_attention_geometry():
+    """Gemma-4-12B's global layers: head_dim 512, one kv head, gqa_group 16.
+
+    Unchunked this fits at NO rows_per_chunk and no context length -- `C+acc` is 65536 B, the whole
+    L1, with no K term. Chunking the output moves that floor and lets W stream per K-chunk.
+    """
+    with pytest.raises(ValueError, match="does not fit L1"):
+        TMatVec(M=512, K=6912, num_aie_columns=1, num_batches=16, batch_group=16, rows_per_chunk=16)
+    TMatVec(
+        M=512, K=6912, num_aie_columns=1, num_batches=16, batch_group=16,
+        rows_per_chunk=16, m_chunk=256,
+    )
+
+
+def test_m_chunk_footprint_does_not_carry_K():
+    """The property the long-context ceiling needs: L1 identical at 2048 and 262144.
+
+    Unchunked, W is `batch_group*K` and grows without bound; the shipped S=6912 already needs
+    221184 B for it alone. Chunked, no term carries K at all.
+    """
+    from iron.operators.tmatvec.design import l1_footprint_bytes
+
+    at = [l1_footprint_bytes(512, K, 16, 16, 256) for K in (2048, 6912, 32768, 262144)]
+    assert len(set(at)) == 1, at
+    assert l1_footprint_bytes(512, 262144, 16, 16) > 65536 * 100, "unchunked must still blow up"
+
+
+def test_the_fit_error_names_m_chunk_when_rows_per_chunk_cannot_help():
+    from iron.operators.tmatvec.design import check_l1_fits, largest_fitting_m_chunk
+
+    msg = check_l1_fits(M=512, K=6912, batch_group=16, rows_per_chunk=64)
+    assert "cannot help" in msg and "m_chunk=" in msg, msg
+    assert largest_fitting_m_chunk(M=512, K=6912, batch_group=16, rows_per_chunk=16) == 256
+
+
+def test_m_chunk_does_not_share_a_cache_key_or_kernel_width():
+    """It changes the core program, the fifo depths and all three access patterns."""
+    base = dict(M=512, K=2048, num_aie_columns=1, num_batches=16, batch_group=16)
+    chunked = TMatVec(**base, rows_per_chunk=16, m_chunk=128)
+    assert "mc128" in chunked.name, chunked.name
+    # DIM_N is the compiled row length, so the object is keyed on the chunk, and an m_chunk=128
+    # slice of M=512 is legitimately the same object as an unchunked M=128 op.
+    assert chunked._kernel_object == "tmv_128n.o", chunked._kernel_object
+
+
+def test_m_chunk_and_block_size_do_not_compose():
+    """Both want all four A access-pattern dims; composing them needs five."""
+    from iron.operators.tmatvec.design import transposed_matvec
+
+    with pytest.raises(AssertionError, match="four A dims"):
+        transposed_matvec(
+            dev=None, cols=1, M=512, K=2048, num_batches=16, batch_group=16,
+            rows_per_chunk=16, m_chunk=128, block_size=512,
+        )
+
+
+def test_unchunked_footprint_is_byte_identical_to_the_validated_build():
+    """Regression guard: 43008 B was read off a real aiecc ld.script at the shipped Qwen3 shape."""
+    from iron.operators.tmatvec.design import l1_footprint_bytes
+
+    assert l1_footprint_bytes(M=128, K=2048, batch_group=2, rows_per_chunk=64) == 43008
+
+
+def test_runtime_extent_leaves_the_operands_alone():
+    """The parameter bounds the REDUCTION, never the allocation: K still sizes W and A."""
+    plain = TMatVec(M=128, K=256, num_aie_columns=1, num_batches=1)
+    rtp = TMatVec(M=128, K=256, num_aie_columns=1, num_batches=1,
+                  vector_size_parameter="sm_mask")
+    assert [s.shape for s in rtp.get_arg_spec()] == [s.shape for s in plain.get_arg_spec()]
+
+
+def test_runtime_extent_does_not_share_a_name_with_the_build_constant_op():
+    """Different core program at the same shape, so a cached plain build must not satisfy it."""
+    plain = TMatVec(M=128, K=256, num_aie_columns=1, num_batches=1)
+    rtp = TMatVec(M=128, K=256, num_aie_columns=1, num_batches=1,
+                  vector_size_parameter="sm_mask")
+    assert plain.name != rtp.name
+    assert rtp.name.endswith("_rtksm_mask")
+
+
+def test_runtime_extent_reaches_the_generator():
+    op = TMatVec(M=128, K=256, num_aie_columns=1, num_batches=1,
+                 vector_size_parameter="sm_mask")
+    assert op.get_mlir_artifact().generator.kwargs["vector_size_parameter"] == "sm_mask"
