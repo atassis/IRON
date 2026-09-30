@@ -40,6 +40,31 @@ def masked_reference(x, widths):
     return torch.softmax(x.masked_fill(~keep, float("-inf")), dim=-1)
 
 
+def masked_reference_hole(x, holes):
+    """CPU reference for the ring mask: a hole in the middle, not a suffix.
+
+    ``holes`` is ``[rows, 3]`` (``hole_lo``, ``hole_hi``, ``width``); row ``i`` is
+    masked on ``[hole_lo, hole_hi)`` and ``[width, cols)`` -- what ``mask_hole_bf16``
+    writes ``-inf`` over before ``softmax_bf16`` runs. See
+    docs/superpowers/specs/2026-09-17-prefill-batch-past-the-sliding-window-design.md sec 1.3.
+    """
+    holes = torch.as_tensor(holes, dtype=torch.long).reshape(-1, 3)
+    if holes.shape[0] != x.shape[0]:
+        raise ValueError(f"expected {x.shape[0]} hole triples, got {holes.shape[0]}")
+    hole_lo, hole_hi, width = holes[:, 0], holes[:, 1], holes[:, 2]
+    if int(width.min()) < 1 or int(width.max()) > x.shape[1]:
+        raise ValueError(f"width must lie in [1, {x.shape[1]}]; got {width.tolist()}")
+    if torch.any(hole_lo < 0) or torch.any(hole_hi > x.shape[1]) or torch.any(hole_lo > hole_hi):
+        raise ValueError(f"hole [hole_lo, hole_hi) must lie in [0, {x.shape[1]}]; got {holes.tolist()}")
+    positions = torch.arange(x.shape[1]).unsqueeze(0)
+    in_hole = (positions >= hole_lo.unsqueeze(1)) & (positions < hole_hi.unsqueeze(1))
+    past_width = positions >= width.unsqueeze(1)
+    keep = ~(in_hole | past_width)
+    if not torch.any(keep, dim=1).all():
+        raise ValueError("a row with every column masked has undefined softmax")
+    return torch.softmax(x.masked_fill(~keep, float("-inf")), dim=-1)
+
+
 def generate_golden_widths(rows: int, cols: int, base: int = 0):
     """Causal widths for a chunk of ``rows`` tokens starting at ``base``.
 

@@ -162,7 +162,7 @@ def test_widths_are_split_across_cores_the_same_way_the_rows_are():
 
 
 def test_an_unknown_source_is_rejected():
-    with pytest.raises(ValueError, match="must be None or 'rows'"):
+    with pytest.raises(ValueError, match="must be None, 'rows' or 'rows_hole'"):
         build(vector_size_source="scalar")
 
 

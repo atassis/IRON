@@ -312,10 +312,93 @@ void acc_rescale_f32(uint32_t n, const float *restrict state, float *restrict ac
         aie::store_v(acc + i, aie::mul(aie::load_v<16>(acc + i), f).to_vector<float>());
 }
 
+// gemma4-weightless-attention-block variant A_g: pack a WORKER core's finished {max, sum} plus its
+// unnormalised f32 context into one drained tile, for a separate merge core to fold. Same shape as
+// taccum_finish_scaled_bf16's (state, acc) -> out, minus the divide and the bf16 narrow: the merge
+// needs the raw max/sum, not a value already normalised against this column's own denominator.
+void taccum_export_partial_f32(uint32_t n, const float *restrict state,
+                               const float *restrict acc, float *restrict out)
+{
+    for (uint32_t i = 0; i < n; i += 16)
+        aie::store_v(out + i, aie::load_v<16>(acc + i));
+    out[n] = state[0];
+    out[n + 1] = state[1];
+}
+
+// Fold one WORKER column's exported partial {max_col, sum_col, acc_col} into a running
+// {state_io, acc_io} -- the same online-softmax combination partial_softmax_f32state_bf16 does
+// per SEGMENT (see that function's derivation), applied across COLUMNS instead of positions.
+// col_partial is (acc_col[n], max_col, sum_col) as taccum_export_partial_f32 lays it out.
+void flash_merge_column(uint32_t n, float *restrict state_io, float *restrict acc_io,
+                        const float *restrict col_partial)
+{
+    const float m_prev = state_io[0];
+    const float l_prev = state_io[1];
+    const float m_col = col_partial[n];
+    const float l_col = col_partial[n + 1];
+    const float m_new = (m_col > m_prev) ? m_col : m_prev;
+
+    // Lane-0-of-a-broadcast exp2, same idiom partial_softmax_f32state_bf16 uses for its own
+    // correction factor -- reusing aie::exp2<bfloat16> here (not expf) keeps this merge on the
+    // SAME coarse SFU LUT the rest of the split-K algebra already accepts, rather than a
+    // differently-rounded scalar path that would silently diverge from it.
+    aie::vector<float, FLASH_SM_VEC_LEN> d_prev = aie::broadcast<float, FLASH_SM_VEC_LEN>(m_prev - m_new);
+    aie::vector<float, FLASH_SM_VEC_LEN> d_col = aie::broadcast<float, FLASH_SM_VEC_LEN>(m_col - m_new);
+    const float corr_prev = (m_prev == -INFINITY) ? 0.0f : (float)aie::exp2<bfloat16>(d_prev)[0];
+    const float corr_col = (m_col == -INFINITY) ? 0.0f : (float)aie::exp2<bfloat16>(d_col)[0];
+
+    state_io[0] = m_new;
+    state_io[1] = l_prev * corr_prev + l_col * corr_col;
+
+    aie::vector<float, 16> cprev_v = aie::broadcast<float, 16>(corr_prev);
+    aie::vector<float, 16> ccol_v = aie::broadcast<float, 16>(corr_col);
+    for (uint32_t i = 0; i < n; i += 16) {
+        aie::accum<accfloat, 16> scaled_prev = aie::mul(aie::load_v<16>(acc_io + i), cprev_v);
+        aie::accum<accfloat, 16> scaled_col = aie::mul(aie::load_v<16>(col_partial + i), ccol_v);
+        aie::store_v(acc_io + i, aie::add(scaled_prev, scaled_col).to_vector<float>());
+    }
+}
+
 void mask_bf16(bfloat16 *inout, const int32 unmasked_size, const int32 total_size)
 {
     // TODO: Optimize this to use vector code
     for (int32 i = unmasked_size; i < total_size; i++) {
+        inout[i] = (bfloat16)(-INFINITY);
+    }
+}
+
+// Same three bodies, offset into a caller's combined [heads][.] buffer. See
+// iron/operators/attn_global_dp/design.py's flash_worker_l1_bytes.
+void mask_bf16_off(bfloat16 *restrict base, int32_t off,
+                   const int32 unmasked_size, const int32 total_size)
+{
+    mask_bf16(base + off, unmasked_size, total_size);
+}
+
+void partial_softmax_f32state_bf16_off(bfloat16 *restrict sc_base, int32_t sc_off,
+                                       bfloat16 *restrict sw_base, int32_t sw_off,
+                                       float *restrict state, const int32_t vector_size)
+{
+    partial_softmax_f32state_bf16(sc_base + sc_off, sw_base + sw_off, state, vector_size);
+}
+
+void acc_rescale_f32_off(uint32_t n, const float *restrict state,
+                         float *restrict acc_base, int32_t acc_off)
+{
+    acc_rescale_f32(n, state, acc_base + acc_off);
+}
+
+// Batched prefill past a sliding-window ring: row i's valid columns are the ring tail
+// [hole_lo, hole_hi) EXCLUDED plus [0, width). See
+// docs/superpowers/specs/2026-09-17-prefill-batch-past-the-sliding-window-design.md sec 1.3.
+void mask_hole_bf16(bfloat16 *inout, const int32 hole_lo, const int32 hole_hi,
+                     const int32 width, const int32 total_size)
+{
+    // TODO: Optimize this to use vector code
+    for (int32 i = hole_lo; i < hole_hi; i++) {
+        inout[i] = (bfloat16)(-INFINITY);
+    }
+    for (int32 i = width; i < total_size; i++) {
         inout[i] = (bfloat16)(-INFINITY);
     }
 }
