@@ -79,6 +79,15 @@ void eltwise_add_offset_a_bf16_vector(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *
     eltwise_vadd<bfloat16, bfloat16>(a_in + a_offset, b_in, c_out, size);
 }
 
+// Same op, but BOTH `a_in` and `b_in` are read starting `ab_offset` elements in -- mirrors
+// mul.cc's `eltwise_mul_offset_ab_bf16_vector` exactly (same template, add instead of multiply).
+// For two full-D buffers whose own D/N output slice sits at the SAME offset in both.
+void eltwise_add_offset_ab_bf16_vector(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out, int size,
+                                        int ab_offset)
+{
+    eltwise_vadd<bfloat16, bfloat16>(a_in + ab_offset, b_in + ab_offset, c_out, size);
+}
+
 // Plain element copy, `size` elements, writing `dst` starting at `dst_offset`. Used once per
 // swiglu_mlp_dp core to reassemble the all-gathered gh vector from misc-fifo chunks smaller than
 // FF. Not vectorized -- called 3x per token (D-sized chunks), nowhere near this design's
@@ -86,6 +95,16 @@ void eltwise_add_offset_a_bf16_vector(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *
 void copy_offset_bf16_vector(bfloat16 *dst, bfloat16 *src, int size, int dst_offset)
 {
     dst += dst_offset;
+    for (int i = 0; i < size; i++) {
+        dst[i] = src[i];
+    }
+}
+
+// Same, but `src` is also offset -- see attn_global_dp/design.py's Q-prefix copy for why.
+void copy_offset_src_bf16_vector(bfloat16 *dst, bfloat16 *src, int size, int src_offset, int dst_offset)
+{
+    dst += dst_offset;
+    src += src_offset;
     for (int i = 0; i < size; i++) {
         dst[i] = src[i];
     }

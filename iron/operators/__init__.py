@@ -16,6 +16,7 @@ _OPERATOR_MODULES = {
     "GEMM": "gemm",
     "GEMV": "gemv",
     "MHA": "mha",
+    "Pointwise": "pointwise",
     "RMSNorm": "rms_norm",
     "RoPE": "rope",
     "SiLU": "silu",
