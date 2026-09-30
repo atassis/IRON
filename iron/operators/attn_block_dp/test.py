@@ -46,6 +46,19 @@ def test_window_parameter_defaults_off_and_is_not_in_the_name():
     assert on.name != plain.name, "a dynamic-window build must not share a name with a plain one"
 
 
+def test_v_norm_defaults_off_and_is_not_in_the_name():
+    """Same invariant as window_parameter above: v_norm=False (the default) must share a build
+    dir with the plain (unspecified) build, and v_norm=True must not."""
+    from iron.operators.attn_block_dp.op import AttnBlockDataParallel
+    common = dict(D=1024, HD=128, Hq=16, Hkv=8, max_seq=4096, num_aie_columns=8,
+                  tile_size_input=4)
+    plain = AttnBlockDataParallel(**common)
+    off = AttnBlockDataParallel(**common, v_norm=False)
+    assert off.name == plain.name
+    on = AttnBlockDataParallel(**common, v_norm=True)
+    assert on.name != plain.name
+
+
 def _extract_core_regions(mlir_text):
     """Every `aie.core(...) { ... }` op body, source order. Brace-matched by hand -- the .mlir
     is text, not a parsed module, and a core body nests its own scf.for/if blocks that also use
@@ -397,6 +410,47 @@ def test_dynamic_window_makes_the_core_trip_count_independent(tmp_path):
         "negative control: a compile-time trip count must still differ under the SAME "
         "normalisation, or the assertion above cannot fail"
     )
+
+
+def test_v_norm_l1_and_dma_cost(tmp_path):
+    """v_norm's marginal cost, checked two ways: the byte formula directly (no compile), then
+    against the emitted MLIR (with compile) to confirm the formula matches what actually places.
+
+    The gain is a compile-time L1 constant, not a stream tile or host argument, so turning it on
+    must add exactly HD*2 bytes to l1_footprint_bytes and ZERO objectFifo declarations (no new
+    shim channel, no new compute-tile DMA channel) -- and one extra `hd_weighted_rms_norm_cols`
+    call per core (v's norm, reusing qk-norm's own symbol).
+    """
+    from iron.operators.attn_block_dp.design import l1_footprint_bytes
+    from iron.operators.attn_block_dp.op import AttnBlockDataParallel
+
+    D, HD, Hq, Hkv, S, tsi, gqa = 1024, 128, 16, 8, 1024, 4, 2
+    tile_elems = tsi * D
+    off_bytes = l1_footprint_bytes(D, HD, gqa, S, tile_elems, 2, 0xD00)
+    on_bytes = l1_footprint_bytes(D, HD, gqa, S, tile_elems, 2, 0xD00, v_norm=True)
+    assert on_bytes - off_bytes == HD * 2
+
+    def build(v_norm):
+        op = AttnBlockDataParallel(
+            D=D, HD=HD, Hq=Hq, Hkv=Hkv, max_seq=S, num_aie_columns=8, tile_size_input=tsi,
+            v_norm=v_norm, context=AIEContext(build_dir=tmp_path / f"vn_{v_norm}"))
+        op.compile()
+        return Path(op.xclbin_artifact.mlir_input.filename).read_text()
+
+    off_text, on_text = build(False), build(True)
+
+    fifo_re = re.compile(r"^\s*aie\.objectfifo @\S+", re.MULTILINE)
+    assert fifo_re.findall(off_text) == fifo_re.findall(on_text), (
+        "v_norm must add no objectFifo -- no shim channel, no compute-tile DMA channel"
+    )
+
+    off_regions, on_regions = _extract_core_regions(off_text), _extract_core_regions(on_text)
+    assert len(off_regions) == len(on_regions) == 8
+    for off_r, on_r in zip(off_regions, on_regions):
+        off_calls = off_r.count("hd_weighted_rms_norm_cols(")
+        on_calls = on_r.count("hd_weighted_rms_norm_cols(")
+        assert off_calls == gqa + 1, f"q heads + k = {gqa + 1} calls expected, got {off_calls}"
+        assert on_calls == off_calls + 1, "v_norm must add exactly one hd-norm call per core"
 
 
 def main():

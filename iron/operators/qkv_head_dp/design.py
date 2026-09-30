@@ -84,9 +84,19 @@ def qkv_head_dp(
     trace_size=0,
     weight_depth=2,
     kv_block_size=None,
+    weight_dtype="bf16",
+    group_size=0,
+    layout="header_first",
+    row_group=None,
+    scale_dtype="f32",
 ):
     """`func_prefix` is not optional once this design is placed in an OperatorSequence -- see
-    gemv/design.py's identical parameter. N = n_aie_cols, one core per column."""
+    gemv/design.py's identical parameter. N = n_aie_cols, one core per column.
+
+    `weight_dtype` (bf16 default) quantizes Wqkv on-core, as GEMV/SwiGLUMLPDataParallel take it
+    (iron/operators/gemv/op.py) -- `group_size`/`layout`/`row_group`/`scale_dtype` are the same
+    axes. Unlike attn_block_dp, this design's weight fifo (`weight_ofs`) never shares a tile with
+    anything else, so quantizing it changes only the tile's byte width, not the channel count."""
     N = n_aie_cols
     tsi = tile_size_input
     QD, KVD = Hq * HD, Hkv * HD
@@ -102,10 +112,17 @@ def qkv_head_dp(
     N_W_TILES = HD // tsi                   # weight tiles per head
     WTILE_ELEMS = tsi * D
 
+    # WROW_BYTES is None at weight_dtype="bf16" (WTILE_ELEMS stays the bf16 element count below).
+    WROW_BYTES = None
+    if weight_dtype != "bf16":
+        from iron.common.quant import row_stride_bytes
+        WROW_BYTES = row_stride_bytes(D, group_size, weight_dtype, scale_dtype)
+
     # L1 budget (64 KB/core), computed rather than assumed -- the same check swiglu_mlp_dp carries.
     L1_BYTES = 65536
     misc_bytes = 3 * (HD * 2)               # depth 3: n_qn, n_kn and ang are held together
-    weight_bytes = weight_depth * (WTILE_ELEMS * 2)
+    weight_bytes = (weight_depth * (tsi * WROW_BYTES) if WROW_BYTES
+                    else weight_depth * (WTILE_ELEMS * 2))
     out_bytes = 2 * (HD * 2)
     persistent_bytes = 3 * (D * 2) + 2 * (HD * 2)   # cur, n_in, hn + raw, normed
     total = misc_bytes + weight_bytes + out_bytes + persistent_bytes + stack_size
@@ -131,13 +148,25 @@ def qkv_head_dp(
 
     D_ty = np.ndarray[(D,), np.dtype[BF16]]
     HD_ty = np.ndarray[(HD,), np.dtype[BF16]]
-    WTILE_ty = np.ndarray[(WTILE_ELEMS,), np.dtype[BF16]]
-    W_L3_ty = np.ndarray[(TOT * D,), np.dtype[BF16]]
+    WTILE_ty = (WROW_BYTES and np.ndarray[(tsi * WROW_BYTES,), np.dtype[np.int8]]
+               or np.ndarray[(WTILE_ELEMS,), np.dtype[BF16]])
+    W_L3_ty = (np.ndarray[(TOT * WROW_BYTES,), np.dtype[np.int8]] if WROW_BYTES
+              else np.ndarray[(TOT * D,), np.dtype[BF16]])
     Q_L3_ty = np.ndarray[(QD,), np.dtype[BF16]]
     KV_L3_ty = np.ndarray[(Hkv * max_seq * HD,), np.dtype[BF16]]
 
     # ---- kernels: one archive, every core plays every role ----
-    CORE_ARCHIVE = f"{func_prefix}qkv_head_dp_core.a"
+    # weight_dtype rides in the archive name too -- see op.py's identical convention (and the bug
+    # its own history records: a bf16 build must never silently link a cached quantized archive).
+    if weight_dtype == "bf16":
+        _archive_tag = ""
+    else:
+        _archive_tag = f"_{weight_dtype}g{group_size}"
+        if layout == "row_group_planar":
+            _archive_tag += f"_planar{row_group}"
+        if scale_dtype != "f32":
+            _archive_tag += f"_s{scale_dtype}"
+    CORE_ARCHIVE = f"{func_prefix}qkv_head_dp_core{_archive_tag}.a"
     copy_kernel = Kernel(
         f"{func_prefix}copy_offset_bf16_vector", CORE_ARCHIVE, [D_ty, HD_ty, np.int32, np.int32]
     )
@@ -154,7 +183,7 @@ def qkv_head_dp(
         [HD_ty, HD_ty, HD_ty, np.float32]
     )
     mv_kernel = Kernel(
-        f"{func_prefix}matvec_vectorized_bf16_bf16", CORE_ARCHIVE,
+        f"{func_prefix}matvec_vectorized_{weight_dtype}_bf16", CORE_ARCHIVE,
         [np.int32, np.int32, WTILE_ty, D_ty, HD_ty],
     )
     rope_kernel = Kernel(
@@ -254,10 +283,17 @@ def qkv_head_dp(
             # ONE fill per core for the whole slice; the fifo hands it to the core in WTILE_ELEMS
             # pieces. Filling per tile instead would be N_W_TILES*HEADS_PER_CORE BDs per core, and
             # small fills are half of why the spatial version lost.
-            weight_ps[c].fill(
-                wqkv, _flat_tap(TOT * D, ROWS_PER_CORE * D, c * ROWS_PER_CORE * D),
-                wait=True, group=tg,
-            )
+            if WROW_BYTES:
+                weight_ps[c].fill(
+                    wqkv, _flat_tap(TOT * WROW_BYTES, ROWS_PER_CORE * WROW_BYTES,
+                                   c * ROWS_PER_CORE * WROW_BYTES),
+                    wait=True, group=tg,
+                )
+            else:
+                weight_ps[c].fill(
+                    wqkv, _flat_tap(TOT * D, ROWS_PER_CORE * D, c * ROWS_PER_CORE * D),
+                    wait=True, group=tg,
+                )
             for h in range(HEADS_PER_CORE):
                 g = c * HEADS_PER_CORE + h
                 kind = head_kind(g)

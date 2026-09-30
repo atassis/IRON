@@ -41,6 +41,17 @@ class QKVHeadDataParallel(MLIROperator):
     tile_size_input: int = 4
     stack_size: int = 0xD00
     kv_offset_parameter: str | None = "kv_off"
+    # Weight-stream format axis, as GEMV/SwiGLUMLPDataParallel take it (iron/operators/gemv/op.py).
+    # bf16 (default) is the byte-for-byte pre-existing path; a quantized dtype dequantizes Wqkv
+    # on-core via mv_quant.cc, same mechanism, same design-key/name/kernel-object rules.
+    weight_dtype: str = field(default="bf16", repr=False)
+    group_size: int = field(default=0, repr=False)
+    layout: str = field(default="header_first", repr=False)
+    row_group: int | None = field(default=None, repr=False)
+    scale_dtype: str = field(default="f32", repr=False)
+    # The dequant chunk width -- GEMV's kernel_vector_size, narrowed the same way in __post_init__.
+    # Meaningless at weight_dtype="bf16", where mv.cc's own VEC_SIZE=64 stays hardcoded.
+    quant_vec_size: int = field(default=64, repr=False)
     # Weight ObjectFifo depth; the L1 budget check in design.py follows it.
     weight_depth: int = field(default=2, repr=False)
     # KV-cache block size (iron.common.kv_layout.KVLayout's T). None (default) is one block ==
@@ -63,7 +74,25 @@ class QKVHeadDataParallel(MLIROperator):
         "kv_offset_parameter": "kvpar",
         "weight_depth": "wd",
         "kv_block_size": "kvblk",
+        "weight_dtype": "wdt",
+        "group_size": "g",
+        "layout": "lay",
+        "row_group": "rg",
+        "scale_dtype": "sdt",
     }
+
+    @property
+    def name(self) -> str:
+        # weight_dtype/group_size/layout/row_group/scale_dtype are repr=False so the default path
+        # keeps its stable name -- mirrors gemv/op.py's identical convention.
+        base = super().name
+        if self.weight_dtype != "bf16":
+            base = f"{base}_wdt{self.weight_dtype}g{self.group_size}"
+            if self.layout == "row_group_planar":
+                base = f"{base}_planar{self.row_group}"
+            if self.scale_dtype != "f32":
+                base = f"{base}_s{self.scale_dtype}"
+        return base
 
     def __post_init__(self):
         heads = self.Hq + 2 * self.Hkv
@@ -82,6 +111,64 @@ class QKVHeadDataParallel(MLIROperator):
                 f"d_model ({self.D}) must be a whole number of head_dim ({self.HD}) chunks -- "
                 "`cur` and `n_in` ride the HD-wide misc channel"
             )
+        if self.weight_dtype not in ("bf16", "int4", "int8", "int4a", "int8a"):
+            raise ValueError(
+                f"unknown weight_dtype {self.weight_dtype!r} (expected 'bf16', 'int4', 'int8', "
+                f"'int4a' or 'int8a')"
+            )
+        if self.layout not in ("header_first", "row_group_planar"):
+            raise ValueError(
+                f"unknown layout {self.layout!r} (expected 'header_first' or 'row_group_planar')"
+            )
+        if self.layout == "row_group_planar" and self.weight_dtype == "bf16":
+            raise ValueError("layout='row_group_planar' needs weight_dtype != 'bf16'")
+        if self.layout == "header_first" and self.row_group is not None:
+            raise ValueError("row_group is only meaningful under layout='row_group_planar'")
+        if self.row_group is not None and self.row_group < 1:
+            raise ValueError(f"row_group ({self.row_group}) must be >= 1")
+        if self.scale_dtype not in ("f32", "bf16"):
+            raise ValueError(
+                f"unknown scale_dtype {self.scale_dtype!r} (expected 'f32' or 'bf16')"
+            )
+        if self.scale_dtype != "f32" and self.weight_dtype == "bf16":
+            raise ValueError("scale_dtype is only meaningful for a quantized weight_dtype")
+        if self.weight_dtype != "bf16":
+            if self.group_size <= 0:
+                raise ValueError("weight_dtype != 'bf16' needs an explicit group_size > 0")
+            if self.D % self.group_size != 0:
+                raise ValueError(
+                    f"D={self.D} must be a whole number of groups (group_size={self.group_size})"
+                )
+            from iron.common.quant import max_legal_vec_size
+            # Same K008 rule GEMV enforces on its own tile_size_input: a planar block cannot be
+            # cut, so the L1 tile (tile_size_input rows) must be a whole number of blocks.
+            if self.layout == "row_group_planar":
+                from iron.common.quant import derive_row_group, widest_chunk
+                if self.row_group is None:
+                    provisional_vec = widest_chunk(self.group_size, self.weight_dtype, cap=64)
+                    object.__setattr__(self, "row_group", derive_row_group(
+                        [self.D], self.group_size, self.weight_dtype,
+                        vec_size=provisional_vec, max_rows=self.tile_size_input,
+                        scale_dtype=self.scale_dtype))
+                if self.tile_size_input % self.row_group != 0:
+                    raise ValueError(
+                        f"row_group_planar needs tile_size_input ({self.tile_size_input}) to be "
+                        f"a multiple of row_group ({self.row_group})"
+                    )
+                legal = max_legal_vec_size([self.D], self.group_size, self.weight_dtype,
+                                            scale_dtype=self.scale_dtype, layout=self.layout,
+                                            row_group=self.row_group)
+            else:
+                legal = max_legal_vec_size([self.D], self.group_size, self.weight_dtype,
+                                            scale_dtype=self.scale_dtype)
+            if self.quant_vec_size > legal:
+                object.__setattr__(self, "quant_vec_size", legal)
+            if not (self.group_size % self.quant_vec_size == 0
+                    or self.quant_vec_size == 2 * self.group_size):
+                raise ValueError(
+                    f"quant_vec_size={self.quant_vec_size} must divide group_size="
+                    f"{self.group_size} or be exactly twice it"
+                )
         MLIROperator.__init__(self, context=self.context)
 
     def get_mlir_artifact(self):
@@ -100,6 +187,11 @@ class QKVHeadDataParallel(MLIROperator):
                     "stack_size": self.stack_size,
                     "n_aie_cols": self.num_aie_columns,
                     "kv_block_size": self.kv_block_size,
+                    "weight_dtype": self.weight_dtype,
+                    "group_size": self.group_size,
+                    "layout": self.layout,
+                    "row_group": self.row_group,
+                    "scale_dtype": self.scale_dtype,
                 },
             ),
         )
@@ -125,10 +217,29 @@ class QKVHeadDataParallel(MLIROperator):
             extra_flags=[f"-DRMS_COLS={self.HD}"],
             prefix_symbols="hd_",
         )
+        # Same collision class as the two rms_norm widths above: -DPLANAR/-DSCALE_BF16 change the
+        # emitted code while the exported symbol stays identical (mv_quant.cc's own contract), so
+        # weight_dtype/layout/scale_dtype all ride in the object NAME -- see gemv/op.py's twin.
+        _qsrc = kdir / "generic" / ("mv.cc" if self.weight_dtype == "bf16" else "mv_quant.cc")
+        _qtag = "" if self.weight_dtype == "bf16" else f"_{self.weight_dtype}g{self.group_size}"
+        if self.weight_dtype != "bf16":
+            if self.layout == "row_group_planar":
+                _qtag += f"_planar{self.row_group}"
+            if self.scale_dtype != "f32":
+                _qtag += f"_s{self.scale_dtype}"
+        _vec = 64 if self.weight_dtype == "bf16" else self.quant_vec_size
+        _qflags = ([] if self.weight_dtype == "bf16"
+                   else [f"-DGROUP_SIZE={self.group_size}",
+                         f"-DQUANT_EMIT_{self.weight_dtype.upper()}=1"])
+        if self.weight_dtype != "bf16":
+            if self.layout == "row_group_planar":
+                _qflags += ["-DPLANAR=1", f"-DROW_GROUP={self.row_group}"]
+            if self.scale_dtype == "bf16":
+                _qflags.append("-DSCALE_BF16=1")
         mv_obj = KernelObjectArtifact(
-            f"gemv_{self.D}k_64vs.o",
-            dependencies=[SourceArtifact(kdir / "generic" / "mv.cc")],
-            extra_flags=[f"-DDIM_K={self.D}", "-DVEC_SIZE=64"],
+            f"gemv_{self.D}k_{_vec}vs{_qtag}.o",
+            dependencies=[SourceArtifact(_qsrc)],
+            extra_flags=[f"-DDIM_K={self.D}", f"-DVEC_SIZE={_vec}"] + _qflags,
         )
         rope_obj = KernelObjectArtifact(
             "rope_0.o",
@@ -137,18 +248,28 @@ class QKVHeadDataParallel(MLIROperator):
         )
         return [
             KernelArchiveArtifact(
-                "qkv_head_dp_core.a",
+                f"qkv_head_dp_core{_qtag}.a",
                 dependencies=[copy_obj, rms_obj, rms_hd_obj, mv_obj, rope_obj],
             )
         ]
 
     def get_arg_spec(self):
         QD, KVD = self.Hq * self.HD, self.Hkv * self.HD
+        TOT = QD + 2 * KVD
         cache = self.Hkv * self.max_seq * self.HD
+        if self.weight_dtype == "bf16":
+            wqkv_spec = AIERuntimeArgSpec("in", (TOT * self.D,))
+        else:
+            import numpy as np
+            from iron.common.quant import row_stride_bytes
+
+            stride = row_stride_bytes(self.D, self.group_size, self.weight_dtype,
+                                      self.scale_dtype)
+            wqkv_spec = AIERuntimeArgSpec("in", (TOT * stride,), dtype=np.int8)
         return [
             AIERuntimeArgSpec("in", (self.D,)),                    # cur
             AIERuntimeArgSpec("in", (self.D,)),                    # n_in
-            AIERuntimeArgSpec("in", ((QD + 2 * KVD) * self.D,)),   # Wqkv, flat [QD+2KVD, D]
+            wqkv_spec,                                             # Wqkv, flat [QD+2KVD, D|stride]
             AIERuntimeArgSpec("in", (self.HD,)),                   # n_qn
             AIERuntimeArgSpec("in", (self.HD,)),                   # n_kn
             AIERuntimeArgSpec("in", (self.HD,)),                   # ang

@@ -81,8 +81,7 @@ count.
 
 NOT AN L2 RESIDENCY CLAIM. Nothing is staged through a MemTile here and nothing needs to be: the
 intermediates are deleted, not relayed. Two decode-side attempts that merely relayed through L2
-measured +0.150 ms and +4.54 ms ([[the-unit-that-costs-is-the-wait-not-the-issue]]) -- L2 pays for
-REUSE, not for relay.
+measured +0.150 ms and +4.54 ms of wait time -- L2 pays for REUSE, not for relay.
 
 WHAT THIS TIES TO L1, AND IT IS NEW. `sc` and `sw` are now core-local, so the attention window S
 costs `2 * gqa * S * 2` bytes of L1 that it did not cost before. At gqa=2 that is 16 KB at S=2048
@@ -93,10 +92,18 @@ INHERITED, NOT INTRODUCED: the K/V cache fills are single BDs against a fifo who
 chunk, which is the shape `tmatvec/design.py` records as a KNOWN DEFECT (correct standalone, racy
 across repeated invocations in one runtime sequence). The shipped graph already runs TMatVec that
 way once per layer; this does not make it worse and does not fix it.
+
+V_NORM (Gemma-4's gainless value RMSNorm) COSTS L1, NOTHING ELSE. It is gainless -- the reference
+drops the learned scale, not the normalise -- so the gain is a compile-time all-ones L1 constant,
+never a stream tile or host argument: +HD*2 bytes per core (512 B at HD=256), +0 shim channels,
++0 of the 2 in/2 out compute-tile DMA channels, +0 host buffer arguments. Off by default; step 5 is
+byte-for-byte what it was before this stage existed.
 """
 
 import aie.dialects.index as index
 import aie.extras.dialects.arith as arith
+from aie import ir
+from aie.dialects import arith as raw_arith, memref
 from aie.dialects.aie import T
 from ml_dtypes import bfloat16
 import math
@@ -127,43 +134,119 @@ def _flat_tap(total, size, offset=0):
     return TensorAccessPattern((1, total), offset, [1, 1, 1, size], [0, 0, 0, 1])
 
 
-def l1_footprint_bytes(D, HD, gqa, L, tile_elems, weight_depth, stack_size):
+def quant_tile_bytes(D, HD, group_size, weight_dtype, scale_dtype, max_seq=None):
+    """THE SHARED-TILE INVARIANT re-derived in BYTES for a quantized Wqkv.
+
+    bf16: `tile_size_input*D == rpc*HD` in ELEMENTS is exact (both sides are bf16, so elements and
+    bytes agree up to the same factor of 2) -- this function is not involved.
+
+    Quantized: a Wqkv row is `[header][payload]` bytes and generally does NOT divide evenly by a
+    bf16 cache row's bytes (Gemma-4's shipped int4 g32 scale-bf16 row is 2160 B against a 512 B
+    HD=256 cache row -- gcd=16, so the exact LCM tile is 69120 B, bigger than all of L1 by itself).
+    The fix is not a wider shared tile, it is a PADDED one: ONE acquire == one padded weight row
+    == `rpc` cache positions, on the SAME per-core fifo, same one input channel it already spends.
+    Padding cost is on Wqkv's own DDR bytes only (rpc*HD*2 - WB extra per row); see the caller's
+    own comment for the measured percentage at Gemma-4's and qwen3's shapes.
+
+    `rpc` has TWO constraints, and covering the row is only the first. The tile is also the unit
+    the cache is walked in (`row_off = i*rpc`, and `SPLIT_CHUNKS = L//rpc`), so `rpc` must DIVIDE
+    max_seq -- the minimum cover is the answer only when it happens to. Gemma-4's sliding geometry
+    is where they part: int4 g32 covers in 5 cache rows and 5 does not divide the 1024 window, so
+    the minimum cover has no legal tiling while rpc=8 does, at 89.6% padding on Wqkv's rows.
+    Passing max_seq=None keeps the bare cover, for a caller that only wants the row's byte size.
+
+    The extent, not a type, is what the DMA object boundary must respect: the fifo's declared
+    object becomes a plain int8[TB] byte buffer, and the cache-consuming kernels (still
+    bf16-declared) read it through a `memref.view` reinterpretation -- proven inside a core body,
+    not just in the runtime-sequence host path iron/common/compilation/sequence.py already uses
+    it for.
+
+    Returns (WB, TB, rpc): WB is one row's real bytes, TB the shared tile's byte size (a whole
+    multiple of one cache row, HD*2), rpc how many cache positions one tile covers.
+    """
+    from iron.common.quant import row_stride_bytes
+    WB = row_stride_bytes(D, group_size, weight_dtype, scale_dtype)
+    cache_row_bytes = HD * 2
+    rpc = -(-WB // cache_row_bytes)   # ceil(WB / cache_row_bytes)
+    if max_seq is not None:
+        while max_seq % rpc:
+            rpc += 1
+            if rpc > max_seq:
+                raise ValueError(
+                    f"no stream tile covers a {WB} B {weight_dtype} g{group_size} row "
+                    f"({-(-WB // cache_row_bytes)} cache rows of {cache_row_bytes} B) and also "
+                    f"divides max_seq ({max_seq})"
+                )
+    return WB, rpc * cache_row_bytes, rpc
+
+
+def l1_footprint_bytes(D, HD, gqa, L, tile_elems, weight_depth, stack_size, v_norm=False,
+                       stream_tile_bytes=None, weightless=False):
     """Bytes this design places in one core's L1, by term. Computed rather than assumed -- the
     same check qkv_head_dp and swiglu_mlp_dp carry.
 
     `L` is the SPLIT length in positions, not the window. Since split-K landed, max_seq does not
     enter this budget at all: sc/sw are sized to one segment and the running max/sum carry the
     result across segments. Before that this argument was max_seq and capped the window at 4544.
+
+    `v_norm` adds one HD-wide gain buffer -- a compile-time all-ones constant (the gainless
+    value-norm is never streamed, see the workers loop), so it is a flat per-core L1 add and costs
+    no stream/misc/out term at all.
+
+    `stream_tile_bytes` is None (default) at weight_dtype="bf16": the ONE shared stream fifo costs
+    `tile_elems*2` bytes, as always. Given (quant_tile_bytes' TB), it overrides that term directly
+    -- still ONE fifo, still ONE term, just sized in bytes rather than derived from tile_elems*2.
+
+    `weightless` (False default) is attn_block_dp_weightless's shape: no D-wide input norm at all
+    (cur/n_in/hn), and no `raw` scratch beside `nrm` (a raw qkv row is a straight fifo acquire, not
+    a matvec output). v_norm is mandatory there, so the gain term is unconditional.
     """
     misc = 3 * (HD * 2)                 # depth 3: n_qn, n_kn and ang are held together
-    stream = weight_depth * (tile_elems * 2)
+    stream = weight_depth * (stream_tile_bytes if stream_tile_bytes is not None else tile_elems * 2)
     out = 2 * (HD * 2)
     persistent = (
-        3 * (D * 2)                     # cur, n_in, hn
-        + 2 * (HD * 2)                  # raw, nrm
+        (0 if weightless else 3 * (D * 2))        # cur, n_in, hn -- absent when weightless
+        + (1 if weightless else 2) * (HD * 2)     # nrm alone, or raw+nrm
         + gqa * (HD * 2)                # the RoPE'd query heads, which never leave L1
         + 2 * gqa * (L * 2)             # sc and sw -- sized to one SPLIT, not to the window
         + gqa * (HD * 4)                # the f32 context accumulators
         + gqa * (3 * 4)                 # {running max, running sum, correction} f32, per group
+        + (HD * 2 if (v_norm or weightless) else 0)  # the value-norm gain, one all-ones constant
     )
     return misc + stream + out + persistent + stack_size
 
 
 def derive_attn_split(D, HD, gqa, S, tile_elems, weight_depth, stack_size, kv_block_size=None,
-                      tile_size_input=4):
+                      tile_size_input=4, v_norm=False, stream_tile_bytes=None, rpc_override=None,
+                      weightless=False):
     """The largest legal segment length for window `S`, or `S` itself when the window fits L1.
 
     ONE owner for the rule, because `decode_layer_dp`'s construction check and this file's own
     build both need it and a second copy would drift. A window at or below the L1 bound returns
     `S`, which is the pre-split design byte for byte -- so a rung ladder spanning widths either
     side of the cap needs no per-rung configuration.
+
+    `rpc_override` is None (default) at weight_dtype="bf16": the split granularity's own `rpc`
+    term is tsi*D/HD, as always. Given (quant_tile_bytes' rpc), it is used instead -- the shared
+    tile is no longer tsi-derived once Wqkv is quantized. attn_block_dp_weightless passes rpc=1
+    (see its own module docstring for why that is always legal).
     """
-    rpc = (tile_size_input * D) // HD
+    rpc = rpc_override if rpc_override is not None else (tile_size_input * D) // HD
     gran = math.lcm(rpc, kv_block_size or S, FLASH_SM_VEC_LEN)
-    if l1_footprint_bytes(D, HD, gqa, S, tile_elems, weight_depth, stack_size) <= L1_BYTES:
+    # `S % gran == 0` iff S is already a common multiple of rpc and FLASH_SM_VEC_LEN (gran is a
+    # multiple of S by construction when kv_block_size is None, since S is one of the lcm's own
+    # terms -- so this equals gran==S exactly). Without it, an S that fits L1 unsplit but is not
+    # 64-aligned (every qwen3 S tested is a power of two, so this never fired there) returned as a
+    # legal split anyway, deferred to a confusing AssertionError three frames later in the caller.
+    if S % gran == 0 and l1_footprint_bytes(
+        D, HD, gqa, S, tile_elems, weight_depth, stack_size, v_norm, stream_tile_bytes,
+        weightless=weightless
+    ) <= L1_BYTES:
         return S
-    fixed = l1_footprint_bytes(D, HD, gqa, 0, tile_elems, weight_depth, stack_size)
-    per = l1_footprint_bytes(D, HD, gqa, 1, tile_elems, weight_depth, stack_size) - fixed
+    fixed = l1_footprint_bytes(D, HD, gqa, 0, tile_elems, weight_depth, stack_size, v_norm,
+                              stream_tile_bytes, weightless=weightless)
+    per = l1_footprint_bytes(D, HD, gqa, 1, tile_elems, weight_depth, stack_size, v_norm,
+                            stream_tile_bytes, weightless=weightless) - fixed
     cap = (L1_BYTES - fixed) // per
     return max((d for d in range(gran, min(cap, S) + 1, gran) if S % d == 0), default=0)
 
@@ -193,6 +276,12 @@ def attn_block_dp(
     fifo_prefix="",
     parts_only=False,
     norms_packed=False,
+    v_norm=False,
+    weight_dtype="bf16",
+    group_size=0,
+    layout="header_first",
+    row_group=None,
+    scale_dtype="f32",
 ):
     """`func_prefix` is not optional once this design is placed in an OperatorSequence -- see
     gemv/design.py's identical parameter. N = n_aie_cols, one core per KV HEAD.
@@ -211,7 +300,20 @@ def attn_block_dp(
     sc/sw, the KV-chunk loop and the mask are all unchanged, still S=max_seq wide. `kv_alloc` only
     sizes the KV_L3 buffer and the per-head stride, so a resident ladder of these designs at
     different windows can share one wide cache. `kv_block_size` (also None) blocks that cache the
-    way gemv/tmatvec's `block_size` blocks theirs, one axis over. See the KV_ALLOC block below."""
+    way gemv/tmatvec's `block_size` blocks theirs, one axis over. See the KV_ALLOC block below.
+
+    `v_norm` (False default) adds Gemma-4's gainless value-norm: `v = weighted_RMSNorm(Wv[head c]
+    @ hn, ones)`. Gainless, like the runlist's own `ones_h{hd}` precedent (gen_llm_decode.py), so
+    the gain is a compile-time all-ones L1 constant -- never a host argument, never a stream tile.
+    False keeps step 5 exactly what it was: `v` written straight into the drain tile, no norm.
+
+    `weight_dtype` (bf16 default) quantizes Wqkv only -- kc/vc stay bf16. bf16 keeps THE SHARED-
+    TILE INVARIANT below untouched, byte for byte. Any other dtype re-derives it in BYTES instead
+    of elements (see `quant_tile_bytes`): Wqkv keeps sharing the ONE per-core `stream_ofs` fifo
+    with the K/V cache -- no new channel -- at the cost of padding each Wqkv row up to a whole
+    number of cache-row bytes, and a `memref.view` reinterpretation of the shared int8 tile back
+    to bf16 on the cache-reading call sites. `group_size`/`layout`/`row_group`/`scale_dtype` are
+    GEMV's own axes (iron/common/quant.py); see gemv/op.py."""
     N = n_aie_cols
     tsi = tile_size_input
     S = max_seq
@@ -227,21 +329,33 @@ def attn_block_dp(
     assert HD % tsi == 0, f"HD ({HD}) must divide by tile_size_input ({tsi})"
 
     N_MISC_CHUNKS = D // HD
-    N_W_TILES = HD // tsi                   # weight tiles per head row-block
-    TILE_ELEMS = tsi * D
 
-    # THE SHARED-TILE INVARIANT. One ObjectFifo carries Wqkv row-tiles (tsi rows of D) AND cache
-    # row-chunks (rpc rows of HD); it works only because the two are the same number of elements.
-    # Asserted rather than commented: it is what collapses two input channels into one, and a
-    # shape where it fails needs a different tiling, not a partial fill.
-    assert TILE_ELEMS % HD == 0, (
-        f"the shared stream tile ({TILE_ELEMS} elements) must be a whole number of cache rows "
-        f"(HD={HD})"
-    )
-    rpc = TILE_ELEMS // HD                  # cache rows per stream tile
+    # THE SHARED-TILE INVARIANT. One ObjectFifo carries Wqkv row-tiles AND cache row-chunks --
+    # it works only because both sides agree on the tile's BYTE extent
+    # (the DMA's contract is the extent, not a type label). bf16: both sides are bf16, so `tsi*D == rpc*HD` in ELEMENTS already means
+    # they agree in bytes -- unchanged, asserted below exactly as before. Quantized: a Wqkv row's
+    # bytes are not generally a bf16-row-count multiple of a cache row (see `quant_tile_bytes`), so
+    # `rpc` (and tsi's own role in sizing the shared tile) comes from there instead, and the fifo's
+    # declared object becomes an int8 byte buffer -- see STREAM_ty below.
+    WB = None
+    N_W_TILES = HD // tsi                   # weight tiles per head row-block -- bf16 path only
+    TILE_ELEMS = tsi * D                     # cache-side VIEW width in bf16 elements (both paths)
+    if weight_dtype != "bf16":
+        WB, TB, rpc = quant_tile_bytes(D, HD, group_size, weight_dtype, scale_dtype, S)
+        TILE_ELEMS = rpc * HD
+    else:
+        assert TILE_ELEMS % HD == 0, (
+            f"the shared stream tile ({TILE_ELEMS} elements) must be a whole number of cache rows "
+            f"(HD={HD})"
+        )
+        rpc = TILE_ELEMS // HD                  # cache rows per stream tile
+        TB = TILE_ELEMS * 2                     # the shared tile's byte size, bf16 elements * 2
     assert S % rpc == 0, (
-        f"max_seq ({S}) must divide by the cache rows per stream tile ({rpc}), which "
-        f"tile_size_input={tsi} and head_dim={HD} fix at tsi*D/HD"
+        f"max_seq ({S}) must divide by the cache rows per stream tile ({rpc})" + (
+            f", which tile_size_input={tsi} and head_dim={HD} fix at tsi*D/HD"
+            if weight_dtype == "bf16" else
+            f" (derived from the padded {weight_dtype} row, see quant_tile_bytes)"
+        )
     )
 
     # THE SPLIT. sc/sw are sized to L positions and the softmax carries a running max/sum across
@@ -259,7 +373,8 @@ def attn_block_dp(
         L = attn_split
     else:
         L = derive_attn_split(D, HD, gqa, S, TILE_ELEMS, weight_depth, stack_size,
-                              kv_block_size, tsi)
+                              kv_block_size, tsi, v_norm, stream_tile_bytes=TB,
+                              rpc_override=(rpc if weight_dtype != "bf16" else None))
         if not L:
             raise ValueError(
                 f"no legal attn_split for max_seq={S}: need a divisor of {S} that is a multiple "
@@ -278,7 +393,8 @@ def attn_block_dp(
     NSPLIT = S // L
     SPLIT_CHUNKS = L // rpc
 
-    used = l1_footprint_bytes(D, HD, gqa, L, TILE_ELEMS, weight_depth, stack_size)
+    used = l1_footprint_bytes(D, HD, gqa, L, TILE_ELEMS, weight_depth, stack_size, v_norm,
+                             stream_tile_bytes=TB)
     assert used <= L1_BYTES, (
         f"estimated L1 use {used} B exceeds {L1_BYTES} B at tsi={tsi} attn_split={L} gqa={gqa}. "
         f"sc+sw alone are {2 * gqa * L * 2} B and are the terms the SPLIT drives (max_seq={S} no "
@@ -360,11 +476,19 @@ def attn_block_dp(
 
     D_ty = np.ndarray[(D,), np.dtype[BF16]]
     HD_ty = np.ndarray[(HD,), np.dtype[BF16]]
+    # TILE_ty is the CACHE-SIDE VIEW type -- bf16, TILE_ELEMS (== rpc*HD) elements, in BOTH paths.
+    # STREAM_ty is the ONE shared fifo's OWN declared object type: bf16 at default (STREAM_ty IS
+    # TILE_ty, so nothing new is declared); a plain int8[TB] byte buffer when quantized, TB bytes
+    # being exactly TILE_ELEMS*2 either way (quant_tile_bytes' own construction). The weight-side
+    # kernel (mv_quant.cc) reads that int8 buffer directly; the cache-side kernels (still bf16-
+    # declared) read it through a `memref.view` back to TILE_ty -- see core_fn below.
     TILE_ty = np.ndarray[(TILE_ELEMS,), np.dtype[BF16]]
+    STREAM_ty = TILE_ty if weight_dtype == "bf16" else np.ndarray[(TB,), np.dtype[np.int8]]
     SROW_ty = np.ndarray[(L,), np.dtype[BF16]]      # one SPLIT's scores, not the window
     ST_ty = np.ndarray[(3,), np.dtype[np.float32]]  # {running max, running sum, correction}
     ACC_ty = np.ndarray[(HD,), np.dtype[np.float32]]
-    W_L3_ty = np.ndarray[(TOT * D,), np.dtype[BF16]]
+    W_L3_ty = (np.ndarray[(TOT * D,), np.dtype[BF16]] if weight_dtype == "bf16"
+              else np.ndarray[(TOT * TB,), np.dtype[np.int8]])
     # PACKED NORM GAINS. n_in, n_qn and n_kn are three STATIC weight vectors; `ang` is not (the
     # host writes the RoPE angle row per token), so it stays its own argument. Packing the three
     # is a build-time concat of blobs the generator already emits, exactly as Wqkv is a concat of
@@ -376,7 +500,17 @@ def attn_block_dp(
     CX_L3_ty = np.ndarray[(QD,), np.dtype[BF16]]
 
     # ---- kernels: one archive, every core plays every role ----
-    CORE_ARCHIVE = f"{func_prefix}attn_block_dp_core.a"
+    # weight_dtype rides in the archive name too -- see op.py's identical convention (and the bug
+    # its own history records: a bf16 build must never silently link a cached quantized archive).
+    if weight_dtype == "bf16":
+        _archive_tag = ""
+    else:
+        _archive_tag = f"_{weight_dtype}g{group_size}"
+        if layout == "row_group_planar":
+            _archive_tag += f"_planar{row_group}"
+        if scale_dtype != "f32":
+            _archive_tag += f"_s{scale_dtype}"
+    CORE_ARCHIVE = f"{func_prefix}attn_block_dp_core{_archive_tag}.a"
     copy_kernel = Kernel(
         f"{func_prefix}copy_offset_bf16_vector", CORE_ARCHIVE, [D_ty, HD_ty, np.int32, np.int32]
     )
@@ -407,9 +541,18 @@ def attn_block_dp(
     )
     # One runtime-K body under two names -- see rms_norm.cc. The row-batched scores path takes K as
     # a template parameter, so when it is on the scores keep their own compile-time-K symbol.
-    mv_kernel = Kernel(
-        f"{func_prefix}matvec_rtk_bf16_bf16", CORE_ARCHIVE,
-        [np.int32, np.int32, np.int32, TILE_ty, D_ty, HD_ty],
+    #
+    # Quantized: Wqkv's D is a compile-time constant here (unlike the scores' HD, which this same
+    # body also serves at runtime-K), so it binds directly to mv_quant.cc's compile-time-K
+    # `matvec_vectorized_{dtype}_bf16` -- the same symbol GEMV/SwiGLUMLPDataParallel/
+    # QKVHeadDataParallel bind for their own weight matvecs. No alias needed: this symbol is
+    # DISTINCT from `matvec_rtk_bf16_bf16`, which the scores kernel below still needs unchanged.
+    mv_kernel = (
+        Kernel(f"{func_prefix}matvec_rtk_bf16_bf16", CORE_ARCHIVE,
+               [np.int32, np.int32, np.int32, TILE_ty, D_ty, HD_ty])
+        if weight_dtype == "bf16" else
+        Kernel(f"{func_prefix}matvec_vectorized_{weight_dtype}_bf16", CORE_ARCHIVE,
+               [np.int32, np.int32, STREAM_ty, D_ty, HD_ty])
     )
     if scores_rowbatch == 1:
         sc_mv_kernel = Kernel(
@@ -453,17 +596,63 @@ def attn_block_dp(
     )
 
     misc_of = ObjectFifo(HD_ty, name=f"{fifo_prefix}misc", depth=3)
-    stream_ofs = [ObjectFifo(TILE_ty, name=f"{fifo_prefix}stream_{c}", depth=weight_depth) for c in range(N)]
+    # ONE fifo, STREAM_ty-typed, in both paths -- bf16 or the shared padded-int8 tile. THE SHARED-
+    # TILE INVARIANT holds by construction either way (see quant_tile_bytes), so this never grows a
+    # second per-core input channel.
+    stream_ofs = [ObjectFifo(STREAM_ty, name=f"{fifo_prefix}stream_{c}", depth=weight_depth) for c in range(N)]
     out_ofs = [ObjectFifo(HD_ty, name=f"{fifo_prefix}out_{c}", depth=2) for c in range(N)]
 
     barriers = [WorkerRuntimeBarrier() for _ in range(N)]
+    # Gainless, so the gain is a compile-time all-ones L1 constant -- no ObjectFifo, no shim
+    # channel, no host argument. One per core: Buffer placement is per-tile.
+    vnorm_gain_bufs = (
+        [Buffer(HD_ty, initial_value=np.ones(HD, dtype=BF16), name=f"{fifo_prefix}vnorm_gain_{c}")
+         for c in range(N)] if v_norm else [None] * N
+    )
 
     def core_fn(misc_c, stream_c, out_p, mask_src, win_src, barrier,
                 cur_buf, nin_buf, hn_buf, raw_buf, nrm_buf, qh_bufs, sc_bufs, sw_bufs, acc_bufs,
-                st_bufs,
+                st_bufs, vnorm_gain_buf,
                 copy_k, wnorm_d_k, wnorm_hd_k, mv_k, rope_k,
                 sc_mv_k, mask_k, softmax_k, tz_k, tr_k, tf_k,
                 psm_k, sinit_k, acc_rescale_k):
+        def view_bf16(tile, n_elems):
+            """Reinterpret an acquired shared-tile handle as a bf16[n_elems] view -- the SAME
+            `memref.view` mechanism iron/common/compilation/sequence.py already uses for the
+            runtime sequence's own byte-arena argument marshalling, here inside a core body
+            instead. A no-op at bf16 (the fifo is already bf16-typed)."""
+            if weight_dtype == "bf16":
+                return tile
+            raw = tile.op if hasattr(tile, "op") else tile
+            result_ty = ir.MemRefType.get([n_elems], ir.Type.parse("bf16"))
+            return memref.view(result_ty, raw, raw_arith.constant(ir.IndexType.get(), 0), [])
+
+        # bf16: wt is a TILE_ty tile (tsi rows of D), row_idx a multi-row block offset (j*tsi), and
+        # this is exactly the pre-existing runtime-K call. Quantized: mv_quant.cc's matvec is
+        # compile-time-K (D is baked in via -DDIM_K) and ONE acquire is exactly one padded row
+        # (quant_tile_bytes), so m=1 and row_idx is the row index directly -- the same 5-arg,
+        # m=1-per-call shape qkv_head_dp/swiglu_mlp_dp already call their own weight matvec with.
+        def mv_weight(row_idx, wt, dst):
+            if weight_dtype == "bf16":
+                mv_k(tsi, row_idx, D, wt, hn_buf, dst)
+            else:
+                mv_k(1, row_idx, wt, hn_buf, dst)
+
+        def stream_weight_rows(dst):
+            """This head's Wqkv rows, acquired from stream_c and matvec'd into dst one tile at a
+            time. The loop SHAPE differs by weight_dtype (N_W_TILES tiles of tsi rows each, vs HD
+            tiles of one padded row each); the call sequence does not -- see mv_weight."""
+            if weight_dtype == "bf16":
+                for j in range_(N_W_TILES):
+                    row_off = index.casts(T.i32(), j) * tsi
+                    wt = stream_c.acquire(1)
+                    mv_weight(row_off, wt, dst)
+                    stream_c.release(1)
+            else:
+                for j in range_(HD):
+                    wt = stream_c.acquire(1)
+                    mv_weight(index.casts(T.i32(), j), wt, dst)
+                    stream_c.release(1)
         # Read AFTER wait_for_value(1), never before: the sequence calls sync_parameters() and only
         # then sets the barrier, so a read here sees THIS dispatch's value. Read earlier and it
         # samples the PREVIOUS dispatch's -- corruption with no clean recurrence.
@@ -514,32 +703,25 @@ def attn_block_dp(
         # step 3: this core's gqa query heads. They stay in L1 -- this is the whole point; today
         # `q` is drained to DDR and read back by the scores GEMV eight times over.
         for g in range(gqa):
-            for j in range_(N_W_TILES):
-                row_off = index.casts(T.i32(), j) * tsi
-                wt = stream_c.acquire(1)
-                mv_k(tsi, row_off, D, wt, hn_buf, raw_buf)
-                stream_c.release(1)
+            stream_weight_rows(raw_buf)
             wnorm_hd_k(raw_buf, nqn_t, nrm_buf, *rms_len(HD), epsilon)
             rope_k(nrm_buf, ang_t, qh_bufs[g], HD)
 
         # step 4: this core's k head, RoPE'd straight into the drain tile that appends it.
         kt = out_p.acquire(1)
-        for j in range_(N_W_TILES):
-            row_off = index.casts(T.i32(), j) * tsi
-            wt = stream_c.acquire(1)
-            mv_k(tsi, row_off, D, wt, hn_buf, raw_buf)
-            stream_c.release(1)
+        stream_weight_rows(raw_buf)
         wnorm_hd_k(raw_buf, nkn_t, nrm_buf, *rms_len(HD), epsilon)
         rope_k(nrm_buf, ang_t, kt, HD)
         out_p.release(1)
 
-        # step 5: this core's v head -- no norm, no RoPE, so the matvec writes the drain tile.
+        # step 5: this core's v head -- no RoPE either way. v_norm=False (default): the matvec
+        # writes the drain tile directly, unchanged from before this stage existed. v_norm=True:
+        # the matvec lands in raw_buf and the norm writes the drain tile, gain-1.0 (see the
+        # vnorm_gain_bufs construction above).
         vt = out_p.acquire(1)
-        for j in range_(N_W_TILES):
-            row_off = index.casts(T.i32(), j) * tsi
-            wt = stream_c.acquire(1)
-            mv_k(tsi, row_off, D, wt, hn_buf, vt)
-            stream_c.release(1)
+        stream_weight_rows(raw_buf if v_norm else vt)
+        if v_norm:
+            wnorm_hd_k(raw_buf, vnorm_gain_buf, vt, *rms_len(HD), epsilon)
         out_p.release(1)
         misc_c.release(3)
 
@@ -558,7 +740,7 @@ def attn_block_dp(
             # two heads sharing this kv head are on the same core.
             for i in range_(SPLIT_CHUNKS):
                 row_off = index.casts(T.i32(), i) * rpc
-                at = stream_c.acquire(1)
+                at = view_bf16(stream_c.acquire(1), TILE_ELEMS)
                 for g in range(gqa):
                     if scores_rowbatch == 1:
                         sc_mv_k(rpc, row_off, HD, at, qh_bufs[g], sc_bufs[g])
@@ -588,7 +770,7 @@ def attn_block_dp(
             # context for this segment, transposed-A over this core's V head.
             for i in range_(SPLIT_CHUNKS):
                 w_off = index.casts(T.i32(), i) * rpc
-                at = stream_c.acquire(1)
+                at = view_bf16(stream_c.acquire(1), TILE_ELEMS)
                 for g in range(gqa):
                     # tr_k's 3rd arg is w_stride (mv_taccum.cc: w_in + g*w_stride + w_off), the
                     # spacing between GROUPS in a packed w buffer -- not a row length. groups=1
@@ -618,6 +800,7 @@ def attn_block_dp(
                     [Buffer(SROW_ty, name=f"{fifo_prefix}sw_{c}_{g}") for g in range(gqa)],
                     [Buffer(ACC_ty, name=f"{fifo_prefix}acc_{c}_{g}") for g in range(gqa)],
                     [Buffer(ST_ty, name=f"{fifo_prefix}st_{c}_{g}") for g in range(gqa)],
+                    vnorm_gain_bufs[c],
                     copy_kernel, wnorm_d_kernel, wnorm_hd_kernel, mv_kernel, rope_kernel,
                     sc_mv_kernel, mask_kernel, softmax_kernel, tz_kernel, tr_kernel, tf_kernel,
                     psm_kernel, sinit_kernel, acc_rescale_kernel,
@@ -667,9 +850,16 @@ def attn_block_dp(
                         ((Hq + c) * HD, HD),                     # k head c
                         ((Hq + Hkv + c) * HD, HD)]               # v head c
             for off, rows in runs:
-                stream_ps[c].fill(
-                    wqkv, _flat_tap(TOT * D, rows * D, off * D), wait=True, group=tg1
-                )
+                if weight_dtype == "bf16":
+                    stream_ps[c].fill(
+                        wqkv, _flat_tap(TOT * D, rows * D, off * D), wait=True, group=tg1
+                    )
+                else:
+                    # Row PITCH is TB (padded), not WB: the L3 buffer is laid out one padded row
+                    # per stride, matching W_L3_ty/op.py's arg spec.
+                    stream_ps[c].fill(
+                        wqkv, _flat_tap(TOT * TB, rows * TB, off * TB), wait=True, group=tg1,
+                    )
         tg1.finish()
 
         tg2 = TaskGroup()
@@ -726,6 +916,365 @@ def attn_block_dp(
     # half and another -- see decode_layer_dp. Nothing about the half changes; the caller supplies
     # `fifo_prefix` and `func_prefix` so the two halves' fifo names and kernel symbols stay
     # disjoint in the one device-wide symbol table, and concatenates the sequences.
+    if parts_only:
+        return dict(workers=workers, seq=sequence, l3_types=l3_types, handles=handles)
+
+    rt = Runtime(sequence, l3_types + handles)
+
+    prog = Program(dev, rt, workers=workers)
+    maybe_enable_trace(prog, trace_size, workers)
+    return prog.resolve_program()
+
+
+def attn_block_dp_weightless(
+    dev,
+    D,
+    HD,
+    Hq,
+    Hkv,
+    max_seq,
+    attn_split=None,
+    scores_rowbatch=1,
+    epsilon=1e-6,
+    stack_size=0xD00,
+    func_prefix="",
+    n_aie_cols=8,
+    kv_offset_parameter="kv_off",
+    mask_parameter="sm_mask",
+    window_parameter=None,
+    trace_size=0,
+    weight_depth=2,
+    kv_alloc=None,
+    kv_block_size=None,
+    fifo_prefix="",
+    parts_only=False,
+):
+    """`attn_block_dp` minus its input RMSNorm and Wqkv matvec (gemma4-weightless-attention-block,
+    variant A_s/A_g). `qkv` -- this core's slice of the W device's own GEMV output, already in the
+    [Wq|Wk|Wv] row order Wqkv's rows have -- replaces `cur`/`n_in`/`Wqkv`. Every stage AFTER the
+    projection (per-head norm, RoPE, KV append, scores, online softmax, context) is
+    `attn_block_dp`'s own machinery unchanged; see that function's module docstring for the head->
+    core mapping and the split-K algebra, and `iron.common.kv_layout` for KV_ALLOC/kv_block_size.
+
+    THE SHARED-TILE INVARIANT IS TRIVIAL HERE, which is the whole point of the variant. A raw qkv
+    row and a cache row are both exactly HD bf16 elements -- there is no weight row to pad a tile
+    up to -- so `rpc` (cache rows per stream tile) is 1: it divides every window, and the per-core
+    fifo's three qkv fills (gqa q-rows, 1 k-row, 1 v-row) need no padding either, because gqa/1/1
+    rows at 1 row/tile is always a whole number of tiles. Contrast `quant_tile_bytes`, whose whole
+    reason to exist is that a weight row generally does NOT divide a cache row.
+
+    v_norm is not a parameter here: it is mandatory. Gemma-4's gainless value-norm gives v its own
+    drain-tile write via the same `hd_weighted_rms_norm_cols` call q and k already use (an all-ones
+    gain); a v that arrives with no norm at all would need a plain fifo-to-fifo copy this variant
+    does not build, because nothing on this model needs it (see `attn_block_dp`'s v_norm docstring
+    for the reference case).
+    """
+    N = n_aie_cols
+    S = max_seq
+    QD, KVD = Hq * HD, Hkv * HD
+    TOT = QD + 2 * KVD                      # rows of the concatenated qkv, same layout as Wqkv's
+    assert Hkv == N, (
+        f"this design places one KV HEAD per core: Hkv ({Hkv}) must equal n_aie_cols ({N})"
+    )
+    assert Hq % Hkv == 0, f"Hq ({Hq}) must be a multiple of Hkv ({Hkv})"
+    gqa = Hq // Hkv
+
+    # THE SHARED-TILE INVARIANT, trivially: every item on the fifo (a raw qkv row or a cache row)
+    # is exactly one HD-wide row.
+    TILE_ELEMS = HD
+    rpc = 1
+
+    if attn_split is not None:
+        L = attn_split
+    else:
+        L = derive_attn_split(D, HD, gqa, S, TILE_ELEMS, weight_depth, stack_size,
+                              kv_block_size, v_norm=True, rpc_override=rpc, weightless=True)
+        if not L:
+            raise ValueError(
+                f"no legal attn_split for max_seq={S}: need a divisor of {S} that is a multiple "
+                f"of the softmax vector ({FLASH_SM_VEC_LEN}) and within the L1 bound. Pick a "
+                f"max_seq with one, or pass attn_split explicitly."
+            )
+    assert S % L == 0, f"attn_split ({L}) must divide max_seq ({S})"
+    assert L % FLASH_SM_VEC_LEN == 0, (
+        f"attn_split ({L}) must be a whole number of softmax vectors ({FLASH_SM_VEC_LEN}): the "
+        f"kernel's loops have no scalar tail, so a remainder is dropped silently"
+    )
+    NSPLIT = S // L
+    SPLIT_CHUNKS = L // rpc
+
+    used = l1_footprint_bytes(D, HD, gqa, L, TILE_ELEMS, weight_depth, stack_size, v_norm=True,
+                             weightless=True)
+    assert used <= L1_BYTES, (
+        f"estimated L1 use {used} B exceeds {L1_BYTES} B at attn_split={L} gqa={gqa}. sc+sw "
+        f"alone are {2 * gqa * L * 2} B and are the terms the SPLIT drives -- lower attn_split."
+    )
+
+    # KV CAPACITY -- verbatim attn_block_dp's own block, which touches no weight axis at all.
+    from iron.common.kv_layout import KVLayout, split_run, validate_block_size
+
+    assert kv_alloc is None or kv_alloc >= S, (
+        f"kv_alloc ({kv_alloc}) must be >= max_seq ({S}): it is the cache CAPACITY, not a second "
+        f"window"
+    )
+    KV_ALLOC = S if kv_alloc is None else kv_alloc
+    _KVT = KV_ALLOC if kv_block_size is None else kv_block_size
+    kv_layout = KVLayout(Hkv=Hkv, S=KV_ALLOC, HD=HD, T=_KVT)
+    kv_blocked = _KVT != KV_ALLOC
+    if kv_blocked:
+        validate_block_size(_KVT, HD, Hkv)
+        assert S % _KVT == 0, (
+            f"blocked KV cache needs the attention window ({S}) to be a whole number of blocks "
+            f"(kv_block_size={_KVT})"
+        )
+        _kv_num_blocks_window = S // _KVT
+        _kv_blk_split = split_run(_KVT * HD)
+        assert _kv_blk_split is not None, (
+            f"blocked KV cache: no wrap-legal split for one block's run ({_KVT * HD} elements, "
+            f"kv_block_size={_KVT})"
+        )
+        _kv_blk_hi, _kv_blk_lo = _kv_blk_split
+
+    def _kv_split_tap(head_base, split):
+        if not kv_blocked:
+            return _flat_tap(kv_layout.total_elems, L * HD, head_base + split * L * HD)
+        blocks_per_split = L // _KVT
+        return TensorAccessPattern(
+            tensor_dims=(kv_layout.total_elems,),
+            offset=head_base + split * blocks_per_split * kv_layout.block_stride,
+            sizes=[1, blocks_per_split, _kv_blk_hi, _kv_blk_lo],
+            strides=[0, kv_layout.block_stride, _kv_blk_lo, 1],
+        )
+
+    kv_off_param = (ScratchpadParameter(kv_offset_parameter, np.int32)
+                    if kv_offset_parameter is not None else None)
+    mask_param = ScratchpadParameter(mask_parameter, np.int32)
+    win_param = (ScratchpadParameter(window_parameter, np.int32)
+                 if window_parameter is not None else None)
+
+    HD_ty = np.ndarray[(HD,), np.dtype[BF16]]
+    TILE_ty = np.ndarray[(TILE_ELEMS,), np.dtype[BF16]]     # == HD_ty; named for the fifo's role
+    SROW_ty = np.ndarray[(L,), np.dtype[BF16]]
+    ST_ty = np.ndarray[(3,), np.dtype[np.float32]]
+    ACC_ty = np.ndarray[(HD,), np.dtype[np.float32]]
+    QKV_L3_ty = np.ndarray[(TOT,), np.dtype[BF16]]
+    KV_L3_ty = np.ndarray[(kv_layout.total_elems,), np.dtype[BF16]]
+    CX_L3_ty = np.ndarray[(QD,), np.dtype[BF16]]
+
+    # Same archive as attn_block_dp's own bf16 path -- same D/HD/GEMV_VEC_SIZE, so the kernel
+    # objects are byte-identical and the cache entry is shared, not duplicated.
+    CORE_ARCHIVE = f"{func_prefix}attn_block_dp_core.a"
+    wnorm_hd_kernel = Kernel(
+        f"{func_prefix}hd_weighted_rms_norm_cols", CORE_ARCHIVE,
+        [HD_ty, HD_ty, HD_ty, np.int32, np.float32, np.float32]
+    )
+
+    def rms_len(cols):
+        return cols, 1.0 / cols
+
+    if scores_rowbatch == 1:
+        sc_mv_kernel = Kernel(
+            f"{func_prefix}sc_matvec_rtk_bf16_bf16", CORE_ARCHIVE,
+            [np.int32, np.int32, np.int32, TILE_ty, HD_ty, SROW_ty],
+        )
+    else:
+        sc_mv_kernel = Kernel(
+            f"{func_prefix}sc_matvec_vectorized_bf16_bf16", CORE_ARCHIVE,
+            [np.int32, np.int32, TILE_ty, HD_ty, SROW_ty],
+        )
+    rope_kernel = Kernel(f"{func_prefix}rope", CORE_ARCHIVE, [HD_ty, HD_ty, HD_ty, np.int32])
+    mask_kernel = Kernel(f"{func_prefix}mask_bf16", CORE_ARCHIVE, [SROW_ty, np.int32, np.int32])
+    tz_kernel = Kernel(f"{func_prefix}taccum_zero_f32", CORE_ARCHIVE, [np.int32, ACC_ty])
+    tr_kernel = Kernel(
+        f"{func_prefix}taccum_rows_bf16_f32", CORE_ARCHIVE,
+        [np.int32, np.int32, np.int32, np.int32, TILE_ty, SROW_ty, ACC_ty],
+    )
+    tf_kernel = Kernel(
+        f"{func_prefix}taccum_finish_scaled_bf16", CORE_ARCHIVE, [np.int32, ST_ty, ACC_ty, HD_ty]
+    )
+    psm_kernel = Kernel(
+        f"{func_prefix}partial_softmax_f32state_bf16", CORE_ARCHIVE,
+        [SROW_ty, SROW_ty, ST_ty, np.int32],
+    )
+    sinit_kernel = Kernel(f"{func_prefix}flash_state_init", CORE_ARCHIVE, [ST_ty])
+    acc_rescale_kernel = Kernel(
+        f"{func_prefix}acc_rescale_f32", CORE_ARCHIVE, [np.int32, ST_ty, ACC_ty]
+    )
+
+    misc_of = ObjectFifo(HD_ty, name=f"{fifo_prefix}misc", depth=3)
+    stream_ofs = [ObjectFifo(TILE_ty, name=f"{fifo_prefix}stream_{c}", depth=weight_depth)
+                  for c in range(N)]
+    out_ofs = [ObjectFifo(HD_ty, name=f"{fifo_prefix}out_{c}", depth=2) for c in range(N)]
+
+    barriers = [WorkerRuntimeBarrier() for _ in range(N)]
+    # Mandatory here (see the module docstring): the gain is a compile-time all-ones L1 constant,
+    # same convention as attn_block_dp's own v_norm=True path.
+    vnorm_gain_bufs = [
+        Buffer(HD_ty, initial_value=np.ones(HD, dtype=BF16), name=f"{fifo_prefix}vnorm_gain_{c}")
+        for c in range(N)
+    ]
+
+    def core_fn(misc_c, stream_c, out_p, mask_src, win_src, barrier,
+                nrm_buf, qh_bufs, sc_bufs, sw_bufs, acc_bufs, st_bufs, vnorm_gain_buf,
+                wnorm_hd_k, rope_k, sc_mv_k, mask_k, tz_k, tr_k, tf_k,
+                psm_k, sinit_k, acc_rescale_k):
+        # Read AFTER wait_for_value(1) -- see attn_block_dp's identical comment; the barrier
+        # protocol is unchanged by removing the weight side.
+        barrier.wait_for_value(1)
+        mask_len = mask_src.read()
+        win_len = win_src.read() if win_src is not None else None
+        nsplits = (arith.divsi(arith.addi(win_len, arith.constant(L - 1, T.i32())),
+                               arith.constant(L, T.i32()))
+                   if win_src is not None else NSPLIT)
+
+        def drain_remainder():
+            if win_src is not None:
+                per_split = arith.constant(SPLIT_CHUNKS * 2, T.i32())
+                total = arith.constant(NSPLIT * SPLIT_CHUNKS * 2, T.i32())
+                for _ in range_(arith.subi(total, arith.muli(nsplits, per_split))):
+                    stream_c.acquire(1)
+                    stream_c.release(1)
+
+        # steps 1-2: n_qn, n_kn, ang -- held together. No D-wide input norm on this core at all.
+        w3 = misc_c.acquire(3)
+        nqn_t, nkn_t, ang_t = w3[0], w3[1], w3[2]
+
+        # step 3: this core's gqa query heads, straight off the W device's qkv row -- no matvec,
+        # no `raw` scratch: the acquired tile IS the row (same pattern the scores/context loops
+        # below already use for cache tiles).
+        for g in range(gqa):
+            qt = stream_c.acquire(1)
+            wnorm_hd_k(qt, nqn_t, nrm_buf, *rms_len(HD), epsilon)
+            rope_k(nrm_buf, ang_t, qh_bufs[g], HD)
+            stream_c.release(1)
+
+        # step 4: this core's k head, RoPE'd straight into the drain tile that appends it.
+        kt_raw = stream_c.acquire(1)
+        wnorm_hd_k(kt_raw, nkn_t, nrm_buf, *rms_len(HD), epsilon)
+        kt = out_p.acquire(1)
+        rope_k(nrm_buf, ang_t, kt, HD)
+        out_p.release(1)
+        stream_c.release(1)
+
+        # step 5: this core's v head -- gainless norm, no RoPE.
+        vt_raw = stream_c.acquire(1)
+        vt = out_p.acquire(1)
+        wnorm_hd_k(vt_raw, vnorm_gain_buf, vt, *rms_len(HD), epsilon)
+        out_p.release(1)
+        stream_c.release(1)
+        misc_c.release(3)
+
+        # steps 6-8: attn_block_dp's own split-K loop, unchanged.
+        for g in range(gqa):
+            tz_k(1, acc_bufs[g])
+            sinit_k(st_bufs[g])
+
+        for sp in range_(nsplits):
+            seg_lo = index.casts(T.i32(), sp) * L
+
+            for i in range_(SPLIT_CHUNKS):
+                row_off = index.casts(T.i32(), i) * rpc
+                at = stream_c.acquire(1)
+                for g in range(gqa):
+                    if scores_rowbatch == 1:
+                        sc_mv_k(rpc, row_off, HD, at, qh_bufs[g], sc_bufs[g])
+                    else:
+                        sc_mv_k(rpc, row_off, at, qh_bufs[g], sc_bufs[g])
+                stream_c.release(1)
+
+            seg_unmasked = arith.maxsi(
+                arith.minsi(arith.subi(mask_len, seg_lo), arith.constant(L, T.i32())),
+                arith.constant(0, T.i32()),
+            )
+
+            for g in range(gqa):
+                mask_k(sc_bufs[g], seg_unmasked, L)
+                psm_k(sc_bufs[g], sw_bufs[g], st_bufs[g], L)
+                acc_rescale_k(HD, st_bufs[g], acc_bufs[g])
+
+            for i in range_(SPLIT_CHUNKS):
+                w_off = index.casts(T.i32(), i) * rpc
+                at = stream_c.acquire(1)
+                for g in range(gqa):
+                    tr_k(rpc, 1, L, w_off, at, sw_bufs[g], acc_bufs[g])
+                stream_c.release(1)
+
+        drain_remainder()
+        for g in range(gqa):
+            ct = out_p.acquire(1)
+            tf_k(1, st_bufs[g], acc_bufs[g], ct)
+            out_p.release(1)
+
+    workers = []
+    for c in range(N):
+        workers.append(
+            Worker(
+                core_fn,
+                [
+                    misc_of.cons(), stream_ofs[c].cons(), out_ofs[c].prod(),
+                    mask_param, win_param, barriers[c],
+                    Buffer(HD_ty, name=f"{fifo_prefix}nrm_{c}"),
+                    [Buffer(HD_ty, name=f"{fifo_prefix}qh_{c}_{g}") for g in range(gqa)],
+                    [Buffer(SROW_ty, name=f"{fifo_prefix}sc_{c}_{g}") for g in range(gqa)],
+                    [Buffer(SROW_ty, name=f"{fifo_prefix}sw_{c}_{g}") for g in range(gqa)],
+                    [Buffer(ACC_ty, name=f"{fifo_prefix}acc_{c}_{g}") for g in range(gqa)],
+                    [Buffer(ST_ty, name=f"{fifo_prefix}st_{c}_{g}") for g in range(gqa)],
+                    vnorm_gain_bufs[c],
+                    wnorm_hd_kernel, rope_kernel, sc_mv_kernel, mask_kernel,
+                    tz_kernel, tr_kernel, tf_kernel, psm_kernel, sinit_kernel,
+                    acc_rescale_kernel,
+                ],
+                stack_size=stack_size,
+            )
+        )
+
+    def sequence(*seq_args):
+        (qkv, nqn, nkn, ang, kc, vc, cx, misc_p, stream_ps, out_cs) = seq_args
+        sync_parameters()
+        for c in range(N):
+            barriers[c].set(1)
+
+        tg1 = TaskGroup()
+        misc_p.fill(nqn, _flat_tap(HD, HD), wait=True, group=tg1)
+        misc_p.fill(nkn, _flat_tap(HD, HD), wait=True, group=tg1)
+        misc_p.fill(ang, _flat_tap(HD, HD), wait=True, group=tg1)
+        for c in range(N):
+            # Stock [Wq|Wk|Wv] row order -- the SAME offsets attn_block_dp's stock
+            # (wqkv_head_major=False) weight fills use, just HD-wide instead of D-wide: the W
+            # device's GEMV output inherits Wqkv's row order unchanged (its own run is untouched).
+            for off, rows in ((gqa * c * HD, gqa), ((Hq + c) * HD, 1), ((Hq + Hkv + c) * HD, 1)):
+                stream_ps[c].fill(qkv, _flat_tap(TOT, rows * HD, off), wait=True, group=tg1)
+        tg1.finish()
+
+        tg2 = TaskGroup()
+        for c in range(N):
+            for cache in (kc, vc):
+                out_cs[c].drain(
+                    cache, _flat_tap(kv_layout.total_elems, HD, kv_layout.head_base(c)),
+                    wait=True, group=tg2, offset_parameter=kv_off_param,
+                )
+        tg2.finish()
+
+        for sp in range(NSPLIT):
+            tg = TaskGroup()
+            for c in range(N):
+                for cache in (kc, vc):
+                    stream_ps[c].fill(
+                        cache, _kv_split_tap(kv_layout.head_base(c), sp), wait=True, group=tg
+                    )
+            tg.finish()
+
+        tg3 = TaskGroup()
+        for c in range(N):
+            for g in range(gqa):
+                out_cs[c].drain(
+                    cx, _flat_tap(QD, HD, (gqa * c + g) * HD), wait=True, group=tg3
+                )
+        tg3.finish()
+
+    l3_types = [QKV_L3_ty, HD_ty, HD_ty, HD_ty, KV_L3_ty, KV_L3_ty, CX_L3_ty]
+    handles = [misc_of.prod(),
+               [of.prod() for of in stream_ofs], [of.cons() for of in out_ofs]]
     if parts_only:
         return dict(workers=workers, seq=sequence, l3_types=l3_types, handles=handles)
 
