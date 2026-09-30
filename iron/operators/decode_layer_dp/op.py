@@ -38,7 +38,7 @@ def _scores_rowbatch_tag():
 
 
 def _mlp_l1_footprint_bytes(D, FF, mlp_cols, QD, tile_rows_gu, weight_depth, stack_size,
-                            weight_dtype="bf16", group_size=0):
+                            weight_dtype="bf16", group_size=0, post_norm=False):
     """The MLP half's per-core L1 use at fuse_o=True (decode_layer_dp's only call shape).
     Mirrors swiglu_mlp_dp/design.py's L1 budget block and this file's own get_arg_spec overlap
     arithmetic -- duplicated, not imported, because both are computed inline there rather than
@@ -47,21 +47,39 @@ def _mlp_l1_footprint_bytes(D, FF, mlp_cols, QD, tile_rows_gu, weight_depth, sta
 
     The weight tile is the one term the format moves, and it moves the SAME way design.py's does:
     `weight_depth * TSI_GU * WROW_D * WUNIT`, where a quantized row is packed BYTES rather than
-    bf16 elements. Every other buffer here is an activation and stays bf16."""
+    bf16 elements. Every other buffer here is an activation and stays bf16.
+
+    Raises on a shape design.py would assert on, rather than returning a footprint for a device
+    that cannot be built: Wo must share the Wg/Wu tile (TSI_O) and `cx` must arrive as whole
+    D-wide misc broadcasts (R_CX). Gemma-4-12B fails both -- QD is 4096 or 8192 against D=3840 --
+    and at tile_rows_gu=1 the TSI_O division was reached with a zero divisor."""
     d_per_core, ff_per_core = D // mlp_cols, FF // mlp_cols
     if weight_dtype == "bf16":
-        wrow_d, wunit = D, 2
+        wrow_d, wrow_qd, wunit = D, QD, 2
     else:
         from iron.common.quant import row_stride_bytes
-        wrow_d, wunit = row_stride_bytes(D, group_size, weight_dtype), 1
+        wrow_d = row_stride_bytes(D, group_size, weight_dtype)
+        wrow_qd, wunit = row_stride_bytes(QD, group_size, weight_dtype), 1
     wtile_units = (tile_rows_gu or 6) * wrow_d
-    tsi_o = ((tile_rows_gu or 6) * D) // QD
-    o_window = -(-(D // mlp_cols) // tsi_o) * tsi_o
-    misc = 2 * (D * 2)
+    if QD % D:
+        raise ValueError(f"fuse_o assumes QD ({QD}) is a whole multiple of D ({D})")
+    if wtile_units % wrow_qd:
+        raise ValueError(
+            f"fuse_o needs the shared weight tile ({wtile_units} units) to be a whole number of "
+            f"Wo rows ({wrow_qd} units each) at tile_rows_gu={tile_rows_gu or 6}")
+    tsi_o = wtile_units // wrow_qd
+    o_window = -(-d_per_core // tsi_o) * tsi_o
+    # depth 2, but the mixed acquire(2)/acquire(1) pattern makes aiecc's objectFifo lowering
+    # allocate a third buffer unconditionally -- design.py's L1 block, which measured it.
+    misc = 3 * (D * 2)
     weight = weight_depth * (wtile_units * wunit)
     out = 2 * (d_per_core * 2)
     persistent = 2 * (D * 2) + (FF * 2) + 2 * (ff_per_core * 2) + (d_per_core * 2)
     persistent += (QD * 2) + (o_window * 2)   # fuse_o: cx_buf + a_slice_buf
+    if post_norm:
+        # pff_gain is read straight off the misc tile, not buffered D-wide -- see
+        # swiglu_mlp_dp/design.py's L1 budget comment.
+        persistent += 3 * (D * 2)   # pa_gain_buf + a_norm_buf + d_norm_buf
     return misc + weight + out + persistent + stack_size
 
 
@@ -95,6 +113,9 @@ class DecodeLayerDataParallel(MLIROperator):
     weight_depth: int = field(default=2, repr=False)
     tile_rows_gu: int | None = field(default=None, repr=False)
     wqkv_head_major: bool = False
+    # Was hardcoded True on the my_swiglu_mlp_dp call below, refusing any QD not a whole
+    # multiple of D. Real parameter now; False still isn't buildable -- see __post_init__.
+    fuse_o: bool = field(default=True, repr=False)
     # Weight-stream format for the MLP HALF -- Wo, Wg, Wu and Wd, which share one ObjectFifo and
     # therefore one format. The attention half has no such axis: Wqkv rides the same fifo as the
     # K and V caches (see design.py), so a format for it is a format for them.
@@ -128,6 +149,13 @@ class DecodeLayerDataParallel(MLIROperator):
     # class's L1 check below stops being a cap on `max_seq`. None (default) is one segment, byte
     # for byte the pre-split design. Delegated straight to attn_block_dp, which owns every term.
     attn_split: int | None = field(default=None, repr=False)
+    # MLP-half gated-FFN activation and sandwich post-block norm slot -- both delegated straight
+    # to swiglu_mlp_dp, which owns them (see its op.py/design.py). repr=False + the `name`
+    # override below (`_atag`), matching `weight_dtype`'s own pattern in THIS file rather than
+    # SwiGLUMLPDataParallel's repr=True: here the tag must also equal the archive suffix
+    # `get_kernel_artifacts` builds, so one property serves both, exactly like `_wtag` below.
+    act: str = field(default="silu", repr=False)
+    post_norm: bool = field(default=False, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -140,6 +168,22 @@ class DecodeLayerDataParallel(MLIROperator):
     }
 
     def __post_init__(self):
+        # fuse_o=False has no operator to embed here (gemv has no parts_only/fifo_prefix
+        # surface) and is foreclosed anyway by two hardware ceilings at this shape -- see the
+        # raise below for both.
+        if not self.fuse_o:
+            shim_in = (1 + self.attn_cols) + (1 + 2 * self.mlp_cols)
+            raise NotImplementedError(
+                f"fuse_o=False has no standalone O-projection phase to embed in this device: "
+                f"an added Wo channel would need {shim_in} input channels "
+                f"(attn {1 + self.attn_cols} + mlp {1 + 2 * self.mlp_cols}) against NPU2's "
+                f"16-channel shim DMA budget, and swiglu_mlp_dp's gh buffer alone "
+                f"({self.FF * 2} B, mlp_cols-independent) already exceeds half the 64 KB L1 "
+                f"tile -- both silicon ceilings at this D={self.D}/FF={self.FF} shape, not a "
+                f"gap in decode_layer_dp. Use attn_block_dp + a standalone op_o gemv + "
+                f"swiglu_mlp_dp(fuse_o=False) as three separate designs instead (FUSE_MLP_O=0 "
+                f"at the generator falls back to exactly that)."
+            )
         # Delegate every per-half rule to the half that owns it rather than restating it here --
         # the two operators already raise at construction with their own messages. What is checked
         # HERE is only what is true of the MERGED device and of neither half alone.
@@ -148,6 +192,11 @@ class DecodeLayerDataParallel(MLIROperator):
                 f"attention places one KV head per core: Hkv ({self.Hkv}) must equal attn_cols "
                 f"({self.attn_cols})"
             )
+        # act is entirely owned by swiglu_mlp_dp (delegated, called as a bare function below) --
+        # checked here too, like kv_alloc/kv_block_size, so a bad value fails at construction
+        # rather than at MLIR generation.
+        if self.act not in ("silu", "gelu_tanh"):
+            raise ValueError(f"unknown act {self.act!r}")
         # kv_alloc/kv_block_size are the two fields this class does NOT delegate to a half's own
         # operator (attn_block_dp is called as a bare function here, not through
         # AttnBlockDataParallel), so -- like GEMV's alloc_M/block_size -- they are checked at
@@ -254,7 +303,7 @@ class DecodeLayerDataParallel(MLIROperator):
         mlp_used = _mlp_l1_footprint_bytes(self.D, self.FF, self.mlp_cols, self.Hq * self.HD,
                                            self.tile_rows_gu, self.weight_depth,
                                            self.mlp_stack_size, self.weight_dtype,
-                                           self.group_size)
+                                           self.group_size, self.post_norm)
         if mlp_used > L1_BYTES:
             raise ValueError(
                 f"MLP L1 use {mlp_used} B exceeds {L1_BYTES} B at mlp_cols={self.mlp_cols} -- "
@@ -307,7 +356,7 @@ class DecodeLayerDataParallel(MLIROperator):
         # shared this name -- the exact collision this property exists to prevent for its other
         # fields. Not repr=False-gated like them: it is a module env read, not a dataclass field.
         base = f"{base}{_scores_rowbatch_tag()}"
-        return f"{base}{self._wtag}"
+        return f"{base}{self._atag}{self._pntag}{self._wtag}"
 
     def get_mlir_artifact(self):
         return PythonGeneratedMLIRArtifact(
@@ -331,9 +380,12 @@ class DecodeLayerDataParallel(MLIROperator):
                     "window_parameter": self.window_parameter,
                     "weight_dtype": self.weight_dtype,
                     "group_size": self.group_size,
+                    "fuse_o": self.fuse_o,
                     "split_gh": self.split_gh,
                     "attn_split": self.attn_split,
                     "scores_rowbatch": _scores_rowbatch(),
+                    "act": self.act,
+                    "post_norm": self.post_norm,
                 },
             ),
         )
@@ -360,7 +412,7 @@ class DecodeLayerDataParallel(MLIROperator):
             # One object for both norm lengths: rms_norm.cc takes the length as an argument and
             # aliases the hd_ name onto the same body, so the D and head_dim call sites share one
             # copy on a core whose 16 KB program memory is the binding constraint.
-            obj("attn_rms.o", a2 / "rms_norm.cc", (), "attn_"),
+            obj("attn_rms.o", a2 / "rms_norm.cc", ["-DRMS_ALIAS_HD"], "attn_"),
             # The projection (K=d_model) and the scores (K=head_dim) share ONE runtime-K body,
             # aliased to the scores' name -- unless SCORES_ROWBATCH is on, whose template takes K
             # at compile time and so needs its own object. GEMV_ROWBATCH rides in the NAME because
@@ -403,12 +455,15 @@ class DecodeLayerDataParallel(MLIROperator):
         qflags = ([] if self.weight_dtype == "bf16"
                   else [f"-DGROUP_SIZE={self.group_size}",
                         f"-DQUANT_EMIT_{self.weight_dtype.upper()}=1"])
+        # Activation: silu.cc/gelu.cc export silu_tile_bf16/gelu_tile_bf16 at the identical
+        # in-place ABI -- swiglu_mlp_dp/op.py builds the same swap standalone.
+        _act_src = "silu.cc" if self.act == "silu" else "gelu.cc"
         mlp = [
             obj("mlp_add.o", gen / "add.cc", (), "mlp_"),
             obj("mlp_mul.o", gen / "mul.cc", (), "mlp_"),
             obj(f"mlp_rms_{self.D}.o", a2 / "rms_norm.cc",
                 [f"-DRMS_COLS={self.D}"], "mlp_"),
-            obj("mlp_silu.o", a2 / "silu.cc", (), "mlp_"),
+            obj(f"mlp_{self.act}.o", a2 / _act_src, (), "mlp_"),
             obj(f"mlp_gemv_{self.D}k{qtag}.o", qsrc,
                 [f"-DDIM_K={self.D}", f"-DVEC_SIZE={qvec}"] + qflags, "mlp_"),
             obj(f"mlp_down_gemv_{self.FF}k{qtag}.o", qsrc,
@@ -418,11 +473,18 @@ class DecodeLayerDataParallel(MLIROperator):
             obj("mlp_add_cxcopy.o", gen / "add.cc", (), "mlp_cx_"),
             obj("mlp_add_oacopy.o", gen / "add.cc", (), "mlp_oa_"),
         ]
+        if self.post_norm:
+            # See swiglu_mlp_dp/op.py's copy_pn_obj/mul_pn_obj.
+            mlp.append(obj("mlp_add_pncopy.o", gen / "add.cc", (), "mlp_pn_"))
+            mlp.append(obj("mlp_mul_pncopy.o", gen / "mul.cc", (), "mlp_pn_"))
         # Archive names must match what each design's own CORE_ARCHIVE builds from its
         # func_prefix -- "attn_" and "mlp_", set by design.py's decode_layer_dp.
         return [
             KernelArchiveArtifact("attn_attn_block_dp_core.a", dependencies=attn),
-            KernelArchiveArtifact(f"mlp_swiglu_mlp_dp_core{self._wtag}.a", dependencies=mlp),
+            KernelArchiveArtifact(
+                f"mlp_swiglu_mlp_dp_core{self._wtag}{self._atag}{self._pntag}.a",
+                dependencies=mlp,
+            ),
         ]
 
     @property
@@ -430,6 +492,17 @@ class DecodeLayerDataParallel(MLIROperator):
         """Format fragment shared by the object names, the archive name and `name`. Must equal
         swiglu_mlp_dp/design.py's `_WTAG`, which is what the emitted MLIR calls the archive."""
         return "" if self.weight_dtype == "bf16" else f"_{self.weight_dtype}g{self.group_size}"
+
+    @property
+    def _atag(self):
+        """Activation fragment, mirrors `_wtag` -- must equal swiglu_mlp_dp/design.py's
+        `_ACT_TAG` (via `act=`, passed straight through)."""
+        return "" if self.act == "silu" else f"_{self.act}"
+
+    @property
+    def _pntag(self):
+        """post_norm fragment, mirrors `_wtag` -- must equal swiglu_mlp_dp/design.py's `_PN_TAG`."""
+        return "_pn" if self.post_norm else ""
 
     def _wrow(self, K):
         """Wire units per weight ROW of width K: bf16 elements, or packed bytes when quantized."""
@@ -478,5 +551,9 @@ class DecodeLayerDataParallel(MLIROperator):
             self._wspec(D * self._wrow(FF)),                  # Wd
             AIERuntimeArgSpec("inout", (FF,)),                # gh all-gather scratch
             AIERuntimeArgSpec("inout", (D,)),                 # a all-gather scratch
+            # post_norms = pa | pff, packed (the MLP half is always fuse_o=True here, so both
+            # gains apply) -- SIXTEENTH host buffer, exactly at kMaxHostBOs. Omitted entirely at
+            # post_norm=False, which is what keeps the default arg list unchanged.
+            *([AIERuntimeArgSpec("in", (2 * D,))] if self.post_norm else []),
             AIERuntimeArgSpec("out", (D,)),                   # nxt
         ]

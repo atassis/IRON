@@ -4,15 +4,37 @@
 import numpy as np
 from ml_dtypes import bfloat16
 
+from iron.operators.gemv.reference import gelu_tanh_approx
 
-def reference(cur, a, n_pf, Wg, Wu, Wd, D, FF, epsilon=1e-5):
-    """CPU (f32) reference for the data-parallel decode SwiGLU MLP block. Same math as
+
+def _activate(g, act):
+    """The gated-FFN nonlinearity, selected by `act` -- SwiGLU (SiLU) or GeGLU (GELU tanh-approx,
+    matching gelu_tile_bf16 in aie_kernels/aie2p/gelu.cc). A SWAP, not an addition: the device
+    picks one kernel symbol per build (see op.py/design.py), so the reference mirrors that with a
+    branch rather than computing both."""
+    if act == "silu":
+        sig = np.empty_like(g)
+        pos = g >= 0
+        sig[pos] = 1.0 / (1.0 + np.exp(-g[pos]))
+        sig[~pos] = np.exp(g[~pos]) / (1.0 + np.exp(g[~pos]))
+        return g * sig
+    if act == "gelu_tanh":
+        return gelu_tanh_approx(g)
+    raise ValueError(f"unknown act {act!r}")
+
+
+def reference(cur, a, n_pf, Wg, Wu, Wd, D, FF, epsilon=1e-5, act="silu"):
+    """CPU (f32) reference for the data-parallel decode SwiGLU/GeGLU MLP block. Same math as
     swiglu_mlp_fused's reference (fusion/parallelism strategy does not change the numerics):
         x1  = cur + a
         hf  = RMSNorm_weighted(x1, n_pf, epsilon)
-        nxt = x1 + Wd @ (SiLU(Wg @ hf) * (Wu @ hf))
+        nxt = x1 + Wd @ (act(Wg @ hf) * (Wu @ hf))
     Wg, Wu are flat [FF*D] row-major (FF rows, D cols); Wd is flat [D*FF] row-major (D rows,
     FF cols) -- the on-wire layout every core's own column slice indexes into.
+
+    Does NOT model `post_norm` (the sandwich post-block norm slot) -- that parameter is
+    construction/arg-spec plumbing only in this task; see op.py's `reference()` for why a
+    post_norm=True call cannot be checked against this function as-is.
     """
     cur = np.asarray(cur, np.float32)
     a = np.asarray(a, np.float32)
@@ -26,19 +48,15 @@ def reference(cur, a, n_pf, Wg, Wu, Wd, D, FF, epsilon=1e-5):
     hf = (x1 / rms) * n_pf
 
     g = Wg @ hf
-    sig = np.empty_like(g)
-    pos = g >= 0
-    sig[pos] = 1.0 / (1.0 + np.exp(-g[pos]))
-    sig[~pos] = np.exp(g[~pos]) / (1.0 + np.exp(g[~pos]))
-    silu_g = g * sig
+    act_g = _activate(g, act)
     u = Wu @ hf
-    gh = silu_g * u
+    gh = act_g * u
     d = Wd @ gh
     nxt = x1 + d
     return nxt.astype(bfloat16)
 
 
-def generate_golden_reference(D, FF, seed=42):
+def generate_golden_reference(D, FF, seed=42, act="silu"):
     rng = np.random.default_rng(seed)
     val_range = 1.0
     cur = (rng.standard_normal(D) * val_range).astype(bfloat16)
@@ -47,11 +65,11 @@ def generate_golden_reference(D, FF, seed=42):
     Wg = (rng.standard_normal(FF * D) * val_range).astype(bfloat16)
     Wu = (rng.standard_normal(FF * D) * val_range).astype(bfloat16)
     Wd = (rng.standard_normal(D * FF) * val_range).astype(bfloat16)
-    nxt = reference(cur, a, n_pf, Wg, Wu, Wd, D, FF)
+    nxt = reference(cur, a, n_pf, Wg, Wu, Wd, D, FF, act=act)
     return {"cur": cur, "a": a, "n_pf": n_pf, "Wg": Wg, "Wu": Wu, "Wd": Wd, "nxt": nxt}
 
 
-def reference_fused_o(cur, cx, n_pf, Wo, Wg, Wu, Wd, D, FF, QD, epsilon=1e-5):
+def reference_fused_o(cur, cx, n_pf, Wo, Wg, Wu, Wd, D, FF, QD, epsilon=1e-5, act="silu"):
     """CPU (f32) reference for the fuse_o arm: same math as `reference()`, except `a` is computed
     on-chip from `Wo @ cx` instead of arriving as an external input.
 
@@ -64,10 +82,10 @@ def reference_fused_o(cur, cx, n_pf, Wo, Wg, Wu, Wd, D, FF, QD, epsilon=1e-5):
     cx = np.asarray(cx, np.float32)
     Wo = np.asarray(Wo, np.float32).reshape(-1, QD)[:D]
     a = (Wo @ cx).astype(bfloat16)
-    return reference(cur, a, n_pf, Wg, Wu, Wd, D, FF, epsilon)
+    return reference(cur, a, n_pf, Wg, Wu, Wd, D, FF, epsilon, act=act)
 
 
-def generate_golden_reference_fused_o(D, FF, QD, wo_rows_padded=None, seed=42):
+def generate_golden_reference_fused_o(D, FF, QD, wo_rows_padded=None, seed=42, act="silu"):
     """Golden inputs/output for the fuse_o arm. `wo_rows_padded` defaults to D (no padding) --
     callers exercising the real device path pass op.py's `_wo_rows_padded` so the returned `Wo`
     buffer matches the arg-spec size the device actually reads, with the tail rows zero (see
@@ -86,7 +104,7 @@ def generate_golden_reference_fused_o(D, FF, QD, wo_rows_padded=None, seed=42):
     Wg = (rng.standard_normal(FF * D) * val_range).astype(bfloat16)
     Wu = (rng.standard_normal(FF * D) * val_range).astype(bfloat16)
     Wd = (rng.standard_normal(D * FF) * val_range).astype(bfloat16)
-    nxt = reference_fused_o(cur, cx, n_pf, Wo, Wg, Wu, Wd, D, FF, QD)
+    nxt = reference_fused_o(cur, cx, n_pf, Wo, Wg, Wu, Wd, D, FF, QD, act=act)
     return {
         "cur": cur, "cx": cx, "n_pf": n_pf, "Wo": Wo, "Wg": Wg, "Wu": Wu, "Wd": Wd, "nxt": nxt,
     }

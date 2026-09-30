@@ -30,10 +30,10 @@ CORES sidesteps it entirely: each core carries only its own phase's `.text`, mea
 
 NO DONOR ROWS. The idle-row layout that would let a compute row borrow a neighbour's 64 KB data
 module (`isLegalMemAffinity`: own module plus South-non-memtile, North, West, East, up to 320 KB)
-is NOT used, because nothing here overruns: attention needs 45,568 B of L1 and the MLP 50,180 B,
-69.5% and 76.6% of one tile's own 64 KB. Neighbour memory is insurance against a budget that does
-not exist, and it would additionally need IRON to express a buffer on another tile's module, which
-it does not today. Left unbuilt deliberately -- reach for it only if a budget actually overruns.
+is NOT used, because nothing here overruns: at Qwen3-0.6B's shape attention needs 45,592 B of L1
+and the MLP 52,228 B, 69.6% and 79.7% of one tile's own 64 KB. Neighbour memory is insurance
+against a budget that does not exist, and it would additionally need IRON to express a buffer on
+another tile's module, which it does not today. Left unbuilt deliberately -- reach for it only if a budget actually overruns.
 
 COLUMN COUNTS DELIBERATELY DIFFER, 8 and 4. The MLP is at 4 columns because 8 was measured slower
 twice; attention requires 8 because `Hkv == n_aie_cols` is TMatVec's "one matrix per column" rule
@@ -99,9 +99,12 @@ def decode_layer_dp(
     window_parameter=None,
     weight_dtype="bf16",
     group_size=0,
+    fuse_o=True,
     split_gh=1,
     attn_split=None,
     scores_rowbatch=1,
+    act="silu",
+    post_norm=False,
 ):
     QD = Hq * HD
     # The two halves land in ONE device-wide symbol table and ONE fifo namespace, so each gets its
@@ -120,9 +123,10 @@ def decode_layer_dp(
     m = my_swiglu_mlp_dp(
         dev, D, FF, epsilon=eps_mlp, stack_size=mlp_stack_size,
         func_prefix=f"{func_prefix}mlp_", n_aie_cols=mlp_cols, n_aie_rows=1,
-        QD=QD, fuse_o=True, weight_depth=weight_depth, tile_rows_gu=tile_rows_gu,
+        QD=QD, fuse_o=fuse_o, weight_depth=weight_depth, tile_rows_gu=tile_rows_gu,
         weight_dtype=weight_dtype, group_size=group_size,
         fifo_prefix=f"{func_prefix}m_", parts_only=True, split_gh=split_gh,
+        act=act, post_norm=post_norm,
     )
 
     # L3 arguments, with the two the halves SHARE folded together rather than duplicated:
