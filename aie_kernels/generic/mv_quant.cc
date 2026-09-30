@@ -40,6 +40,8 @@
 #include <aie_api/aie.hpp>
 #include <stdint.h>
 
+#include "quant_row_layout.h"
+
 #ifndef VEC_SIZE
 #define VEC_SIZE 64
 #endif
@@ -56,6 +58,8 @@
 #ifndef SCALE_BF16
 #define SCALE_BF16 0
 #endif
+
+// Row layout: see quant_row_layout.h. PLANAR=1 selects the row-group form.
 
 namespace {
 
@@ -92,22 +96,50 @@ using scale_t = bfloat16;
 using scale_t = float;
 #endif
 
+// Agrees with quant.py's _SCALE_BYTES only by assertion: sizeof on a vendor type is not
+// self-evident here (bfp16ebs8 is 1 byte under Peano, 9 under Chess), and a disagreement would
+// shift every payload pointer silently.
+static_assert(sizeof(scale_t) == (SCALE_BF16 ? 2 : 4),
+              "scale_t width disagrees with quant.py's _SCALE_BYTES");
+
 inline int8_t sext4(uint8_t nibble) {
   return (int8_t)(((int8_t)(nibble << 4)) >> 4);
 }
+
+// The r-lane scale vector for a chunk spanning r/g groups. At r <= g that is the single broadcast
+// this loop has always used. At r == 2g it is two half-broadcasts concatenated, which is what
+// stops a group NARROWER than the vector from capping the vector: at g=32 the chunk was 32 lanes
+// wide against a 64-lane machine, so every per-iteration cost -- loop control, the scale multiply,
+// the bf16 convert -- was amortised over half the elements it could have been.
+template <uint32_t r, uint32_t g>
+inline ::aie::vector<bfloat16, r> chunk_scales(const scale_t *scale, uint32_t gi) {
+  if constexpr (r <= g) {
+    return ::aie::broadcast<bfloat16, r>((bfloat16)scale[gi]);
+  } else {
+    return ::aie::concat(::aie::broadcast<bfloat16, g>((bfloat16)scale[gi]),
+                         ::aie::broadcast<bfloat16, g>((bfloat16)scale[gi + 1]));
+  }
+}
+
+
+#ifndef MVQ_UNROLL
+#define MVQ_UNROLL 2   // two accumulators; 1 restores the single-accumulator loop
+#endif
 
 // r: vector chunk width (VEC_SIZE); k: full row length (DIM_K); g: quant group width
 // (GROUP_SIZE). A vector chunk must never straddle a group boundary, so g must be a multiple of r.
 template <uint32_t r, uint32_t k, uint32_t g>
 void matvec_int4_dequant(uint32_t m, const int8_t *__restrict a, const bfloat16 *__restrict b,
                          bfloat16 *__restrict c) {
-  static_assert(g % r == 0, "GROUP_SIZE must be a multiple of VEC_SIZE");
+  static_assert(g % r == 0 || r == 2 * g,
+                "a chunk must sit inside one group, or span exactly two (chunk_scales)");
   static_assert(k % g == 0, "DIM_K must be a whole number of groups");
   constexpr uint32_t n_groups = k / g;
   constexpr uint32_t header_bytes = n_groups * sizeof(scale_t);
-  constexpr uint32_t row_stride = header_bytes + k / 2;
-  static_assert(header_bytes % (r / 2) == 0, "int4 payload start must clear the load width");
-  static_assert(row_stride % (r / 2) == 0, "int4 row stride must clear the load width");
+  constexpr uint32_t payload_bytes = k / 2;
+  constexpr uint32_t row_stride = header_bytes + payload_bytes;
+  static_assert(QUANT_ALIGN_OK(r / 2, header_bytes, payload_bytes, row_stride),
+                "int4 payload load is not aligned under this layout");
   // %4 is the shared bf16-granule arena's alignment (iron/common/sequence.py), not scale_t's own
   // (2-byte for bf16 would only need 2-byte alignment by itself) -- see quant.py's
   // row_stride_bytes for the full derivation, including the odd-n_groups bf16 case this
@@ -118,23 +150,113 @@ void matvec_int4_dequant(uint32_t m, const int8_t *__restrict a, const bfloat16 
   const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   const uint8_t *a_bytes = reinterpret_cast<const uint8_t *>(a);
   for (uint32_t row = 0; row < m; row++) {
-    const uint8_t *rowp = a_bytes + row * row_stride;
-    const scale_t *scale = reinterpret_cast<const scale_t *>(rowp);
-    const int8_t *packed = reinterpret_cast<const int8_t *>(rowp + header_bytes);
+    const quant_row_offsets off = quant_row_at<row_stride, header_bytes, payload_bytes>(row);
+    const scale_t *scale = reinterpret_cast<const scale_t *>(a_bytes + off.header);
+    const int8_t *packed = reinterpret_cast<const int8_t *>(a_bytes + off.payload);
     // ONE flat loop and ONE reduce per row. Hoisting the scale per GROUP is arithmetically nicer
     // but costs a reduce_add per group (8 per row at k=1024,g=128) against the 16 vector muls it
     // saves, and a 64-lane reduce is a log-depth shuffle chain -- far more than a vector mul.
     // It also nests the loops, and hardware loops are innermost-only (contract K013).
-    ::aie::accum<accfloat, r> acc = ::aie::zeros<accfloat, r>();
-    uint32_t chunk = 0;
-    for (const bfloat16 *__restrict b_cur = b; b_cur < b + k; b_cur += r, chunk++) {
-      ::aie::vector<int8, r / 2> raw = ::aie::load_v<r / 2>(packed + chunk * (r / 2));
-      ::aie::vector<int8, r> q8 = ::aie::unpack(::aie::vector_cast<int4>(raw));
-      ::aie::vector<bfloat16, r> qbf = ::aie::to_float<bfloat16>(q8, 0);
-      ::aie::vector<bfloat16, r> sv =
-          ::aie::broadcast<bfloat16, r>((bfloat16)scale[(chunk * r) / g]);
-      acc = ::aie::mac(acc, ::aie::mul(qbf, sv).template to_vector<bfloat16>(),
-                       ::aie::load_v<r>(b_cur));
+    // One accumulator makes chunk c+1's mac wait on chunk c's: the loop is recurrence-bound, not
+    // slot-bound, measured at 15 bundles with 1 idle. MVQ_UNROLL=2 runs two independent
+    // accumulators over even/odd chunks and sums once at the end -- 0.2344 -> 0.1328
+    // bundles/element. Changes summation order (shallower tree, slightly MORE accurate), so it is
+    // not bit-identical: gate on token parity, never a logits byte-compare. Needs an even chunk
+    // count; odd falls back. See kb/breaking-the-accumulator-recurrence-halves-the-decode-gemv-loop.
+    ::aie::accum<accfloat, r> acc;
+    if constexpr (MVQ_UNROLL == 2 && (k / r) % 2 == 0) {
+      ::aie::accum<accfloat, r> acc0 = ::aie::zeros<accfloat, r>();
+      ::aie::accum<accfloat, r> acc1 = ::aie::zeros<accfloat, r>();
+      const bfloat16 *__restrict b_cur = b;
+      for (uint32_t chunk = 0; chunk < k / r; chunk += 2) {
+        ::aie::vector<int8, r / 2> raw0 = ::aie::load_v<r / 2>(packed + chunk * (r / 2));
+        ::aie::vector<int8, r> q8_0 = ::aie::unpack(::aie::vector_cast<int4>(raw0));
+        ::aie::vector<bfloat16, r> qbf0 = ::aie::to_float<bfloat16>(q8_0, 0);
+        ::aie::vector<bfloat16, r> sv0 = chunk_scales<r, g>(scale, (chunk * r) / g);
+        acc0 = ::aie::mac(acc0, ::aie::mul(qbf0, sv0).template to_vector<bfloat16>(),
+                          ::aie::load_v<r>(b_cur));
+        b_cur += r;
+        ::aie::vector<int8, r / 2> raw1 = ::aie::load_v<r / 2>(packed + (chunk + 1) * (r / 2));
+        ::aie::vector<int8, r> q8_1 = ::aie::unpack(::aie::vector_cast<int4>(raw1));
+        ::aie::vector<bfloat16, r> qbf1 = ::aie::to_float<bfloat16>(q8_1, 0);
+        ::aie::vector<bfloat16, r> sv1 = chunk_scales<r, g>(scale, ((chunk + 1) * r) / g);
+        acc1 = ::aie::mac(acc1, ::aie::mul(qbf1, sv1).template to_vector<bfloat16>(),
+                          ::aie::load_v<r>(b_cur));
+        b_cur += r;
+      }
+      acc = ::aie::add(acc0, acc1);
+    } else {
+      acc = ::aie::zeros<accfloat, r>();
+      uint32_t chunk = 0;
+      for (const bfloat16 *__restrict b_cur = b; b_cur < b + k; b_cur += r, chunk++) {
+        ::aie::vector<int8, r / 2> raw = ::aie::load_v<r / 2>(packed + chunk * (r / 2));
+        ::aie::vector<int8, r> q8 = ::aie::unpack(::aie::vector_cast<int4>(raw));
+        ::aie::vector<bfloat16, r> qbf = ::aie::to_float<bfloat16>(q8, 0);
+        ::aie::vector<bfloat16, r> sv = chunk_scales<r, g>(scale, (chunk * r) / g);
+        acc = ::aie::mac(acc, ::aie::mul(qbf, sv).template to_vector<bfloat16>(),
+                         ::aie::load_v<r>(b_cur));
+      }
+    }
+    c[row] = static_cast<bfloat16>(::aie::reduce_add(acc.template to_vector<float>()));
+  }
+  ::aie::set_rounding(saved_rounding);
+}
+
+// RUNTIME-K sibling of matvec_int4_dequant: k is a function argument, not a template constant, so
+// ONE compiled object serves every K a caller names at generator time (gemma4-w-device-runtime-
+// k-unsplit) -- merge_devices' body-equality check needs identical .o's, and -DDIM_K forces a new
+// one per K. ROW_GROUP stays the compile-time macro; this family's K's all derive it as 1 (K022).
+// Priced free on this loop by mv-quant-runtime-k-row-group-cost; built here for the first time.
+// `if (n_chunks % 2 == 0)` below is an ordinary runtime branch, not `if constexpr` -- k is not
+// compile-time -- so both loop bodies are compiled in, unlike the template form above.
+template <uint32_t r, uint32_t g>
+void matvec_int4_dequant_rtk(uint32_t m, uint32_t k, const int8_t *__restrict a,
+                             const bfloat16 *__restrict b, bfloat16 *__restrict c) {
+  const uint32_t n_groups = k / g;
+  const uint32_t header_bytes = n_groups * sizeof(scale_t);
+  const uint32_t payload_bytes = k / 2;
+  const uint32_t row_stride = header_bytes + payload_bytes;
+
+  const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
+  const uint8_t *a_bytes = reinterpret_cast<const uint8_t *>(a);
+  const uint32_t n_chunks = k / r;
+  for (uint32_t row = 0; row < m; row++) {
+    const quant_row_offsets off = quant_row_at_rt(row, row_stride, header_bytes, payload_bytes);
+    const scale_t *scale = reinterpret_cast<const scale_t *>(a_bytes + off.header);
+    const int8_t *packed = reinterpret_cast<const int8_t *>(a_bytes + off.payload);
+    ::aie::accum<accfloat, r> acc;
+    if (MVQ_UNROLL == 2 && (n_chunks % 2) == 0) {
+      ::aie::accum<accfloat, r> acc0 = ::aie::zeros<accfloat, r>();
+      ::aie::accum<accfloat, r> acc1 = ::aie::zeros<accfloat, r>();
+      const bfloat16 *__restrict b_cur = b;
+      for (uint32_t chunk = 0; chunk < n_chunks; chunk += 2) {
+        ::aie::vector<int8, r / 2> raw0 = ::aie::load_v<r / 2>(packed + chunk * (r / 2));
+        ::aie::vector<int8, r> q8_0 = ::aie::unpack(::aie::vector_cast<int4>(raw0));
+        ::aie::vector<bfloat16, r> qbf0 = ::aie::to_float<bfloat16>(q8_0, 0);
+        ::aie::vector<bfloat16, r> sv0 = chunk_scales<r, g>(scale, (chunk * r) / g);
+        acc0 = ::aie::mac(acc0, ::aie::mul(qbf0, sv0).template to_vector<bfloat16>(),
+                          ::aie::load_v<r>(b_cur));
+        b_cur += r;
+        ::aie::vector<int8, r / 2> raw1 = ::aie::load_v<r / 2>(packed + (chunk + 1) * (r / 2));
+        ::aie::vector<int8, r> q8_1 = ::aie::unpack(::aie::vector_cast<int4>(raw1));
+        ::aie::vector<bfloat16, r> qbf1 = ::aie::to_float<bfloat16>(q8_1, 0);
+        ::aie::vector<bfloat16, r> sv1 = chunk_scales<r, g>(scale, ((chunk + 1) * r) / g);
+        acc1 = ::aie::mac(acc1, ::aie::mul(qbf1, sv1).template to_vector<bfloat16>(),
+                          ::aie::load_v<r>(b_cur));
+        b_cur += r;
+      }
+      acc = ::aie::add(acc0, acc1);
+    } else {
+      acc = ::aie::zeros<accfloat, r>();
+      const bfloat16 *__restrict b_cur = b;
+      for (uint32_t chunk = 0; chunk < n_chunks; chunk++, b_cur += r) {
+        ::aie::vector<int8, r / 2> raw = ::aie::load_v<r / 2>(packed + chunk * (r / 2));
+        ::aie::vector<int8, r> q8 = ::aie::unpack(::aie::vector_cast<int4>(raw));
+        ::aie::vector<bfloat16, r> qbf = ::aie::to_float<bfloat16>(q8, 0);
+        ::aie::vector<bfloat16, r> sv = chunk_scales<r, g>(scale, (chunk * r) / g);
+        acc = ::aie::mac(acc, ::aie::mul(qbf, sv).template to_vector<bfloat16>(),
+                         ::aie::load_v<r>(b_cur));
+      }
     }
     c[row] = static_cast<bfloat16>(::aie::reduce_add(acc.template to_vector<float>()));
   }
@@ -144,20 +266,22 @@ void matvec_int4_dequant(uint32_t m, const int8_t *__restrict a, const bfloat16 
 template <uint32_t r, uint32_t k, uint32_t g>
 void matvec_int8_dequant(uint32_t m, const int8_t *__restrict a, const bfloat16 *__restrict b,
                          bfloat16 *__restrict c) {
-  static_assert(g % r == 0, "GROUP_SIZE must be a multiple of VEC_SIZE");
+  static_assert(g % r == 0 || r == 2 * g,
+                "a chunk must sit inside one group, or span exactly two (chunk_scales)");
   static_assert(k % g == 0, "DIM_K must be a whole number of groups");
   constexpr uint32_t n_groups = k / g;
   constexpr uint32_t header_bytes = n_groups * sizeof(scale_t);
-  constexpr uint32_t row_stride = header_bytes + k;
-  static_assert(header_bytes % r == 0, "int8 payload start must clear the load width");
-  static_assert(row_stride % r == 0, "int8 row stride must clear the load width");
+  constexpr uint32_t payload_bytes = k;
+  constexpr uint32_t row_stride = header_bytes + payload_bytes;
+  static_assert(QUANT_ALIGN_OK(r, header_bytes, payload_bytes, row_stride),
+                "int8 payload load is not aligned under this layout");
 
   const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   const uint8_t *a_bytes = reinterpret_cast<const uint8_t *>(a);
   for (uint32_t row = 0; row < m; row++) {
-    const uint8_t *rowp = a_bytes + row * row_stride;
-    const scale_t *scale = reinterpret_cast<const scale_t *>(rowp);
-    const int8_t *packed = reinterpret_cast<const int8_t *>(rowp + header_bytes);
+    const quant_row_offsets off = quant_row_at<row_stride, header_bytes, payload_bytes>(row);
+    const scale_t *scale = reinterpret_cast<const scale_t *>(a_bytes + off.header);
+    const int8_t *packed = reinterpret_cast<const int8_t *>(a_bytes + off.payload);
     // ONE flat loop and ONE reduce per row, the same shape the int4 path uses and for the same
     // reason: a per-GROUP scale hoist costs a reduce_add per group (8 per row at k=1024,g=128)
     // plus a dependent scalar FMA chain, and a 64-lane reduce is a log-depth shuffle chain. It
@@ -173,8 +297,7 @@ void matvec_int8_dequant(uint32_t m, const int8_t *__restrict a, const bfloat16 
     for (const bfloat16 *__restrict b_cur = b; b_cur < b + k; b_cur += r, chunk++) {
       ::aie::vector<int8, r> q8 = ::aie::load_v<r>(packed + chunk * r);
       ::aie::vector<bfloat16, r> qbf = ::aie::to_float<bfloat16>(q8, 0);
-      ::aie::vector<bfloat16, r> sv =
-          ::aie::broadcast<bfloat16, r>((bfloat16)scale[(chunk * r) / g]);
+      ::aie::vector<bfloat16, r> sv = chunk_scales<r, g>(scale, (chunk * r) / g);
       acc = ::aie::mac(acc, ::aie::mul(qbf, sv).template to_vector<bfloat16>(),
                        ::aie::load_v<r>(b_cur));
     }
@@ -219,9 +342,10 @@ void matvec_int4_affine(uint32_t m, const int8_t *__restrict a, const bfloat16 *
   static_assert(k % g == 0, "DIM_K must be a whole number of groups");
   constexpr uint32_t n_groups = k / g;
   constexpr uint32_t header_bytes = 4 * n_groups;
-  constexpr uint32_t row_stride = header_bytes + k / 2;
-  static_assert(header_bytes % (r / 2) == 0, "int4a payload start must clear the load width");
-  static_assert(row_stride % (r / 2) == 0, "int4a row stride must clear the load width");
+  constexpr uint32_t payload_bytes = k / 2;
+  constexpr uint32_t row_stride = header_bytes + payload_bytes;
+  static_assert(QUANT_ALIGN_OK(r / 2, header_bytes, payload_bytes, row_stride),
+                "int4a payload load is not aligned under this layout");
 
   float bsum[n_groups];
   group_sums_of_b<r, k, g>(b, bsum);
@@ -229,10 +353,10 @@ void matvec_int4_affine(uint32_t m, const int8_t *__restrict a, const bfloat16 *
   const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   const uint8_t *a_bytes = reinterpret_cast<const uint8_t *>(a);
   for (uint32_t row = 0; row < m; row++) {
-    const uint8_t *rowp = a_bytes + row * row_stride;
-    const bfloat16 *scale = reinterpret_cast<const bfloat16 *>(rowp);
-    const bfloat16 *mins = reinterpret_cast<const bfloat16 *>(rowp + 2 * n_groups);
-    const int8_t *packed = reinterpret_cast<const int8_t *>(rowp + header_bytes);
+    const quant_row_offsets off = quant_row_at<row_stride, header_bytes, payload_bytes>(row);
+    const bfloat16 *scale = reinterpret_cast<const bfloat16 *>(a_bytes + off.header);
+    const bfloat16 *mins = reinterpret_cast<const bfloat16 *>(a_bytes + off.header + 2 * n_groups);
+    const int8_t *packed = reinterpret_cast<const int8_t *>(a_bytes + off.payload);
     ::aie::accum<accfloat, r> acc = ::aie::zeros<accfloat, r>();
     uint32_t chunk = 0;
     for (const bfloat16 *__restrict b_cur = b; b_cur < b + k; b_cur += r, chunk++) {
@@ -258,9 +382,10 @@ void matvec_int8_affine(uint32_t m, const int8_t *__restrict a, const bfloat16 *
   static_assert(k % g == 0, "DIM_K must be a whole number of groups");
   constexpr uint32_t n_groups = k / g;
   constexpr uint32_t header_bytes = 4 * n_groups;
-  constexpr uint32_t row_stride = header_bytes + k;
-  static_assert(header_bytes % r == 0, "int8a payload start must clear the load width");
-  static_assert(row_stride % r == 0, "int8a row stride must clear the load width");
+  constexpr uint32_t payload_bytes = k;
+  constexpr uint32_t row_stride = header_bytes + payload_bytes;
+  static_assert(QUANT_ALIGN_OK(r, header_bytes, payload_bytes, row_stride),
+                "int8a payload load is not aligned under this layout");
   constexpr uint32_t chunks_per_group = g / r;
 
   float bsum[n_groups];
@@ -269,10 +394,10 @@ void matvec_int8_affine(uint32_t m, const int8_t *__restrict a, const bfloat16 *
   const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   const uint8_t *a_bytes = reinterpret_cast<const uint8_t *>(a);
   for (uint32_t row = 0; row < m; row++) {
-    const uint8_t *rowp = a_bytes + row * row_stride;
-    const bfloat16 *scale = reinterpret_cast<const bfloat16 *>(rowp);
-    const bfloat16 *mins = reinterpret_cast<const bfloat16 *>(rowp + 2 * n_groups);
-    const int8_t *packed = reinterpret_cast<const int8_t *>(rowp + header_bytes);
+    const quant_row_offsets off = quant_row_at<row_stride, header_bytes, payload_bytes>(row);
+    const bfloat16 *scale = reinterpret_cast<const bfloat16 *>(a_bytes + off.header);
+    const bfloat16 *mins = reinterpret_cast<const bfloat16 *>(a_bytes + off.header + 2 * n_groups);
+    const int8_t *packed = reinterpret_cast<const int8_t *>(a_bytes + off.payload);
     const bfloat16 *__restrict b_cur = b;
     float row_sum = 0.0f;
     for (uint32_t gi = 0; gi < n_groups; gi++) {
@@ -302,7 +427,7 @@ void matvec_int8_affine(uint32_t m, const int8_t *__restrict a, const bfloat16 *
 //
 // Unset, all four are emitted -- the behaviour any caller that predates this flag expects.
 #if !defined(QUANT_EMIT_INT4) && !defined(QUANT_EMIT_INT8) && \
-    !defined(QUANT_EMIT_INT4A) && !defined(QUANT_EMIT_INT8A)
+    !defined(QUANT_EMIT_INT4A) && !defined(QUANT_EMIT_INT8A) && !defined(QUANT_EMIT_INT4_RTK)
 #define QUANT_EMIT_INT4 1
 #define QUANT_EMIT_INT8 1
 #define QUANT_EMIT_INT4A 1
@@ -342,6 +467,17 @@ void matvec_vectorized_int8a_bf16(uint32_t m, uint32_t row_offset, const int8_t 
                                   const bfloat16 *__restrict b_in, bfloat16 *__restrict c_out) {
   c_out += row_offset;
   matvec_int8_affine<VEC_SIZE, DIM_K, GROUP_SIZE>(m, a_in, b_in, c_out);
+}
+#endif
+
+// Wrapper for matvec_int4_dequant_rtk above. Standalone (no DIM_K needed), so it is in the "any
+// QUANT_EMIT_* set" gate above, not just its own #if.
+#if defined(QUANT_EMIT_INT4_RTK) && QUANT_EMIT_INT4_RTK
+void matvec_vectorized_int4_bf16_rtk(uint32_t m, uint32_t row_offset, uint32_t k,
+                                     const int8_t *__restrict a_in, const bfloat16 *__restrict b_in,
+                                     bfloat16 *__restrict c_out) {
+  c_out += row_offset;
+  matvec_int4_dequant_rtk<VEC_SIZE, GROUP_SIZE>(m, k, a_in, b_in, c_out);
 }
 #endif
 

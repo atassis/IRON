@@ -195,6 +195,65 @@ void matvec_vectorized_rtk(uint32_t m, uint32_t k,
     }
 }
 
+// G-batched form of matvec_vectorized_rtk: G query rows (`a`, contiguous [G][k]) dotted against
+// the shared vector `b`, writing row_off within each head's out_stride-wide segment of `c`. See
+// iron/operators/attn_global_dp/design.py's flash_worker_l1_bytes for why (combined per-head
+// buffers, kb: attn-global-flash-per-row-call-overhead).
+template <uint32_t r>
+void matvec_vectorized_rtk_gstride(uint32_t G, uint32_t row_off, uint32_t k, uint32_t out_stride,
+                                   const bfloat16 *__restrict a, const bfloat16 *__restrict b,
+                                   bfloat16 *__restrict c)
+{
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    const bfloat16 *b_end = b + k;
+    for (uint32_t g = 0; g < G; g++, a += k, c += out_stride) {
+        aie::accum<accfloat, r> acc = aie::zeros<accfloat, r>();
+        const bfloat16 *__restrict a_cur = a;
+        AIE_LOOP_MIN_ITERATION_COUNT(2)
+        for (const bfloat16 *__restrict b_cur = b; b_cur < b_end; b_cur += r, a_cur += r) {
+            aie::vector<bfloat16, r> a_vec = aie::load_v<r>(a_cur);
+            aie::vector<bfloat16, r> b_vec = aie::load_v<r>(b_cur);
+            acc = aie::mac(acc, a_vec, b_vec);
+        }
+        c[row_off] = static_cast<bfloat16>(aie::reduce_add(acc.template to_vector<float>()));
+    }
+}
+
+// docs/superpowers/specs/2026-09-25-flash-multirow-mmul-design.md section 1, P2: the 4 heads'
+// accumulator chains and reduce_add_v trees are interleaved instead of run one head at a time, so
+// they overlap. G is fixed at 4 (the reduce_add_v call below), not a template/runtime parameter --
+// the caller-side ABI parity with sc_matvec_g_rtk_bf16_bf16 is kept at the extern "C" wrapper.
+// `kblk` is `rows` contiguous K rows [rows][k]; `q_in` is G contiguous k-wide query rows, resident
+// across the whole call.
+template <uint32_t r>
+void matvec_g4_rows_rtk_gstride(uint32_t rows, uint32_t row_off, uint32_t k, uint32_t out_stride,
+                                const bfloat16 *__restrict q_in,
+                                const bfloat16 *__restrict kblk,
+                                bfloat16 *__restrict sc)
+{
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    const bfloat16 *__restrict krow = kblk;
+    for (uint32_t p = 0; p < rows; p++, krow += k) {
+        aie::accum<accfloat, r> acc[4];
+        AIE_LOOP_UNROLL_FULL
+        for (uint32_t g = 0; g < 4; g++) acc[g] = aie::zeros<accfloat, r>();
+        const bfloat16 *__restrict k_end = krow + k;
+        AIE_LOOP_MIN_ITERATION_COUNT(2)
+        for (const bfloat16 *__restrict k_cur = krow; k_cur < k_end; k_cur += r) {
+            aie::vector<bfloat16, r> kv = aie::load_v<r>(k_cur);
+            uint32_t off = (uint32_t)(k_cur - krow);
+            AIE_LOOP_UNROLL_FULL
+            for (uint32_t g = 0; g < 4; g++)
+                acc[g] = aie::mac(acc[g], aie::load_v<r>(q_in + g * k + off), kv);
+        }
+        auto s = aie::reduce_add_v(acc[0].template to_vector<float>(), acc[1].template to_vector<float>(),
+                                   acc[2].template to_vector<float>(), acc[3].template to_vector<float>());
+        AIE_LOOP_UNROLL_FULL
+        for (uint32_t g = 0; g < 4; g++)
+            sc[g * out_stride + row_off + p] = static_cast<bfloat16>(s[g]);
+    }
+}
+
 extern "C" {
 
 /* The row offset parameter in the functions below is a workaround. The output will be written to c + row_offset * m.
@@ -231,6 +290,30 @@ void sc_matvec_rtk_bf16_bf16(uint32_t m,
                              const bfloat16 *__restrict b_in,
                              bfloat16 *__restrict c_out)
     __attribute__((alias("matvec_rtk_bf16_bf16")));
+#endif
+
+#ifdef GEMV_ALIAS_SC
+// attn_global_flash's per-row score call, G resident heads in one: `a_in` is G contiguous
+// HD-wide query rows, `b_in` is the shared K row, `c_out` is [G][out_stride] with row `row_off`
+// written per head.
+void sc_matvec_g_rtk_bf16_bf16(uint32_t G, uint32_t row_off, uint32_t k, uint32_t out_stride,
+                               const bfloat16 *__restrict a_in,
+                               const bfloat16 *__restrict b_in,
+                               bfloat16 *__restrict c_out)
+{
+    matvec_vectorized_rtk_gstride<VEC_SIZE>(G, row_off, k, out_stride, a_in, b_in, c_out);
+}
+#endif
+
+#ifdef GEMV_ALIAS_SC
+void sc_matvec_g_rows_bf16_bf16(uint32_t rows, uint32_t G, uint32_t row_off, uint32_t k,
+                                uint32_t out_stride,
+                                const bfloat16 *__restrict q_in,
+                                const bfloat16 *__restrict kblk,
+                                bfloat16 *__restrict sc)
+{
+    matvec_g4_rows_rtk_gstride<VEC_SIZE>(rows, row_off, k, out_stride, q_in, kblk, sc);
+}
 #endif
 
 void matvec_vectorized_bf16_bf16(uint32_t m,

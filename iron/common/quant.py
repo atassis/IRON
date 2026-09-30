@@ -10,6 +10,13 @@ Four dtypes, two families. Byte-for-byte contract with aie_kernels/generic/mv_qu
       (row, group).  row = ``[n_groups x bf16 scale][n_groups x bf16 min][payload]``
 
 payload = K/2 nibble-packed bytes (int4, low nibble = even column) or K int8 bytes.
+
+TWO LAYOUTS, selected by `layout=`. `"header_first"` is the shape above and the default, byte-for-
+byte what every existing caller gets. `"row_group_planar"` moves the scales OUT of the row: rows
+are grouped `ROW_GROUP` at a time as `[payload_0 .. payload_{G-1}][header_0 .. header_{G-1}]`, so a
+payload row starts at a multiple of its own byte length and the header stops sitting between the
+buffer base and the first vector load. See `max_legal_vec_size` for what that is worth and for the
+constraint it does NOT lift.
 At equal BYTES the affine family is strictly better on this model: at K=1024 the symmetric
 f32-scale g=128 row and the affine g=128 row are both 544 B, and mean dequant rel-L2 over the
 MLP tensors is 0.1230 against 0.1034. The extra expressiveness is worth more than a finer group:
@@ -36,6 +43,12 @@ interface with no owner, the failure class that costs device runs to find.
 import numpy as np
 
 _QMAX = {"int4": 7, "int8": 127}
+# The signed type's true low level, one step below -_QMAX. Reaching it is a QUANTIZER
+# choice, not a format change: the nibble pack (`q & 0xF`), the sign-extending unpack
+# (`lo >= 8 -> lo - 16`) and mv_quant.cc's `vector_cast<int4>` all already carry it.
+# Restricting to +-_QMAX costs nothing on a continuous weight distribution and is
+# catastrophic on a checkpoint QAT-trained against all 16 levels -- see `full_range`.
+_QMIN_FULL = {"int4": -8, "int8": -128}
 _SCALE_BYTES = {"f32": 4, "bf16": 2}
 
 # AFFINE ("a"-suffixed) weight dtypes: dequant = q*s + m, with a bf16 scale AND a bf16 min per
@@ -55,6 +68,31 @@ _SCALE_BYTES = {"f32": 4, "bf16": 2}
 #     misaligned -- the constraint that was read as forcing a tile-planar [Q][S][Z] layout.
 _AFFINE = {"int4a": 4, "int8a": 8}
 _AFFINE_HEADER_BYTES = 4          # bf16 scale + bf16 min, per group
+
+# LAYOUT of a packed weight buffer. "header_first" is [n_groups x scale][payload] per row, the
+# shape mv_quant.cc has always read. "row_group_planar" groups ROW_GROUP rows and puts all their
+# payloads before all their headers.
+LAYOUTS = ("header_first", "row_group_planar")
+
+# Rows per planar block. Derived per design, not frozen at a constant: the L1 tile the DMA hands
+# a core is `tile_size_input` rows and a planar block cannot be split (row i's payload and its
+# header sit ROW_GROUP*payload apart), so the tile must hold a whole number of blocks. A fixed
+# G=8 (mmul's output-row count) overflows L1 at some shapes, so the deriving function takes the
+# L1 budget as a parameter instead of assuming one value fits everywhere.
+ROW_GROUP_DEFAULT = 1
+
+# Element order WITHIN a planar block's payload region.
+#   "row_major"  (implemented) -- row i's K elements contiguous at i*K.
+#   "mmul_8x8"   (NOT implemented) -- the order aie::mmul's B operand consumes, which for a weight
+#                stored [Nout, K] and a reduction chunk of 8 is
+#                    packed(n, k) = (n/8)*(8*K) + (k/8)*64 + (k%8)*8 + (n%8)
+#                i.e. reduction-major then output-minor inside a 64-element tile, tiles consecutive.
+#                Consumption order equals memory order, so the minimum contiguous run is the whole
+#                8*K region and no shim reorder is needed. NOT built, and deliberately: the mmul
+#                shape is a small-K lever (the fixed per-output-row block is ~90% of per-output
+#                cost at K=128 and ~13% at K=3840) and weight GEMVs are transport-bound today, so
+#                it converts at roughly nothing until quantization has made the op core-bound.
+PAYLOAD_ORDERS = ("row_major", "mmul_8x8")
 
 
 def _affine_levels(weight_dtype):
@@ -88,8 +126,18 @@ def header_bytes(K: int, group_size: int, weight_dtype: str, scale_dtype: str = 
             else _scale_header_bytes(n_groups, scale_dtype))
 
 
+def widest_chunk(group_size: int, weight_dtype: str, cap: int = 64) -> int:
+    """The widest VEC_SIZE whose scale vector mv_quant.cc can form -- see `chunk_scales` there.
+
+    ONE owner: the packer and the operator derive row_group from this independently and never
+    compare, so a disagreement is a byte layout written one way and read another, not an error.
+    """
+    return min(cap, group_size if weight_dtype in _AFFINE else 2 * group_size)
+
+
 def max_legal_vec_size(Ks, group_size: int, weight_dtype: str, scale_dtype: str = "f32",
-                       cap: int = 64) -> int:
+                       cap: int = 64, layout: str = "header_first",
+                       row_group: int = ROW_GROUP_DEFAULT) -> int:
     """The widest VEC_SIZE whose payload load is aligned for every K a design builds.
 
     THIS IS WHY int4 WAS CORRECT AND int8 WAS GARBAGE. The payload starts `header_bytes` into a
@@ -104,16 +152,42 @@ def max_legal_vec_size(Ks, group_size: int, weight_dtype: str, scale_dtype: str 
     (`TSI_GU * WROW_D == TSI_D * WROW_FF`); a round-up is not proportional. Planar scales are
     the general fix and would make both problems disappear.
 
+    WHAT PLANAR DOES AND DOES NOT LIFT. `layout="row_group_planar"` removes `header_bytes` from
+    the derivation entirely, and with it the K dependence: every shape in this tree then returns
+    `min(cap, group_size)`. That is NOT "the full 512 bits everywhere". `mv_quant.cc` carries
+    `static_assert(g % r == 0)` in all four dtype templates -- the per-group scale meets a chunk as
+    ONE broadcast, so a chunk must not straddle a group -- and that assert is about arithmetic, not
+    addressing, so no layout touches it. Consequence at Gemma-4's K=3840 int8: 256b at g32 and
+    512b at g64 under BOTH layouts, i.e. planar at the shipped g32 moves nothing there and only
+    pays once the group also moves to 64. What it does buy is that g64 stops being punished at
+    K=3840 (128b -> 512b) and that every (dtype, K, group) becomes legal, including the two this
+    tree has recorded as refusals: int8 g128 at K=3840, and int4 g64 at gemma3-270m's K=640.
+
     Raises if no width down to 8 is legal -- refuse rather than emit a kernel that lies.
     """
     if weight_dtype not in _QMAX and weight_dtype not in _AFFINE:
         return cap
-    vec = min(cap, group_size)
+    # A chunk may span TWO groups, not just sit inside one: mv_quant.cc's chunk_scales builds the
+    # scale vector as two half-broadcasts concatenated there. Without this a group narrower than
+    # the machine's vector caps the vector -- int4 at g32 ran 32 lanes wide on a 64-lane core and
+    # paid every per-iteration cost twice per element, 0.438 bundles/element against int8 g64's
+    # 0.250. The affine kernels keep the old rule; their header is a different shape and no
+    # caller needs the width yet.
+    vec = widest_chunk(group_size, weight_dtype, cap)
     while vec >= 8:
         load = _load_bytes(weight_dtype, vec)
-        if all(header_bytes(K, group_size, weight_dtype, scale_dtype) % load == 0
-               and row_stride_bytes(K, group_size, weight_dtype, scale_dtype) % load == 0
-               for K in Ks):
+        if _check_layout(layout) == "row_group_planar":
+            # The header is no longer between the base and the payload, so what has to clear the
+            # load width is the PAYLOAD row (rows sit end to end inside a block) and the BLOCK.
+            ok = all(payload_bytes(K, weight_dtype) % load == 0
+                     and block_stride_bytes(K, group_size, weight_dtype, scale_dtype,
+                                            layout, row_group) % load == 0
+                     for K in Ks)
+        else:
+            ok = all(header_bytes(K, group_size, weight_dtype, scale_dtype) % load == 0
+                     and row_stride_bytes(K, group_size, weight_dtype, scale_dtype) % load == 0
+                     for K in Ks)
+        if ok:
             return vec
         vec //= 2
     raise ValueError(
@@ -156,21 +230,145 @@ def row_stride_bytes(K: int, group_size: int, weight_dtype: str, scale_dtype: st
     return stride
 
 
+def _check_layout(layout: str) -> str:
+    if layout not in LAYOUTS:
+        raise ValueError(f"unknown layout {layout!r} (expected one of {LAYOUTS})")
+    return layout
+
+
+def payload_bytes(K: int, weight_dtype: str) -> int:
+    """Bytes of quantized payload in ONE row. Two nibbles per byte at 4 bits."""
+    if weight_dtype not in _QMAX and weight_dtype not in _AFFINE:
+        raise ValueError(f"unknown weight_dtype {weight_dtype!r}")
+    return K // 2 if weight_dtype in ("int4", "int4a") else K
+
+
+def derive_row_group(Ks, group_size: int, weight_dtype: str, vec_size: int,
+                     scale_dtype: str = "f32", max_rows: int = None) -> int:
+    """Smallest ROW_GROUP whose block base clears a `vec_size`-element payload load at every K.
+
+    `max_rows` is the caller's tile budget -- the rows an L1 tile can hold. Passing it turns an
+    unbuildable blocking into a named refusal here instead of an `'aie.tile' op Basic sequential
+    allocation also failed` later, which names a tile and not a size.
+    """
+    load = _load_bytes(weight_dtype, vec_size)
+    g = 1
+    while True:
+        if all(payload_bytes(K, weight_dtype) % load == 0
+               and (g * row_stride_bytes(K, group_size, weight_dtype, scale_dtype)) % load == 0
+               for K in Ks):
+            break
+        g += 1
+        if g > 64:
+            raise ValueError(
+                f"no ROW_GROUP <= 64 aligns a {vec_size}-element {weight_dtype} load over "
+                f"K={sorted(Ks)} at group_size={group_size}")
+    if max_rows is not None and g > max_rows:
+        raise ValueError(
+            f"row_group_planar needs {g} rows per block at {weight_dtype}/g{group_size} "
+            f"vec_size={vec_size} over K={sorted(Ks)}, but the tile holds {max_rows}. A block "
+            f"cannot be cut: row i's payload and header are ROW_GROUP*payload apart. Raise "
+            f"tile_size_input to a multiple of {g} (and check L1), or pick a group whose row "
+            f"stride needs a smaller block.")
+    return g
+
+
+def block_stride_bytes(K: int, group_size: int, weight_dtype: str, scale_dtype: str = "f32",
+                       layout: str = "header_first", row_group: int = ROW_GROUP_DEFAULT) -> int:
+    """Bytes from one addressing block to the next: one ROW under `header_first`, ROW_GROUP rows
+    under `row_group_planar`.
+
+    Proportional in K under BOTH layouts, which is the property `swiglu_mlp_dp` rests on: gate/up
+    (row width D) and down (row width FF) ride one ObjectFifo and the design asserts
+    `TSI_GU * WROW_D == TSI_D * WROW_FF`. It holds because a row is affine in K with a
+    PROPORTIONAL header, and `ROW_GROUP * (K + 4K/g)` keeps that. It is also why padding the header
+    to the vector width was rejected: a round-up is not proportional (3*1056 == 3168 holds,
+    3*1088 != 3200 does not).
+    """
+    rows = row_group if _check_layout(layout) == "row_group_planar" else 1
+    return rows * row_stride_bytes(K, group_size, weight_dtype, scale_dtype)
+
+
+def row_offsets(row: int, K: int, group_size: int, weight_dtype: str, scale_dtype: str = "f32",
+                layout: str = "header_first", row_group: int = ROW_GROUP_DEFAULT) -> tuple:
+    """(payload_offset, header_offset) of `row`, in bytes from the buffer base.
+
+    ONE owner for the arithmetic mv_quant.cc reimplements per dtype, so the two cannot drift:
+
+        header_first:        rowp = row*stride;  header at rowp;  payload at rowp + header_bytes
+        row_group_planar:    blkp = (row//G)*G*stride
+                             payload at blkp + (row%G)*payload_bytes
+                             header  at blkp + G*payload_bytes + (row%G)*header_bytes
+    """
+    stride = row_stride_bytes(K, group_size, weight_dtype, scale_dtype)
+    hdr = (_AFFINE_HEADER_BYTES * (K // group_size) if is_affine(weight_dtype)
+           else _scale_header_bytes(K // group_size, scale_dtype))
+    pay = payload_bytes(K, weight_dtype)
+    if _check_layout(layout) == "header_first":
+        return row * stride + hdr, row * stride
+    blk, i = divmod(row, row_group)
+    base = blk * row_group * stride
+    return base + i * pay, base + row_group * pay + i * hdr
+
+
+def _rows_to_planar(rows: np.ndarray, K: int, weight_dtype: str, row_group: int) -> np.ndarray:
+    """[M, stride] `[header][payload]` rows -> flat row-group-planar bytes.
+
+    Written as a REORDER of the header-first bytes rather than as a second packing path, so the
+    two layouts cannot disagree about a value: only where a byte lives changes, never what it is.
+    """
+    M, stride = rows.shape
+    pay = payload_bytes(K, weight_dtype)
+    hdr = stride - pay
+    if M % row_group:
+        raise ValueError(
+            f"row_group_planar needs M ({M}) to be a whole number of {row_group}-row blocks; a "
+            f"partial block would put the next block's payload at an unaligned offset, which is "
+            f"the defect this layout exists to remove")
+    b = M // row_group
+    r = rows.reshape(b, row_group, stride)
+    out = np.empty((b, row_group * stride), dtype=np.uint8)
+    out[:, :row_group * pay] = r[:, :, hdr:].reshape(b, -1)
+    out[:, row_group * pay:] = r[:, :, :hdr].reshape(b, -1)
+    return out.reshape(-1)
+
+
+def _planar_to_rows(packed: np.ndarray, M: int, K: int, stride: int, weight_dtype: str,
+                    row_group: int) -> np.ndarray:
+    """Inverse of _rows_to_planar: flat planar bytes -> [M, stride] `[header][payload]` rows."""
+    pay = payload_bytes(K, weight_dtype)
+    hdr = stride - pay
+    b = M // row_group
+    blocks = np.asarray(packed).view(np.uint8).reshape(b, row_group * stride)
+    rows = np.empty((b, row_group, stride), dtype=np.uint8)
+    rows[:, :, hdr:] = blocks[:, :row_group * pay].reshape(b, row_group, pay)
+    rows[:, :, :hdr] = blocks[:, row_group * pay:].reshape(b, row_group, hdr)
+    return rows.reshape(M, stride)
+
+
 def _mse_optimal_scale(Wg: np.ndarray, qmax: int, n_candidates: int,
-                        clip_lo: float, clip_hi: float) -> np.ndarray:
+                        clip_lo: float, clip_hi: float, qlo: int = None) -> np.ndarray:
     """Per-group MSE-optimal symmetric scale: grid-search c in [clip_lo, clip_hi] and pick
     scale = c*amax/qmax minimising the group's reconstruction MSE. Same clip-and-round quantizer
     as the c=1.0 (today's) case -- only the scale differs.
 
     Wg: [M, n_groups, group_size]. Returns scale [M, n_groups] float32.
     """
+    if qlo is None:
+        qlo = -qmax
     amax = np.max(np.abs(Wg), axis=2)  # [M, n_groups]
     cs = np.linspace(clip_lo, clip_hi, n_candidates)
+    if qlo < -qmax:
+        # Lands the low level exactly on amax (scale = amax/-qlo). On a group whose extreme IS
+        # that level -- every group of a checkpoint quantized to this grid -- it is the exact
+        # answer, and a linspace hits it only by luck: 7/8 and 127/128 both fall between
+        # candidates at any round candidate count.
+        cs = np.append(cs, qmax / float(-qlo))
     best_scale = np.where(amax > 0, amax / qmax, 1.0).astype(np.float32)  # c=1.0 fallback
     best_mse = np.full(amax.shape, np.inf, dtype=np.float64)
     for c in cs:
         scale_c = np.where(amax > 0, c * amax / qmax, 1.0).astype(np.float32)
-        q = np.clip(np.round(Wg / scale_c[:, :, None]), -qmax, qmax)
+        q = np.clip(np.round(Wg / scale_c[:, :, None]), qlo, qmax)
         recon = q * scale_c[:, :, None]
         mse = np.mean((Wg - recon) ** 2, axis=2, dtype=np.float64)
         better = mse < best_mse
@@ -180,7 +378,8 @@ def _mse_optimal_scale(Wg: np.ndarray, qmax: int, n_candidates: int,
 
 
 def _pack_affine(W: np.ndarray, group_size: int, weight_dtype: str,
-                  zero_on_grid: bool = True) -> np.ndarray:
+                  zero_on_grid: bool = True, layout: str = "header_first",
+                  row_group: int = ROW_GROUP_DEFAULT) -> np.ndarray:
     """Affine pack: row = [n_groups x bf16 scale][n_groups x bf16 min][payload].
 
     The scale and min are rounded to bf16 BEFORE q is solved, so the fit is against the values
@@ -246,17 +445,22 @@ def _pack_affine(W: np.ndarray, group_size: int, weight_dtype: str,
         out[:, pay:] = (nib[:, 0::2] | (nib[:, 1::2] << 4)).astype(np.uint8)
     else:
         out[:, pay:] = q.astype(np.int8).view(np.uint8)
+    if _check_layout(layout) == "row_group_planar":
+        return _rows_to_planar(out, K, weight_dtype, row_group).view(np.int8)
     return out.reshape(-1).view(np.int8)
 
 
 def _unpack_affine(packed: np.ndarray, M: int, K: int, group_size: int,
-                    weight_dtype: str) -> np.ndarray:
+                    weight_dtype: str, layout: str = "header_first",
+                    row_group: int = ROW_GROUP_DEFAULT) -> np.ndarray:
     import ml_dtypes
     stride = row_stride_bytes(K, group_size, weight_dtype)
     n_groups = K // group_size
     hdr = 2 * n_groups
     pay = 2 * hdr
-    rows = np.asarray(packed).view(np.uint8).reshape(M, stride)
+    rows = (_planar_to_rows(packed, M, K, stride, weight_dtype, row_group)
+            if _check_layout(layout) == "row_group_planar"
+            else np.asarray(packed).view(np.uint8).reshape(M, stride))
     s = rows[:, :hdr].view(ml_dtypes.bfloat16).reshape(M, n_groups).astype(np.float32)
     m = rows[:, hdr:2 * hdr].view(ml_dtypes.bfloat16).reshape(M, n_groups).astype(np.float32)
     payload = rows[:, pay:]
@@ -277,7 +481,10 @@ def _unpack_affine(packed: np.ndarray, M: int, K: int, group_size: int,
 def quantize_weight(W: np.ndarray, group_size: int, weight_dtype: str, *,
                      clip_search: bool = False, n_clip_candidates: int = 61,
                      clip_range: tuple = (0.4, 1.0), scale_dtype: str = "f32",
-                     affine_zero_on_grid: bool = True) -> np.ndarray:
+                     full_range: bool = False,
+                     affine_zero_on_grid: bool = True, layout: str = "header_first",
+                     payload_order: str = "row_major",
+                     row_group: int = ROW_GROUP_DEFAULT) -> np.ndarray:
     """W: [M, K] float-ish array. Returns a flat np.int8 array of M * row_stride_bytes bytes,
     the exact device-side wire format mv_quant.cc reads (bit-for-bit; dtype is int8 purely so the
     generated MLIR types this buffer's shim BDs as ``i8``, matching decode_ddr_bytes.py's parser --
@@ -291,18 +498,36 @@ def quantize_weight(W: np.ndarray, group_size: int, weight_dtype: str, *,
     scale_dtype: "f32" (default, unchanged) or "bf16" -- narrows the stored per-group scale to 2
     bytes, shrinking row_stride_bytes accordingly. mv_quant.cc must be built with the matching
     `SCALE_BF16` setting to read this format; the two sides move together (see file docstring).
+
+    full_range: quantize onto [_QMIN_FULL, qmax] -- all 2**n levels -- instead of the symmetric
+    [-qmax, qmax]. Same wire format and same kernel, so this is a pack-time choice. It matters
+    only where the weights themselves sit on the full grid: on a checkpoint QAT-trained against
+    4-bit, dropping the low level is a 23x error penalty, while on a continuous distribution it
+    is worth a fraction of a percent. Pair it with `clip_search`, whose search then runs over the
+    same levels the packer clamps to.
     """
+    _check_layout(layout)
+    if payload_order not in PAYLOAD_ORDERS:
+        raise ValueError(f"unknown payload_order {payload_order!r} (expected {PAYLOAD_ORDERS})")
+    if payload_order != "row_major":
+        raise NotImplementedError(
+            f"payload_order={payload_order!r} is declared but not implemented -- see PAYLOAD_ORDERS "
+            f"for its index expression and for why it is not built yet. It is a permutation INSIDE "
+            f"a row_group_planar block's payload region, so adopting it changes this packer's "
+            f"inner loop and nothing about the buffer map.")
     if is_affine(weight_dtype):
         if clip_search:
             raise ValueError("clip_search is a symmetric-scale search and does not apply to the "
                              "affine dtypes; the affine fit already uses the group's full range")
-        return _pack_affine(W, group_size, weight_dtype, zero_on_grid=affine_zero_on_grid)
+        return _pack_affine(W, group_size, weight_dtype, zero_on_grid=affine_zero_on_grid,
+                            layout=layout, row_group=row_group)
     if weight_dtype not in _QMAX:
         raise ValueError(f"unknown weight_dtype {weight_dtype!r} (expected 'int4' or 'int8')")
     M, K = W.shape
     stride = row_stride_bytes(K, group_size, weight_dtype, scale_dtype)
     n_groups = K // group_size
     qmax = _QMAX[weight_dtype]
+    qlo = _QMIN_FULL[weight_dtype] if full_range else -qmax
 
     Wf = np.asarray(W, dtype=np.float32)
     Wg = Wf.reshape(M, n_groups, group_size)
@@ -311,8 +536,8 @@ def quantize_weight(W: np.ndarray, group_size: int, weight_dtype: str, *,
         scale = np.where(amax > 0, amax / qmax, 1.0).astype(np.float32)
     else:
         lo, hi = clip_range
-        scale = _mse_optimal_scale(Wg, qmax, n_clip_candidates, lo, hi)
-    q = np.clip(np.round(Wg / scale[:, :, None]), -qmax, qmax).astype(np.int32).reshape(M, K)
+        scale = _mse_optimal_scale(Wg, qmax, n_clip_candidates, lo, hi, qlo=qlo)
+    q = np.clip(np.round(Wg / scale[:, :, None]), qlo, qmax).astype(np.int32).reshape(M, K)
 
     out = np.zeros((M, stride), dtype=np.uint8)
     scale_bytes = _scale_header_bytes(n_groups, scale_dtype)
@@ -332,11 +557,14 @@ def quantize_weight(W: np.ndarray, group_size: int, weight_dtype: str, *,
     else:
         packed = q.astype(np.int8).view(np.uint8)
     out[:, pay:] = packed
+    if layout == "row_group_planar":
+        return _rows_to_planar(out, K, weight_dtype, row_group).view(np.int8)
     return out.reshape(-1).view(np.int8)
 
 
 def dequantize_weight(packed: np.ndarray, M: int, K: int, group_size: int, weight_dtype: str, *,
-                       scale_dtype: str = "f32", emulate_kernel_scale_cast: bool = False
+                       scale_dtype: str = "f32", emulate_kernel_scale_cast: bool = False,
+                       layout: str = "header_first", row_group: int = ROW_GROUP_DEFAULT
                        ) -> np.ndarray:
     """Inverse of quantize_weight, for a CPU-side golden reference. Returns [M, K] float32.
 
@@ -349,12 +577,15 @@ def dequantize_weight(packed: np.ndarray, M: int, K: int, group_size: int, weigh
     already bf16-narrow by construction.
     """
     if is_affine(weight_dtype):
-        return _unpack_affine(packed, M, K, group_size, weight_dtype)
+        return _unpack_affine(packed, M, K, group_size, weight_dtype, layout=layout,
+                              row_group=row_group)
     stride = row_stride_bytes(K, group_size, weight_dtype, scale_dtype)
     n_groups = K // group_size
     scale_bytes = _scale_header_bytes(n_groups, scale_dtype)
     pay = scale_bytes
-    rows = np.asarray(packed).view(np.uint8).reshape(M, stride)
+    rows = (_planar_to_rows(packed, M, K, stride, weight_dtype, row_group)
+            if _check_layout(layout) == "row_group_planar"
+            else np.asarray(packed).view(np.uint8).reshape(M, stride))
     if scale_dtype == "f32":
         scale = rows[:, :scale_bytes].reshape(M, scale_bytes).view(np.float32).reshape(
             M, n_groups)
@@ -379,6 +610,48 @@ def dequantize_weight(packed: np.ndarray, M: int, K: int, group_size: int, weigh
     q = q.reshape(M, n_groups, group_size).astype(np.float32)
     W = q * scale[:, :, None]
     return W.reshape(M, K)
+
+
+def quantize_weight_chunked(W: np.ndarray, group_size: int, weight_dtype: str, n_chunks: int,
+                             **kwargs) -> np.ndarray:
+    """Pack W: [M, K] as `n_chunks` INDEPENDENTLY-quantized column-slices, concatenated block by
+    block: block r = ``quantize_weight(W[:, r*K_chunk:(r+1)*K_chunk], group_size, weight_dtype)``,
+    each with its OWN header (scales computed from that slice alone, not the full row). This is
+    swiglu_mlp_dp's `gh_chunks>1` wire format (design.py's module docstring, "Wd's L3 layout
+    becomes R independently-quantized [D_out, D] planar blocks instead of one [D_out, FF] block"),
+    NOT a slice of one `quantize_weight(W, ...)` call over the full row -- those two are different
+    bytes even though they cover the same logical weight (see `row_stride_bytes`: a row's header
+    covers ALL of K's groups, so slicing it at a K_CHUNK boundary cuts across the header/payload
+    split rather than along it). Feeding the plain, unchunked `quantize_weight(W, ...)` output to a
+    `gh_chunks>1` build reads garbage -- confirmed on device 2026-09-14, see
+    g4-t2-mlp-l1-floor / gh-chunks-device-gate-fails-with-a-1-in-4-nan-stride.
+
+    K must be a whole multiple of n_chunks (asserted); `kwargs` forward to `quantize_weight`
+    (clip_search, scale_dtype, ...), applied identically per chunk.
+    """
+    M, K = W.shape
+    assert K % n_chunks == 0, f"K={K} must be a whole multiple of n_chunks={n_chunks}"
+    K_chunk = K // n_chunks
+    blocks = [quantize_weight(W[:, r * K_chunk:(r + 1) * K_chunk], group_size, weight_dtype,
+                              **kwargs)
+              for r in range(n_chunks)]
+    return np.concatenate(blocks)
+
+
+def dequantize_weight_chunked(packed: np.ndarray, M: int, K: int, group_size: int,
+                               weight_dtype: str, n_chunks: int, **kwargs) -> np.ndarray:
+    """Inverse of `quantize_weight_chunked`, for a CPU-side golden reference. Returns [M, K]
+    float32, reassembled column-slice by column-slice."""
+    K_chunk = K // n_chunks
+    stride_chunk = row_stride_bytes(K_chunk, group_size, weight_dtype,
+                                    kwargs.get("scale_dtype", "f32"))
+    block_bytes = M * stride_chunk
+    chunks = [
+        dequantize_weight(packed[r * block_bytes:(r + 1) * block_bytes], M, K_chunk, group_size,
+                          weight_dtype, **kwargs)
+        for r in range(n_chunks)
+    ]
+    return np.concatenate(chunks, axis=1)
 
 
 def quantize_weight_asymmetric_research(W: np.ndarray, group_size: int, *, nbits: int = 4,
