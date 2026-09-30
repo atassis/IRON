@@ -27,13 +27,28 @@ class RMSNorm(MLIROperator):
     tile_size: int
     weighted: bool = False
     epsilon: float = 1e-5  # RMSNorm eps; Llama 1e-5 (default), Gemma 1e-6
+    # Native bf16-pair gain scale instead of the emulated f32 multiply -- rms_norm.cc's
+    # RMS_BF16_SCALE (118 -> 22 bundles/32 elem, kb/the-norm-kernels-pay-an-emulated-f32-vector-
+    # multiply). A precision change, so it rides the kernel object name, never a bare -D.
+    bf16_scale: bool = False
+    # Per-core buffer allocation strategy ('basic-sequential' or 'bank-aware'), forwarded to each
+    # Worker -- see GEMM's twin field (iron/operators/gemm/op.py) for the measurement this mirrors.
+    allocation_scheme: str | None = field(default=None, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
         **MLIROperator._name_aliases,
         "weighted": "w",
         "epsilon": "eps",
+        "bf16_scale": "bf16s",
     }
+
+    @property
+    def _kernel_obj_name(self) -> str:
+        """rms_norm.cc's compiled object filename, read by both get_kernel_artifacts (what gets
+        built) and get_mlir_artifact (what the generated Kernel() binds to) -- one predicate, so
+        the two cannot name different files for the same self.bf16_scale."""
+        return "rms_norm_bf16scale.o" if self.bf16_scale else "rms_norm.o"
 
     def __post_init__(self):
         dev = aie_utils.get_current_device()
@@ -90,6 +105,7 @@ class RMSNorm(MLIROperator):
                     0,  # trace_size
                     self.epsilon,
                 ),
+                {"allocation_scheme": self.allocation_scheme, "kernel_obj": self._kernel_obj_name},
             ),
         )
 
@@ -97,12 +113,13 @@ class RMSNorm(MLIROperator):
         arch_dir = get_kernel_dir()
         artifacts = [
             KernelObjectArtifact(
-                "rms_norm.o",
+                self._kernel_obj_name,
                 dependencies=[
                     SourceArtifact(
                         self.context.base_dir / "aie_kernels" / arch_dir / "rms_norm.cc"
                     )
                 ],
+                extra_flags=["-DRMS_BF16_SCALE=1"] if self.bf16_scale else [],
             ),
         ]
         if self.weighted:

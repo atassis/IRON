@@ -90,3 +90,26 @@ def test_rope(rows, cols, angle_rows, aie_columns, method_type, aie_context):
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
 
     assert not errors, f"Test failed with errors: {errors}"
+
+
+@pytest.mark.parametrize("tokens,heads,rotary,head_dim", [(16, 16, 64, 256)])
+def test_rope_partial_rows(tokens, heads, rotary, head_dim, aie_context):
+    """Qwen3.5's partial rotary: the first 64 of each 256-wide head row, one angle row per token
+    covering its heads. The op writes only the rotated columns, so the rest of `output` stays 0."""
+    import torch
+
+    rows = tokens * heads
+    golden_ref = generate_golden_reference(rows=rows, cols=rotary, context_len=tokens,
+                                           method_type=0)
+    x = golden_ref["A"].transpose(0, 1).contiguous().reshape(rows, rotary)
+    y = golden_ref["C"].transpose(0, 1).contiguous().reshape(rows, rotary)
+    full_in = torch.randn(rows, head_dim).to(x.dtype)
+    full_in[:, :rotary] = x
+    full_out = torch.zeros(rows, head_dim, dtype=y.dtype)
+    full_out[:, :rotary] = y
+    operator = RoPE(rows=rows, cols=rotary, num_aie_columns=8, angle_rows=tokens, method_type=0,
+                    row_stride=head_dim, context=aie_context)
+    errors, latency_us, _ = run_test(operator, {"in": full_in, "angles": golden_ref["B"]},
+                                     {"output": full_out}, rel_tol=0.05, abs_tol=0.5)
+    print(f"\nLatency (us): {latency_us:.1f}")
+    assert not errors, f"Test failed with errors: {errors}"

@@ -24,6 +24,11 @@ class RoPE(MLIROperator):
     angle_rows: int | None = None
     num_aie_columns: int = 1
     method_type: int = 0
+    # Width of a tensor row when only its first `cols` rotate (partial rotary); None = cols.
+    row_stride: int | None = None
+    # Per-core buffer allocation strategy ('basic-sequential' or 'bank-aware'), forwarded to each
+    # Worker -- see GEMM's twin field (iron/operators/gemm/op.py) for the measurement this mirrors.
+    allocation_scheme: str | None = field(default=None, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -31,6 +36,7 @@ class RoPE(MLIROperator):
         "num_aie_columns": "col",
         "angle_rows": "arows",
         "method_type": "m",
+        "row_stride": "rs",
     }
 
     def __post_init__(self):
@@ -48,6 +54,8 @@ class RoPE(MLIROperator):
             and self.angle_rows % self.num_aie_columns == 0
         ):
             raise ValueError("angle_rows must be divisible by num_aie_columns")
+        if self.row_stride is not None and self.row_stride < self.cols:
+            raise ValueError(f"row_stride ({self.row_stride}) is narrower than cols ({self.cols})")
         if self.method_type not in {0, 1}:
             raise ValueError(f"method_type must be 0 or 1, got {self.method_type}")
 
@@ -68,6 +76,8 @@ class RoPE(MLIROperator):
                     0,
                     self.method_type,
                 ),
+                {"allocation_scheme": self.allocation_scheme,
+                 **({"row_stride": self.row_stride} if self.row_stride else {})},
             ),
         )
 
@@ -88,9 +98,9 @@ class RoPE(MLIROperator):
 
     def get_arg_spec(self):
         return [
-            AIERuntimeArgSpec("in", (self.rows, self.cols)),  # input tensor
+            AIERuntimeArgSpec("in", (self.rows, self.row_stride or self.cols)),  # input tensor
             AIERuntimeArgSpec("in", (self.angle_rows, self.cols)),  # angles
-            AIERuntimeArgSpec("out", (self.rows, self.cols)),  # output
+            AIERuntimeArgSpec("out", (self.rows, self.row_stride or self.cols)),  # output
         ]
 
     def reference(self, x, angles):

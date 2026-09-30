@@ -34,7 +34,11 @@ def rope(
     trace_size=0,
     method_type=None,
     func_prefix="",
+    allocation_scheme=None,
+    row_stride=None,
 ):
+    """`row_stride` > cols rotates the first `cols` of each `row_stride`-wide row and leaves the
+    rest unwritten: a partial rotary over whole head rows, in place."""
     dtype = bfloat16
 
     if angle_rows is None:
@@ -59,7 +63,8 @@ def rope(
     tensor_rows_per_angle_row = rows // angle_rows
 
     # Define tensor types
-    tensor_ty = np.ndarray[(rows, cols), np.dtype[dtype]]
+    stride = row_stride or cols
+    tensor_ty = np.ndarray[(rows, stride), np.dtype[dtype]]
     angle_ty = np.ndarray[(angle_rows, cols), np.dtype[dtype]]
     tensor_tile_ty = np.ndarray[(1, cols), np.dtype[dtype]]
     angle_tile_ty = np.ndarray[(1, cols), np.dtype[dtype]]
@@ -103,6 +108,7 @@ def rope(
                 of_out[i].prod(),
                 rope_kernel,
             ],
+            allocation_scheme=allocation_scheme,
         )
         for i in range(num_aie_columns)
     ]
@@ -114,6 +120,13 @@ def rope(
             i * tensor_rows_per_aie_column * cols,  # Start offset for column i
             [1, 1, 1, tensor_rows_per_aie_column * cols],
             [0, 0, 0, 1],
+        )
+        if stride == cols
+        else TensorAccessPattern(
+            (rows, stride),
+            i * tensor_rows_per_aie_column * stride,
+            [1, 1, tensor_rows_per_aie_column, cols],
+            [0, 0, stride, 1],
         )
         for i in range(num_aie_columns)
     ]
