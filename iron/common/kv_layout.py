@@ -41,9 +41,8 @@ class KVLayout:
     """Where a (head, position) slice of a bf16-granularity KV cache lives, in ELEMENTS.
 
     Hkv: number of kv heads.
-    S:   capacity, in positions (today, capacity == the attention window -- see
-         [[the-kv-window-and-the-kv-capacity-are-separable]] for the DIFFERENT axis that
-         decouples them, which this class does not attempt).
+    S:   capacity, in positions (today, capacity == the attention window; a capacity larger
+         than the window is a different, decoupled axis this class does not attempt).
     HD:  head_dim, in elements.
     T:   block size, in positions. `T == S` means "one block" -- today's flat layout.
     """
