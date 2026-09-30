@@ -157,6 +157,8 @@ class FusedDispatch(SequenceDispatch):
             buffer_sizes=seq.buffer_sizes,
             slice_info=seq.slice_info,
             extra_runlists=extra,
+            merge_devices=seq.merge_devices,
+            collapse_configures=seq.collapse_configures,
         )
 
     def _collect_kernel_artifacts(self, seq):
@@ -302,6 +304,11 @@ class OperatorSequence(AIEOperatorBase):
             follows in its usual (first-appearance-in-runlist) order. Default
             ``None`` keeps today's layout (first-appearance order for every
             scratch buffer) unchanged.
+        merge_devices: Fused dispatch only. Operators whose devices are identical outside their
+            runtime sequences share one device, each keeping its own named sequence. Cuts
+            designs, not configures.
+        collapse_configures: With merge_devices, consecutive runs on one shared device share one
+            configure. Correct only for designs whose cores re-arm their runtime barriers.
     """
 
     def __init__(
@@ -316,6 +323,8 @@ class OperatorSequence(AIEOperatorBase):
         share_designs=False,
         scratch_order=None,
         extra_runlists=None,
+        merge_devices=False,
+        collapse_configures=False,
         *args,
         **kwargs,
     ):
@@ -341,6 +350,10 @@ class OperatorSequence(AIEOperatorBase):
         # Sharing changes which designs are built, so it belongs in the name that
         # keys the build artifacts.
         self.name = name + "_shared" if share_designs else name
+        if collapse_configures and not merge_devices:
+            raise ValueError("collapse_configures needs merge_devices")
+        self.name += "_merged" if merge_devices else ""
+        self.name += "_collapsed" if collapse_configures else ""
         self.input_args = input_args
         self.output_args = output_args
         self.explicit_buffer_sizes = (
@@ -349,6 +362,8 @@ class OperatorSequence(AIEOperatorBase):
         # Extra aiecc flags forwarded to the full-ELF build.
         self.extra_flags = extra_flags or []
         self.share_designs = share_designs
+        self.merge_devices = merge_devices
+        self.collapse_configures = collapse_configures
         self.scratch_order = scratch_order
         self._dispatch = dispatch
 

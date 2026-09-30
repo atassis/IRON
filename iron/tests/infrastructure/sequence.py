@@ -265,6 +265,71 @@ def test_extra_runlists_emit_named_sequences(with_variant, aie_context, tmp_path
 
 
 # ---------------------------------------------------------------------------
+# 2c. merge_devices folds shape-only variants into one device with named sequences.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("merge,collapse", [(True, False), (True, True), (False, False)])
+def test_merge_devices_folds_identical_bodies(merge, collapse, aie_context, tmp_path):
+    """Two tiles_rtp GEMVs differing only in M have identical device bodies; a stock GEMV does
+    not. With `merge=False` (the control) every design keeps its own device."""
+    from iron.operators.gemv.op import GEMV
+
+    kw = dict(K=256, num_aie_columns=8, tile_size_input=16, tile_size_output=64,
+              context=aie_context)
+    short, long_ = GEMV(M=512, tiles_rtp=True, **kw), GEMV(M=1024, tiles_rtp=True, **kw)
+    stock = GEMV(M=512, **kw)
+    seq = OperatorSequence(
+        name=f"infra_merge_{merge}_{collapse}",
+        runlist=[(short, "Wa", "x", "ya"), (long_, "Wb", "x", "yb"), (stock, "Wa", "x", "yc")],
+        input_args=["x"],
+        output_args=["ya", "yb", "yc"],
+        buffer_sizes={"x": 512, "Wa": 512 * 512, "Wb": 1024 * 512,
+                      "ya": 1024, "yb": 2048, "yc": 1024},
+        dispatch="fused",
+        merge_devices=merge,
+        collapse_configures=collapse,
+        context=aie_context,
+    )
+    text, seq = _fused_text(seq, tmp_path)
+    devices = re.findall(r"aie\.device\(npu2\) @(op\d+_GEMV)", text)
+    configures = re.findall(r"aiex\.configure @(\w+)", text)
+    if not merge:
+        assert devices == ["op0_GEMV", "op1_GEMV", "op2_GEMV"]
+        # Three configure points is odd, so the reset device evens the parity.
+        assert configures == devices + ["reset_device"] and "seq_op" not in text
+        return
+    assert devices == ["op0_GEMV", "op2_GEMV"], devices
+    assert "aie.runtime_sequence @seq_op1_GEMV(" in text
+    assert "aiex.run @seq_op1_GEMV(" in text
+    if collapse:
+        # op0 and op1 back to back on the shared device: one configure, an even count, no reset.
+        assert configures == ["op0_GEMV", "op2_GEMV"], configures
+    else:
+        assert configures == ["op0_GEMV", "op0_GEMV", "op2_GEMV", "reset_device"], configures
+
+
+def test_pointwise_modes_share_one_device(aie_context, tmp_path):
+    """Add, Mul and GELU as Pointwise modes build one device body; merged, they run on one device."""
+    from iron.operators.pointwise.op import Pointwise
+
+    kw = dict(size=3840, tile_size=480, context=aie_context)
+    rl = [(Pointwise(mode=m, **kw), "a", "b" if m != "gelu" else "a", f"y_{m}")
+          for m in ("add", "mul", "gelu")]
+    seq = OperatorSequence(
+        name="infra_pointwise", runlist=rl, input_args=["a", "b"],
+        output_args=["y_add", "y_mul", "y_gelu"],
+        buffer_sizes={n: 7680 for n in ("a", "b", "y_add", "y_mul", "y_gelu")},
+        dispatch="fused", merge_devices=True, collapse_configures=True, context=aie_context,
+    )
+    text, _ = _fused_text(seq, tmp_path)
+    assert re.findall(r"aie\.device\(npu2\) @(op\d+_\w+)", text) == ["op0_Pointwise"]
+    assert re.findall(r"aiex\.configure @(\w+)", text) == ["op0_Pointwise", "reset_device"]
+    assert re.findall(r"aiex\.run @(\w+)\(", text) == ["sequence", "seq_op1_Pointwise",
+                                                       "seq_op2_Pointwise"]
+
+
+# ---------------------------------------------------------------------------
 # 3. Every NPU dispatch mode produces bit-identical output.
 # ---------------------------------------------------------------------------
 
