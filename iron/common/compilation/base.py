@@ -36,9 +36,14 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from uuid import uuid4
+import hashlib
+import os
 import os.path
 import shutil
+import threading
 import zlib
 import logging
 import subprocess
@@ -475,6 +480,77 @@ class PythonCallbackCompilationCommand(CompilationCommand):
         return f"PythonCallback({self.callback})"
 
 
+def _compile_jobs() -> int:
+    """IRON_COMPILE_JOBS, default half the machine's cores (the half-cores build rule)."""
+    raw = os.environ.get("IRON_COMPILE_JOBS")
+    if raw:
+        try:
+            n = int(raw)
+            if n >= 1:
+                return n
+        except ValueError:
+            pass
+    return max(1, (os.cpu_count() or 1) // 2)
+
+
+def _run_chain(chain: list[CompilationCommand]) -> None:
+    for command in chain:
+        logging.debug(f"  Executing command: {command}")
+        success = command.run()
+        if not success:
+            raise RuntimeError(f"Command failed: {command}")
+
+
+class ParallelCompilationCommand(CompilationCommand):
+    """Runs independent command CHAINS concurrently, honoring IRON_COMPILE_JOBS.
+
+    Each chain is a list of CompilationCommand that must run in order -- e.g. a
+    kernel object compile followed by its own symbol-rename/prefix objcopy,
+    which touches the file the compile just produced. THE CALLER MUST GROUP
+    CHAINS BY OUTPUT FILENAME, not by artifact identity: two distinct
+    KernelObjectArtifact objects can resolve to the same output path (IRON's
+    SeparateDispatch gives no per-operator filename prefix, unlike
+    FusedDispatch), and running their compiles in different chains would
+    compile and objcopy that one file from two threads at once.
+    KernelCompilationRule.compile() does this grouping before constructing a
+    ParallelCompilationCommand; only it uses this class, so aiecc (which
+    depends on every kernel object) still runs after, unchanged.
+
+    IRON_COMPILE_JOBS=1 (or force_serial=True, for the Chess path, whose
+    xchesscc_wrapper has not been verified safe under a shared cwd) runs
+    chains one at a time in submission order -- identical to the prior serial
+    `for command in commands: command.run()`.
+    """
+
+    def __init__(
+        self, chains: list[list[CompilationCommand]], force_serial: bool = False
+    ) -> None:
+        self.chains = chains
+        self.force_serial = force_serial
+
+    def run(self) -> bool:
+        jobs = 1 if self.force_serial else _compile_jobs()
+        if jobs <= 1:
+            for chain in self.chains:
+                _run_chain(chain)
+            return True
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = [pool.submit(_run_chain, chain) for chain in self.chains]
+            first_exc: Exception | None = None
+            for future in futures:
+                try:
+                    future.result()
+                except Exception as exc:  # noqa: BLE001 -- re-raised below, not swallowed
+                    if first_exc is None:
+                        first_exc = exc
+        if first_exc is not None:
+            raise first_exc
+        return True
+
+    def __repr__(self) -> str:
+        return f"Parallel({len(self.chains)} chains, force_serial={self.force_serial})"
+
+
 # Compilation Rules
 # ##########################################################################
 
@@ -652,6 +728,13 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
                 options.append("--disable-repeater-scripts")
             if os.environ.get("AIECC_OPT"):
                 options += ["-O", os.environ["AIECC_OPT"]]
+            # Unlike the shortcuts above, output is byte-identical; only the wall clock changes.
+            if os.environ.get("AIECC_PARTITION_RUNTIME_SEQUENCES") == "1":
+                options.append("--partition-runtime-sequences")
+            # Same knob family: a `--expand-load-pdis`-only option, read here rather
+            # than left to the caller for the same reason as SKIP_EXPAND_PDIS above.
+            if os.environ.get("AIECC_ELIDE_IDENTICAL_PM") == "1":
+                options.append("--elide-identical-pm-writes")
             options += ["--get-scratchpad-parameters"] + artifact.extra_flags
 
             def _compile(
@@ -824,6 +907,105 @@ def _find_working_tool(name, peano_dir, mlir_aie_dir):
     return _find_tool(name, peano_dir, mlir_aie_dir)
 
 
+def _kernel_object_key(
+    source_path: str,
+    compile_args: list[str],
+    target_arch: str,
+    include_dirs: list[str],
+    use_chess: bool,
+) -> str:
+    """Content key for one raw kernel compile.
+
+    Covers every field the compile command varies on WITHIN one compile()
+    call (source bytes, compile_args, target arch, include dirs, Chess vs
+    Peano) -- not the include closure or compiler identity, so raw objects
+    keyed here are never reused ACROSS builds (see _compile_raw_kernel_object).
+    """
+    with open(source_path, "rb") as f:
+        source_sha256 = hashlib.sha256(f.read()).hexdigest()
+    identity = (
+        source_path,
+        source_sha256,
+        tuple(compile_args),
+        target_arch,
+        tuple(str(d) for d in include_dirs),
+        bool(use_chess),
+    )
+    return hashlib.sha256(repr(identity).encode()).hexdigest()[:24]
+
+
+def _compile_raw_kernel_object(
+    raw_path: str,
+    source_path: str,
+    target_arch: str,
+    include_dirs: list[str],
+    compile_args: list[str],
+    use_chess: bool,
+) -> None:
+    """Compile into raw_path via a private temp file + os.replace().
+
+    raw_path lives under this compile() call's own kobj/<run_id>/ directory
+    (KernelCompilationRule.compile()), never shared with another call -- a
+    concurrent build, or a rebuild of the same spec, gets its own run_id and
+    its own directory, so there is no cross-call path to race on. The
+    temp+replace here only guards a reader of THIS call's own copy stage
+    against observing THIS call's own compile half-written.
+    """
+    tmp = f"{raw_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    Path(tmp).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        compile_cxx_core_function(
+            source_path=source_path,
+            target_arch=target_arch,
+            output_path=tmp,
+            include_dirs=include_dirs,
+            compile_args=compile_args,
+            use_chess=use_chess,
+        )
+        os.replace(tmp, raw_path)
+        if os.path.exists(f"{tmp}.d"):
+            os.replace(f"{tmp}.d", f"{raw_path}.d")
+    finally:
+        for stray in (tmp, f"{tmp}.d"):
+            if os.path.exists(stray):
+                os.remove(stray)
+
+
+def _copy_kernel_object(src: str, dst: str) -> None:
+    shutil.copyfile(src, dst)
+    if os.path.exists(f"{src}.d"):
+        shutil.copyfile(f"{src}.d", f"{dst}.d")
+
+
+class _ScopedRawCompileStage(CompilationCommand):
+    """Runs one compile() call's raw-compile and copy stages, then always
+    removes that call's kobj/<run_id>/ raw-object directory -- success or
+    exception -- so a later call's own run_id never inherits stale files
+    from a compiler or header change made since this one ran."""
+
+    def __init__(
+        self,
+        raw_stage: CompilationCommand,
+        copy_stage: CompilationCommand,
+        raw_dirs: list[str],
+    ) -> None:
+        self.raw_stage = raw_stage
+        self.copy_stage = copy_stage
+        self.raw_dirs = raw_dirs
+
+    def run(self) -> bool:
+        try:
+            if not self.raw_stage.run():
+                return False
+            return self.copy_stage.run()
+        finally:
+            for raw_dir in self.raw_dirs:
+                shutil.rmtree(raw_dir, ignore_errors=True)
+
+    def __repr__(self) -> str:
+        return f"ScopedRawCompile({self.raw_stage!r} -> {self.copy_stage!r})"
+
+
 class KernelCompilationRule(CompilationRule):
     """Compile KernelObjectArtifacts using Peano (clang++) or xchesscc."""
 
@@ -838,12 +1020,27 @@ class KernelCompilationRule(CompilationRule):
 
     def compile(self, artifacts):
         worklist = artifacts.get_worklist(KernelObjectArtifact)
-        commands = []
+        if not worklist:
+            return []
 
         kernel_dir = get_kernel_dir()
         runtime_lib_include_path = (
             Path(self.mlir_aie_dir) / "aie_runtime_lib" / kernel_dir.upper()
         )
+        include_dirs = [str(runtime_lib_include_path)]
+
+        # One raw compile per unique (source, flags, arch) key (see
+        # _kernel_object_key), under THIS call's own kobj/<run_id>/ -- so a
+        # concurrent build, or a rebuild of the same spec, never shares a raw
+        # path with this one. _ScopedRawCompileStage runs the raw stage then
+        # the copy-then-rename stage (execute() would otherwise run both
+        # stages before either could clean up), and removes run_id's
+        # directory whether they succeeded or raised.
+        run_id = f"{os.getpid()}-{uuid4().hex[:12]}"
+        raw_chains_by_key: dict[str, list[CompilationCommand]] = {}
+        raw_path_by_key: dict[str, str] = {}
+        raw_dirs: set[str] = set()
+        chains_by_filename: dict[str, list[CompilationCommand]] = {}
 
         for artifact in worklist:
             if len(artifact.dependencies) < 1:
@@ -865,26 +1062,54 @@ class KernelCompilationRule(CompilationRule):
                     "-Wno-missing-template-arg-list-after-template-kw"
                 ] + compile_args
 
-            commands.append(
-                PythonCallbackCompilationCommand(
-                    partial(
-                        compile_cxx_core_function,
-                        source_path=source_file.filename,
-                        target_arch=kernel_dir,
-                        output_path=artifact.filename,
-                        include_dirs=[str(runtime_lib_include_path)],
-                        compile_args=compile_args,
-                        use_chess=self.use_chess,
+            key = _kernel_object_key(
+                source_path=source_file.filename,
+                compile_args=compile_args,
+                target_arch=kernel_dir,
+                include_dirs=include_dirs,
+                use_chess=self.use_chess,
+            )
+            if key not in raw_chains_by_key:
+                raw_dir = Path(artifact.filename).parent / "kobj" / run_id
+                raw_dirs.add(str(raw_dir))
+                raw_path = str(raw_dir / f"kobj_{key}.o")
+                raw_path_by_key[key] = raw_path
+                raw_chains_by_key[key] = [
+                    PythonCallbackCompilationCommand(
+                        partial(
+                            _compile_raw_kernel_object,
+                            raw_path=raw_path,
+                            source_path=source_file.filename,
+                            target_arch=kernel_dir,
+                            include_dirs=include_dirs,
+                            compile_args=compile_args,
+                            use_chess=self.use_chess,
+                        )
                     )
+                ]
+            raw_path = raw_path_by_key[key]
+
+            chain = chains_by_filename.setdefault(artifact.filename, [])
+            chain.append(
+                PythonCallbackCompilationCommand(
+                    partial(_copy_kernel_object, src=raw_path, dst=artifact.filename)
                 )
             )
             if artifact.rename_symbols:
-                commands.extend(self._rename_symbols(artifact))
+                chain.extend(self._rename_symbols(artifact))
             if artifact.prefix_symbols:
-                commands.extend(self._prefix_symbols(artifact, artifact.prefix_symbols))
+                chain.extend(self._prefix_symbols(artifact, artifact.prefix_symbols))
             artifact.available = True
 
-        return commands
+        # xchesscc_wrapper's cwd-sharing under concurrent invocation is
+        # unverified, so force serial for the Chess path, in both stages.
+        raw_stage = ParallelCompilationCommand(
+            list(raw_chains_by_key.values()), force_serial=self.use_chess
+        )
+        copy_stage = ParallelCompilationCommand(
+            list(chains_by_filename.values()), force_serial=self.use_chess
+        )
+        return [_ScopedRawCompileStage(raw_stage, copy_stage, sorted(raw_dirs))]
 
     def _rename_symbols(self, artifact):
         objcopy_path = self._find_working_tool("llvm-objcopy")

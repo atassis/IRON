@@ -7,6 +7,8 @@ Temporal fusion of multiple MLIR modules into one module with multiple devices a
 
 from __future__ import annotations
 
+import io
+import re
 import numpy as np
 import importlib.util
 from functools import partial
@@ -78,6 +80,8 @@ class SequenceMLIRArtifact(MLIRArtifact):
         buffer_sizes: tuple[int, int, int],
         slice_info: dict[str, tuple[str, int, int]] | None = None,
         extra_runlists: dict[str, list[tuple[str, ...]]] | None = None,
+        merge_devices: bool = False,
+        collapse_configures: bool = False,
     ) -> None:
         dependencies = list(operator_mlir_map.values())
         super().__init__(filename, dependencies)
@@ -98,6 +102,10 @@ class SequenceMLIRArtifact(MLIRArtifact):
             raise ValueError(
                 f"extra_runlists must not redefine the default variant '{DEFAULT_SEQUENCE}'"
             )
+        self.merge_devices = merge_devices
+        self.collapse_configures = collapse_configures
+        # Filled by fuse_mlir: absorbed operator device -> the device that now carries its sequence.
+        self.merged_devices: dict[str, str] = {}
 
     @property
     def runlists(self) -> dict[str, list[tuple[str, ...]]]:
@@ -144,6 +152,49 @@ def get_child_mlir_module(mlir_artifact: PythonGeneratedMLIRArtifact) -> Any:
     return callback_function(*gen.args, **gen.kwargs)
 
 
+def _kernel_prefix(op_name: str) -> str:
+    """The `func_prefix` FusedDispatch gives operator `op_name`'s kernel symbols and objects."""
+    m = re.match(r"(op\d+_)", op_name)
+    return m.group(1) if m else ""
+
+
+def device_body_key(device_op: Any, op_name: str) -> str:
+    """A device's text without its runtime sequences, with its kernel prefix normalized.
+
+    Two operators with equal keys place, link and load the same program; only what their
+    sequences stream differs, so one device can carry both sequences.
+    """
+    clone = device_op.operation.clone()
+    for op in list(clone.regions[0].blocks[0].operations):
+        if op.operation.name == "aie.runtime_sequence":
+            op.operation.erase()
+    text = str(clone)
+    clone.erase()
+    prefix = _kernel_prefix(op_name)
+    return re.sub(rf"\b{prefix}", "OP_", text) if prefix else text
+
+
+def renamed_sequence_text(device_op: Any, sym_name: str) -> str:
+    """The device's runtime sequence printed as `@sym_name`, with the device's own SSA names.
+
+    Printed against the whole device's AsmState, so references to device-scope values (the
+    barrier locks) keep the names the device body prints with. The sequence can then be parsed
+    into any device whose body prints identically; moving the op itself would keep pointers to
+    the source device's values instead.
+    """
+    seqs = [
+        op
+        for op in device_op.body_region.blocks[0].operations
+        if op.operation.name == "aie.runtime_sequence"
+    ]
+    if len(seqs) != 1:
+        raise ValueError(f"expected one runtime sequence to rename, found {len(seqs)}")
+    seqs[0].operation.attributes["sym_name"] = ir.StringAttr.get(sym_name, device_op.context)
+    buf = io.StringIO()
+    seqs[0].operation.print(state=ir.AsmState(device_op.operation), file=buf)
+    return buf.getvalue()
+
+
 def needs_additional_reset(runlist: list[Any]) -> bool:
     """Whether the sequence must configure one more device than the runlist asks for.
 
@@ -178,6 +229,7 @@ def fuse_mlir(artifact: SequenceMLIRArtifact) -> None:
     # scope.  We collect those module-level decls per-operator so we can
     # re-declare them once at the top of the fused module.
     device_mlir_strings = {}
+    child_devices = {}
     operator_param_decls: dict[str, dict[str, ir.Type]] = {}
     device_ty = None
     sequence_arg_types = {}
@@ -201,8 +253,29 @@ def fuse_mlir(artifact: SequenceMLIRArtifact) -> None:
         if device_ty is None:
             device_ty = device_op.device
         device_mlir_strings[op_name] = str(device_op)
+        child_devices[op_name] = (mlir_module, device_op)
         operator_param_decls[op_name] = params_here
         sequence_arg_types[op_name] = extract_runtime_sequence_arg_types(device_op)
+
+    # Operators whose device bodies are identical share the first such device: each absorbed
+    # operator's sequence moves into it under its own name, and its runs call that name.
+    device_of = {name: name for name in device_mlir_strings}
+    sequence_of = {name: DEFAULT_SEQUENCE for name in device_mlir_strings}
+    absorbed_sequences: dict[str, list[str]] = {}
+    if artifact.merge_devices:
+        survivor_of_key: dict[str, str] = {}
+        for op_name, (_, device_op) in child_devices.items():
+            survivor = survivor_of_key.setdefault(device_body_key(device_op, op_name), op_name)
+            if survivor == op_name:
+                continue
+            seq_name = f"seq_{op_name}"
+            text = renamed_sequence_text(device_op, seq_name)
+            if _kernel_prefix(op_name):
+                text = re.sub(rf"\b{_kernel_prefix(op_name)}", _kernel_prefix(survivor), text)
+            absorbed_sequences.setdefault(survivor, []).append(text)
+            device_of[op_name] = survivor
+            sequence_of[op_name] = seq_name
+        artifact.merged_devices = {a: d for a, d in device_of.items() if a != d}
 
     # Deduplicate parameter decls across operators (same name must have the
     # same type; otherwise indices would collide in the global state table).
@@ -231,6 +304,12 @@ def fuse_mlir(artifact: SequenceMLIRArtifact) -> None:
             for name, param_type in hoisted_params.items()
         )
         for op_name, device_str in device_mlir_strings.items():
+            if device_of[op_name] != op_name:
+                continue
+            if op_name in absorbed_sequences:
+                body = device_str.rstrip()
+                assert body.endswith("}"), f"unexpected device text for '{op_name}'"
+                device_str = body[:-1] + "".join(absorbed_sequences[op_name]) + "\n}"
             wrapped = f"module {{\n{params_preamble}\n{device_str}\n}}"
             wrapper_module = ir.Module.parse(wrapped)
             # Find the (sole) DeviceOp in the wrapper module.
@@ -249,8 +328,11 @@ def fuse_mlir(artifact: SequenceMLIRArtifact) -> None:
         # runlist's own configure-point parity, so it is decided PER VARIANT; the empty reset
         # device is emitted once and shared by whichever variants need it.
         variant_runlists = artifact.runlists
+        # A configure point is a change of operator, or of device when merged runs may share one.
+        point_of = device_of if artifact.collapse_configures else {n: n for n in device_of}
         variant_needs_reset = {
-            name: needs_additional_reset(rl) for name, rl in variant_runlists.items()
+            name: needs_additional_reset([(point_of[op], *bufs) for op, *bufs in rl])
+            for name, rl in variant_runlists.items()
         }
         if any(variant_needs_reset.values()):
 
@@ -283,19 +365,18 @@ def fuse_mlir(artifact: SequenceMLIRArtifact) -> None:
 
                 # Execute operations in runlist order
                 configure_op = None
-                last_op_name = None
+                last_point = None
                 for op_name, *buffer_names in variant_runlist:
                     expected_arg_types = sequence_arg_types[op_name]
 
-                    # Avoid reconfiguring altogether if the same op is called multiple times consecutively
-                    if configure_op is None or op_name != last_op_name:
-                        # Configure Op
-                        configure_sym_ref_attr = ir.FlatSymbolRefAttr.get(op_name)
-                        configure_op = aiex.ConfigureOp(
-                            configure_sym_ref_attr
-                        )  # TODO: optimization -- if previous op was in the same device, skip reconfiguration
+                    # Two sequences of one device in one configure block are only correct when every
+                    # run re-arms whatever gates its core on the sequence: without a configure's PDI
+                    # load in between, a barrier left set lets a core read the previous run's RTP.
+                    if configure_op is None or point_of[op_name] != last_point:
+                        configure_sym_ref_attr = ir.FlatSymbolRefAttr.get(device_of[op_name])
+                        configure_op = aiex.ConfigureOp(configure_sym_ref_attr)
                         configure_body = configure_op.body.blocks.append()
-                        last_op_name = op_name
+                        last_point = point_of[op_name]
 
                     with ir.InsertionPoint(configure_body):
 
@@ -358,7 +439,7 @@ def fuse_mlir(artifact: SequenceMLIRArtifact) -> None:
                             buffer_ssa_values.append(viewed)
 
                         # Run Op
-                        sequence_sym_ref_attr = ir.FlatSymbolRefAttr.get("sequence")
+                        sequence_sym_ref_attr = ir.FlatSymbolRefAttr.get(sequence_of[op_name])
                         run_op = aiex.RunOp(sequence_sym_ref_attr, buffer_ssa_values)
 
                 if variant_reset:
