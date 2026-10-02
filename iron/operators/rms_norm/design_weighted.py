@@ -4,10 +4,11 @@
 from ml_dtypes import bfloat16
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup
 from aie.iron.device import NPU1, NPU2
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
+from iron.common.worker_compat import create_worker
 
 
 def my_weighted_rms_norm(
@@ -102,7 +103,7 @@ def my_weighted_rms_norm(
         for j in range(num_channels):
             idx = i * num_channels + j
             my_workers.append(
-                Worker(
+                create_worker(
                     core_body_norm,
                     [
                         of_in1s[idx].cons(),
@@ -116,7 +117,7 @@ def my_weighted_rms_norm(
         for j in range(num_channels):
             idx = i * num_channels + j
             my_workers.append(
-                Worker(
+                create_worker(
                     core_body_mul,
                     [
                         of_out1s[idx].cons(),

@@ -17,11 +17,12 @@ Another interpretation of the input tensor is (rows / num_heads, num_heads, cols
 
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup
 from aie.iron.device import NPU1, NPU2
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.helpers.dialects.scf import _for as range_
 from ml_dtypes import bfloat16
+from iron.common.worker_compat import create_worker
 from iron.operators._trace import maybe_enable_trace
 
 
@@ -100,7 +101,7 @@ def rope(
 
     # Create a worker to run the task on a compute tile (one per column)
     my_workers = [
-        Worker(
+        create_worker(
             core_body,
             [
                 of_in[i].cons(),

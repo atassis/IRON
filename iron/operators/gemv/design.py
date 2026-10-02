@@ -19,10 +19,10 @@ from aie.iron import (
     Runtime,
     ScratchpadParameter,
     TaskGroup,
-    Worker,
     WorkerRuntimeBarrier,
     sync_parameters,
 )
+from iron.common.worker_compat import create_worker
 
 """
 Matrix-vector design
@@ -791,7 +791,7 @@ def my_matvec(
                 if (runtime_m or tiles_rtp or runtime_k) else [])
 
     workers = [
-        Worker(
+        create_worker(
             make_core_body(i),
             [
                 A_L3L1_fifos[i].cons(),

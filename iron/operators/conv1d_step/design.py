@@ -4,9 +4,10 @@
 from ml_dtypes import bfloat16
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
+from iron.common.worker_compat import create_worker
 
 
 def conv1d_step_design(
@@ -50,8 +51,8 @@ def conv1d_step_design(
             of_o.release(1)
 
     workers = [
-        Worker(core_body, [of_win[i].cons(), of_w[i].cons(), of_out[i].prod(), kernel],
-               allocation_scheme=allocation_scheme)
+        create_worker(core_body, [of_win[i].cons(), of_w[i].cons(), of_out[i].prod(), kernel],
+                      allocation_scheme=allocation_scheme)
         for i in range(num_columns)
     ]
     def taps_for(n):

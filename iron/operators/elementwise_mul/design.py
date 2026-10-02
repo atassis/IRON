@@ -4,9 +4,10 @@
 from ml_dtypes import bfloat16
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
+from iron.common.worker_compat import create_worker
 from iron.operators._trace import maybe_enable_trace
 
 
@@ -72,7 +73,7 @@ def elementwise_mul_broadcast_design(
             of_in2.release(1)
 
     my_workers = [
-        Worker(
+        create_worker(
             core_body,
             [
                 of_in1s[i].cons(),

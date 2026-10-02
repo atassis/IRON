@@ -4,10 +4,11 @@
 from ml_dtypes import bfloat16
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup
 from aie.iron.device import NPU1, NPU2
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
+from iron.common.worker_compat import create_worker
 
 
 def my_rms_norm(
@@ -70,7 +71,7 @@ def my_rms_norm(
 
     # Create a worker to run the task on a compute tile
     my_workers = [
-        Worker(
+        create_worker(
             core_body,
             [
                 of_in1s[i * num_channels + j].cons(),

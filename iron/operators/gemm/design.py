@@ -16,7 +16,6 @@ from aie.iron import (
     Runtime,
     ScratchpadParameter,
     TaskGroup,
-    Worker,
     WorkerRuntimeBarrier,
     str_to_dtype,
 )
@@ -29,6 +28,7 @@ from aie.dialects.aiex import (dma_free_task, npu_load_pdi, npu_maskwrite32, npu
 from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D, TensorAccessPattern
 from aie.iron.controlflow import range_
 from iron.common.kv_layout import blocked_access_pattern, restride_rows
+from iron.common.worker_compat import create_worker
 from iron.operators._trace import maybe_enable_trace
 
 microkernel_mac_dim_map = {
@@ -755,7 +755,7 @@ def my_matmul(
             if runtime_rows:
                 assert not use_larger_internal_buffer, "runtime_rows core_fn_rt has no acc_buffer path"
                 workers.append(
-                    Worker(
+                    create_worker(
                         core_fn_rt,
                         [
                             A_l2l1_fifos[row].cons(),
@@ -776,7 +776,7 @@ def my_matmul(
                 continue
 
             workers.append(
-                Worker(
+                create_worker(
                     core_fn,
                     [
                         A_l2l1_fifos[row].cons(),

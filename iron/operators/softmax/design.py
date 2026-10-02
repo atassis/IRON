@@ -14,7 +14,6 @@ from aie.iron import (
     Program,
     Runtime,
     TaskGroup,
-    Worker,
     Buffer,
     WorkerRuntimeBarrier,
     sync_parameters,
@@ -23,6 +22,7 @@ from aie.iron.device import NPU1, NPU2
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.helpers.dialects.scf import _for as range_
 from ml_dtypes import bfloat16
+from iron.common.worker_compat import create_worker
 from iron.operators._trace import maybe_enable_trace
 
 SM_VEC_LEN = 64  # mirrors aie_kernels/aie2p/flash_contract.h; a mismatch drops a tail
@@ -216,7 +216,7 @@ def softmax(
         ]
 
     my_workers = [
-        Worker(core_body, worker_args(i, j), allocation_scheme=allocation_scheme)
+        create_worker(core_body, worker_args(i, j), allocation_scheme=allocation_scheme)
         for i in range(num_aie_columns)
         for j in range(num_channels)
     ]
@@ -514,7 +514,7 @@ def _softmax_chunked(
         return rtps[idx]
 
     my_workers = [
-        Worker(
+        create_worker(
             core_body,
             [
                 of_in1s[i * num_channels + j].cons(),

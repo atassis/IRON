@@ -4,9 +4,10 @@
 from ml_dtypes import bfloat16
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
+from iron.common.worker_compat import create_worker
 from iron.operators._trace import maybe_enable_trace
 
 
@@ -74,7 +75,7 @@ def channeled_unary_design(
 
     # Create a worker to perform the task
     my_workers = [
-        Worker(
+        create_worker(
             core_fn,
             [
                 of_ins[i * num_channels + j].cons(),
