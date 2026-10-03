@@ -140,8 +140,7 @@ class QKVHeadDataParallel(MLIROperator):
                     f"D={self.D} must be a whole number of groups (group_size={self.group_size})"
                 )
             from iron.common.quant import max_legal_vec_size
-            # Same K008 rule GEMV enforces on its own tile_size_input: a planar block cannot be
-            # cut, so the L1 tile (tile_size_input rows) must be a whole number of blocks.
+            # Complete-block requirement; see iron/common/quant.py::derive_row_group.
             if self.layout == "row_group_planar":
                 from iron.common.quant import derive_row_group, widest_chunk
                 if self.row_group is None:

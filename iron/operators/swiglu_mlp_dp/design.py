@@ -307,8 +307,7 @@ def my_swiglu_mlp_dp(
         WROW_FF = row_stride_bytes(FF, group_size, weight_dtype, scale_dtype)
         WROW_QD = (row_stride_bytes(QD, group_size, weight_dtype, scale_dtype)
                    if fuse_o else None)
-        # A planar row's groups sit row_group*payload apart, so an L1 tile must hold a whole
-        # number of blocks -- the same constraint GEMV enforces on tile_size_input.
+        # See iron/common/quant.py::derive_row_group for the tiling contract.
         if layout == "row_group_planar":
             assert row_group and row_group >= 1, (
                 f"layout='row_group_planar' needs a derived row_group (got {row_group!r})")

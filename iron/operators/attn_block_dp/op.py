@@ -76,13 +76,7 @@ class AttnBlockDataParallel(MLIROperator):
     # position slab per head. None (default) is one block -- byte-identical to the flat layout.
     kv_block_size: int | None = field(default=None, repr=False)
     weight_depth: int = field(default=2, repr=False)
-    # Weight-stream format axis on Wqkv ONLY, as GEMV/SwiGLUMLPDataParallel take it
-    # (iron/operators/gemv/op.py) -- kc/vc stay bf16 regardless (quantized KV is a separate,
-    # unbuilt axis; see the kv_layout module). bf16 (default) is the byte-for-byte pre-existing
-    # path, where Wqkv shares stream_ofs's tile with the K/V cache reads (see design.py's THE
-    # SHARED-TILE INVARIANT). A quantized dtype breaks that invariant -- a quantized row is not
-    # generally a whole fraction of a bf16 cache chunk -- so it gets its own per-core ObjectFifo
-    # (design.py's wstream_ofs), spending one more of the device's 16 input shim channels.
+    # Quantized Wqkv needs its own FIFO because a packed row does not fit the KV tile.
     weight_dtype: str = field(default="bf16", repr=False)
     group_size: int = field(default=0, repr=False)
     layout: str = field(default="header_first", repr=False)
@@ -270,8 +264,7 @@ class AttnBlockDataParallel(MLIROperator):
                         [self.D], self.group_size, self.weight_dtype,
                         vec_size=provisional_vec, max_rows=self.tile_size_input,
                         scale_dtype=self.scale_dtype))
-                # K008: a planar block cannot be cut -- the L1 tile (tile_size_input rows) must be
-                # a whole number of blocks, same rule GEMV enforces on its own tile_size_input.
+                # Complete-block requirement; see iron/common/quant.py::derive_row_group.
                 if self.tile_size_input % self.row_group != 0:
                     raise ValueError(
                         f"row_group_planar needs tile_size_input ({self.tile_size_input}) to be "

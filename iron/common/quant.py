@@ -69,16 +69,10 @@ _SCALE_BYTES = {"f32": 4, "bf16": 2}
 _AFFINE = {"int4a": 4, "int8a": 8}
 _AFFINE_HEADER_BYTES = 4          # bf16 scale + bf16 min, per group
 
-# LAYOUT of a packed weight buffer. "header_first" is [n_groups x scale][payload] per row, the
-# shape mv_quant.cc has always read. "row_group_planar" groups ROW_GROUP rows and puts all their
-# payloads before all their headers.
+# Storage formats; see the module docstring.
 LAYOUTS = ("header_first", "row_group_planar")
 
-# Rows per planar block. Derived per design, not frozen at a constant: the L1 tile the DMA hands
-# a core is `tile_size_input` rows and a planar block cannot be split (row i's payload and its
-# header sit ROW_GROUP*payload apart), so the tile must hold a whole number of blocks. A fixed
-# G=8 (mmul's output-row count) overflows L1 at some shapes, so the deriving function takes the
-# L1 budget as a parameter instead of assuming one value fits everywhere.
+# Design-specific block height; see derive_row_group.
 ROW_GROUP_DEFAULT = 1
 
 # Element order WITHIN a planar block's payload region.

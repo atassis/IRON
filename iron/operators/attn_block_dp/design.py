@@ -541,12 +541,7 @@ def attn_block_dp(
     )
     # One runtime-K body under two names -- see rms_norm.cc. The row-batched scores path takes K as
     # a template parameter, so when it is on the scores keep their own compile-time-K symbol.
-    #
-    # Quantized: Wqkv's D is a compile-time constant here (unlike the scores' HD, which this same
-    # body also serves at runtime-K), so it binds directly to mv_quant.cc's compile-time-K
-    # `matvec_vectorized_{dtype}_bf16` -- the same symbol GEMV/SwiGLUMLPDataParallel/
-    # QKVHeadDataParallel bind for their own weight matvecs. No alias needed: this symbol is
-    # DISTINCT from `matvec_rtk_bf16_bf16`, which the scores kernel below still needs unchanged.
+    # Wqkv reduces constant D; the scores kernel takes runtime K.
     mv_kernel = (
         Kernel(f"{func_prefix}matvec_rtk_bf16_bf16", CORE_ARCHIVE,
                [np.int32, np.int32, np.int32, TILE_ty, D_ty, HD_ty])
@@ -627,11 +622,7 @@ def attn_block_dp(
             result_ty = ir.MemRefType.get([n_elems], ir.Type.parse("bf16"))
             return memref.view(result_ty, raw, raw_arith.constant(ir.IndexType.get(), 0), [])
 
-        # bf16: wt is a TILE_ty tile (tsi rows of D), row_idx a multi-row block offset (j*tsi), and
-        # this is exactly the pre-existing runtime-K call. Quantized: mv_quant.cc's matvec is
-        # compile-time-K (D is baked in via -DDIM_K) and ONE acquire is exactly one padded row
-        # (quant_tile_bytes), so m=1 and row_idx is the row index directly -- the same 5-arg,
-        # m=1-per-call shape qkv_head_dp/swiglu_mlp_dp already call their own weight matvec with.
+        # Quantized acquisitions carry one padded row; see quant_tile_bytes.
         def mv_weight(row_idx, wt, dst):
             if weight_dtype == "bf16":
                 mv_k(tsi, row_idx, D, wt, hn_buf, dst)

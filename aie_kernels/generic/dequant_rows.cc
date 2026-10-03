@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// GEMV's quantized weight rows (int4, per-group f32 scale, quant_row_layout.h) expanded to bf16
-// rows, with mv_quant.cc's arithmetic: bf16(q) * bf16(scale), rounded to nearest even. A GEMM
-// then reads the weights GEMV multiplies, without a second packed copy.
+// Dequantize int4 rows with mv_quant.cc's rounded product; see quant_row_layout.h.
 
 #include <aie_api/aie.hpp>
 #include <stdint.h>

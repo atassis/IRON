@@ -18,11 +18,7 @@
 #define PLANAR 0
 #endif
 
-// DERIVED per design by iron/common/quant.py::derive_row_group and passed as a -D; the default is
-// the identity so a build that forgets it is wrong loudly at the alignment assert rather than
-// quietly at a block base. The binding constraint is L1, not alignment: a block cannot be cut, so
-// tile_size_input must be a multiple of it, and 8 rows -- aie::mmul's tile height, and tempting --
-// is over L1 at every Gemma-4 GEMV site by 9 to 28 KB.
+// One-row default; designs select a fitting block height. See iron/common/quant.py::derive_row_group.
 #ifndef ROW_GROUP
 #define ROW_GROUP 1
 #endif
@@ -32,10 +28,7 @@ struct quant_row_offsets {
   uint32_t payload;
 };
 
-// `payload` and `header` are the row's widths in BYTES (payload is k/2 at 4 bits), `row_stride`
-// their sum. Under PLANAR the caller must hand the kernel a tile starting on a block boundary and
-// holding whole blocks; a partial tile computes plausible wrong answers rather than failing, so
-// the operator asserts it where the tiling is chosen.
+// Byte offsets; see iron/common/quant.py for the complete-block tiling contract.
 template <uint32_t row_stride, uint32_t header, uint32_t payload>
 inline quant_row_offsets quant_row_at(uint32_t row) {
 #if PLANAR

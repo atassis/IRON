@@ -82,14 +82,9 @@ class GEMV(MLIROperator):
     # g64 from being punished to a 128-bit load at K=3840 (Gemma-4-12B's shipped shape) -- see
     # quant.max_legal_vec_size's docstring for the mechanism. Meaningless at weight_dtype="bf16".
     layout: str = field(default="header_first", repr=False)
-    # Rows per planar block, only under layout="row_group_planar". None (default) means DERIVE:
-    # self-derived in __post_init__ against this design's own tile_size_input, per K022 -- a
-    # hand-picked value is silently over L1 (two sessions independently picked 8; every Gemma-4
-    # quantized GEMV site needs 4 and overruns at 8 by 9-28 KB), so nothing here should choose it.
+    # Planar block height; see iron/common/quant.py::derive_row_group.
     row_group: int | None = field(default=None, repr=False)
-    # Stored width of the per-group scale. mv_quant.cc casts it to bfloat16 before the MAC either
-    # way, so "f32" spends 2 B/group the core discards -- 1 bit/weight at int4 g32. The kernel
-    # reads the narrow header only when built -DSCALE_BF16=1, so this is a design-key axis.
+    # Header precision; see iron/common/quant.py.
     scale_dtype: str = field(default="f32", repr=False)
     # Per-dispatch int32 ScratchpadParameter naming how many output rows to COMPUTE; None (the
     # default) computes all M and is byte for byte the pre-existing design. Decode attention reads
