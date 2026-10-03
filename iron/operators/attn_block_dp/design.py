@@ -1230,9 +1230,7 @@ def attn_block_dp_weightless(
         misc_p.fill(nkn, _flat_tap(HD, HD), wait=True, group=tg1)
         misc_p.fill(ang, _flat_tap(HD, HD), wait=True, group=tg1)
         for c in range(N):
-            # Stock [Wq|Wk|Wv] row order -- the SAME offsets attn_block_dp's stock
-            # (wqkv_head_major=False) weight fills use, just HD-wide instead of D-wide: the W
-            # device's GEMV output inherits Wqkv's row order unchanged (its own run is untouched).
+            # The QKV projection emits [Wq|Wk|Wv].
             for off, rows in ((gqa * c * HD, gqa), ((Hq + c) * HD, 1), ((Hq + Hkv + c) * HD, 1)):
                 stream_ps[c].fill(qkv, _flat_tap(TOT, rows * HD, off), wait=True, group=tg1)
         tg1.finish()
