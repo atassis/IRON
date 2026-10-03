@@ -75,17 +75,7 @@ LAYOUTS = ("header_first", "row_group_planar")
 # Design-specific block height; see derive_row_group.
 ROW_GROUP_DEFAULT = 1
 
-# Element order WITHIN a planar block's payload region.
-#   "row_major"  (implemented) -- row i's K elements contiguous at i*K.
-#   "mmul_8x8"   (NOT implemented) -- the order aie::mmul's B operand consumes, which for a weight
-#                stored [Nout, K] and a reduction chunk of 8 is
-#                    packed(n, k) = (n/8)*(8*K) + (k/8)*64 + (k%8)*8 + (n%8)
-#                i.e. reduction-major then output-minor inside a 64-element tile, tiles consecutive.
-#                Consumption order equals memory order, so the minimum contiguous run is the whole
-#                8*K region and no shim reorder is needed. NOT built, and deliberately: the mmul
-#                shape is a small-K lever (the fixed per-output-row block is ~90% of per-output
-#                cost at K=128 and ~13% at K=3840) and weight GEMVs are transport-bound today, so
-#                it converts at roughly nothing until quantization has made the op core-bound.
+# row_major keeps each K-element row contiguous; mmul_8x8 is reserved, not implemented.
 PAYLOAD_ORDERS = ("row_major", "mmul_8x8")
 
 
